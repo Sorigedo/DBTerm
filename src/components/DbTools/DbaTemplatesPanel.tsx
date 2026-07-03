@@ -18,6 +18,65 @@ interface Template {
 }
 
 const TEMPLATES: Template[] = [
+  // 预编译语句 / 参数化写法
+  {
+    id: 'mysql-prepared-stmt', category: '预编译语句', name: '用户级 PREPARE / EXECUTE', db: 'mysql',
+    desc: 'MySQL / MariaDB / TiDB / OceanBase 的服务端预编译语句写法；整段需在同一会话中执行',
+    sql: `PREPARE stmt FROM 'SELECT 1 LIMIT 1';
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;`,
+  },
+  {
+    id: 'pg-prepared-stmt', category: '预编译语句', name: 'PREPARE / EXECUTE', db: 'pg',
+    desc: 'PostgreSQL 系服务端预编译语句，参数用 $1、$2 并声明类型',
+    sql: `PREPARE stmt(integer) AS
+SELECT $1 AS value;
+
+EXECUTE stmt(1);
+DEALLOCATE stmt;`,
+  },
+  {
+    id: 'ss-prepared-stmt', category: '预编译语句', name: 'sp_executesql 参数化执行', db: 'sqlserver',
+    desc: 'SQL Server 常用参数化动态 SQL 写法；T-SQL 不使用 MySQL 的 PREPARE 语法',
+    sql: `DECLARE @sql nvarchar(max) = N'SELECT @value AS value';
+
+EXEC sp_executesql
+  @sql,
+  N'@value int',
+  @value = 1;`,
+  },
+  {
+    id: 'ora-prepared-stmt', category: '预编译语句', name: '动态 SQL 占位绑定', db: 'oracle',
+    desc: 'Oracle 在 PL/SQL 中用 EXECUTE IMMEDIATE 和绑定变量表达动态参数化执行',
+    sql: `DECLARE
+  v_value NUMBER;
+BEGIN
+  EXECUTE IMMEDIATE 'SELECT :value FROM dual'
+    INTO v_value
+    USING 1;
+END;`,
+  },
+  {
+    id: 'sqlite-prepared-stmt', category: '预编译语句', name: 'SQLite 参数占位说明', db: 'sqlite',
+    desc: 'SQLite 预编译由客户端 API 完成；SQL 编辑器里直接执行普通 SQL',
+    sql: `-- SQLite 的 prepared statement 是驱动/API 层能力，不是 SQL 脚本命令。
+-- 在 SQL 编辑器中直接执行：
+SELECT 1 AS value;`,
+  },
+  {
+    id: 'duck-prepared-stmt', category: '预编译语句', name: 'DuckDB 参数占位说明', db: 'duckdb',
+    desc: 'DuckDB 常见预编译由客户端 API 完成；SQL 编辑器里直接执行普通 SQL',
+    sql: `-- DuckDB 的参数化执行通常由驱动/API 绑定参数完成。
+-- 在 SQL 编辑器中直接执行：
+SELECT 1 AS value;`,
+  },
+  {
+    id: 'ch-prepared-stmt', category: '预编译语句', name: 'ClickHouse 参数化说明', db: 'clickhouse',
+    desc: 'ClickHouse 常用 HTTP/native 参数绑定或客户端格式化；SQL 脚本不使用 MySQL PREPARE',
+    sql: `-- ClickHouse 不使用 MySQL 风格 PREPARE / EXECUTE 脚本。
+-- 在 SQL 编辑器中直接执行：
+SELECT 1 AS value;`,
+  },
   // 锁与等待
   {
     id: 'lock-waiting', category: '锁 / 阻塞', name: '查看锁等待', db: 'mysql',

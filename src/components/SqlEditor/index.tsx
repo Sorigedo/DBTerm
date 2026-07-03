@@ -75,6 +75,7 @@ import { isPgFamily } from '../../utils/sqlDialect'
 import { formatDuration } from '../../utils/formatDuration'
 import { appendAuditLog } from '../../utils/auditLog'
 import { markBatchCancelledFrom } from './queryBatchCancel'
+import { hasMysqlDelimiterDirective, hasMysqlUserPreparedStmt, splitSqlStatements, stripSqlComments } from './sqlSplit'
 
 const QueryHistoryPanel = lazy(() => import('./QueryHistoryPanel'))
 const ExportDialog = lazy(() => import('./ExportDialog'))
@@ -159,15 +160,6 @@ function clearTableHover(view: EditorView) {
   }
 }
 
-// 去掉注释与空白后判断语句是否“有效”（仅注释/空白 → 无效）
-function stripSqlComments(s: string): string {
-  return s
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/--[^\n]*/g, '')
-    .replace(/#[^\n]*/g, '')
-    .trim()
-}
-
 export interface EditCtx {
   schema: string
   table: string
@@ -178,51 +170,6 @@ export interface EditCtx {
  * 识别"单表简单 SELECT"：只有这种结果才允许行内编辑。
  * 含 JOIN / GROUP BY / UNION / 子查询 / 多表的一律不可编辑。
  */
-// K5 — SQL 分句：按 ; 分割，忽略字符串和注释内的 ;
-function splitSqlStatements(sql: string): string[] {
-  const stmts: string[] = []
-  let cur = ''
-  let i = 0
-  const len = sql.length
-  while (i < len) {
-    const ch = sql[i]
-    if (ch === '-' && sql[i + 1] === '-') {
-      // line comment
-      const end = sql.indexOf('\n', i)
-      cur += end === -1 ? sql.slice(i) : sql.slice(i, end + 1)
-      i = end === -1 ? len : end + 1
-    } else if (ch === '/' && sql[i + 1] === '*') {
-      // block comment
-      const end = sql.indexOf('*/', i + 2)
-      cur += end === -1 ? sql.slice(i) : sql.slice(i, end + 2)
-      i = end === -1 ? len : end + 2
-    } else if (ch === "'" || ch === '"' || ch === '`') {
-      // quoted string — find matching close quote
-      const q = ch
-      let j = i + 1
-      while (j < len) {
-        if (sql[j] === '\\') { j += 2; continue }
-        if (sql[j] === q && sql[j + 1] === q) { j += 2; continue } // doubled-quote escape
-        if (sql[j] === q) { j++; break }
-        j++
-      }
-      cur += sql.slice(i, j)
-      i = j
-    } else if (ch === ';') {
-      const trimmed = cur.trim()
-      if (trimmed) stmts.push(trimmed)
-      cur = ''
-      i++
-    } else {
-      cur += ch
-      i++
-    }
-  }
-  const last = cur.trim()
-  if (last) stmts.push(last)
-  return stmts
-}
-
 // ── 子查询感知的「别名.列」补全 ───────────────────────────────────────────────
 // CodeMirror lang-sql 内置补全的别名解析对子查询里的 `from 表 别名` 解析不全，
 // 导致 `(select x.col from t x ...)` 中 `x.` 无任何列提示。这里改用「全文扫描所有
@@ -843,7 +790,13 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
     setResultClosed(false)   // 执行即重新打开结果区
 
     // 过滤掉“仅注释/空白”的语句，避免把纯注释当命令发给数据库（MySQL 1295）
-    const stmts = splitSqlStatements(trimmed).filter(s => stripSqlComments(s) !== '')
+    const isMysqlFamilyConn = ['mysql', 'mariadb', 'tidb', 'oceanBase'].includes(connType)
+    const keepMysqlPreparedScript = isMysqlFamilyConn
+      && hasMysqlUserPreparedStmt(trimmed)
+      && !hasMysqlDelimiterDirective(trimmed)
+    const stmts = keepMysqlPreparedScript
+      ? [trimmed]
+      : splitSqlStatements(trimmed, connType).filter(s => stripSqlComments(s) !== '')
     if (stmts.length === 0) return // 仅注释/空白：静默不执行
     // 单条执行：用拆分后的语句（剥离尾部分号/多余注释），避免把分号后内容一起发送
     if (stmts.length === 1) trimmed = stmts[0]
@@ -1075,7 +1028,7 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
     const sel = getSelectedSql()
     const target = (sel || sqlText).trim()
     if (!target) { toast.warning('没有可导出的 SQL'); return }
-    const stmts = splitSqlStatements(target)
+    const stmts = splitSqlStatements(target, connType)
     if (stmts.length > 1) {
       toast.warning(sel
         ? `选中含 ${stmts.length} 条语句，将导出第 1 条；如需指定请只选中单条`
@@ -1091,7 +1044,7 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
   const runExplain = useCallback(() => {
     const sel = getSelectedSql()
     const target = (sel || sqlText).trim()
-    const stmts = splitSqlStatements(target).filter(s => stripSqlComments(s) !== '')
+    const stmts = splitSqlStatements(target, connType).filter(s => stripSqlComments(s) !== '')
     if (stmts.length === 0) return
     const base = stmts[0].replace(/;\s*$/, '')
     // 各数据库执行计划语法：

@@ -1478,14 +1478,43 @@ fn needs_text_protocol(sql: &str) -> bool {
             || upper.contains(" TRIGGER") || upper.contains(" EVENT"));
     // CALL 存储过程（可能返回结果集）在 prepared 协议下报 1295；执行页的「SET @x;CALL ...」组合也需文本协议
     let is_call = upper.starts_with("CALL ") || (upper.starts_with("SET @") && upper.contains("CALL "));
+    // MySQL 用户级 PREPARE/EXECUTE/DEALLOCATE PREPARE 本身就是服务端预编译语句控制命令，
+    // 不能再包进客户端 prepared-statement 协议，否则 MySQL 返回 1295。
+    let is_user_prepared_stmt = has_mysql_user_prepared_stmt_command(sql);
     is_routine_ddl
         || is_call
+        || is_user_prepared_stmt
         || upper.starts_with("CHECK TABLE")
         || upper.starts_with("ANALYZE TABLE")
         || upper.starts_with("OPTIMIZE TABLE")
         || upper.starts_with("REPAIR TABLE")
         || upper.starts_with("FLUSH")
         || upper.starts_with("USE ")   // USE `db` 在 prepared 协议下报 1295，必须走文本协议
+}
+
+fn has_mysql_user_prepared_stmt_command(sql: &str) -> bool {
+    sql.split(';').any(|stmt| {
+        let upper = strip_leading_comments(stmt).to_uppercase();
+        upper.starts_with("PREPARE ")
+            || upper.starts_with("EXECUTE ")
+            || upper.starts_with("DEALLOCATE PREPARE ")
+            || upper.starts_with("DROP PREPARE ")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_text_protocol;
+
+    #[test]
+    fn mysql_user_prepared_statement_commands_use_text_protocol() {
+        assert!(needs_text_protocol(r#"PREPARE stmt FROM "SELECT 1 LIMIT 1""#));
+        assert!(needs_text_protocol("EXECUTE stmt"));
+        assert!(needs_text_protocol("DEALLOCATE PREPARE stmt"));
+        assert!(needs_text_protocol("DROP PREPARE stmt"));
+        assert!(needs_text_protocol("/* dbterm-cancel:abc123 */ PREPARE stmt FROM 'SELECT 1'"));
+        assert!(needs_text_protocol("SET @sql = 'SELECT 1'; PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt"));
+    }
 }
 
 /// Admin commands like CHECK/ANALYZE/OPTIMIZE TABLE require text protocol.
