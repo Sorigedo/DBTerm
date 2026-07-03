@@ -1,0 +1,45 @@
+DBTerm Private Software License
+
+Copyright (c) 2026 DBTerm Project.
+All rights reserved.
+
+This software, including source code, binary packages, documentation,
+design assets, build scripts, configuration templates, and related
+materials, is proprietary and confidential unless a separate written
+agreement states otherwise.
+
+Permission is granted only to authorized users and authorized
+repositories for internal development, testing, packaging, deployment,
+and operational use of DBTerm.
+
+Without prior written authorization, you may not:
+
+1. copy, publish, sublicense, sell, rent, lease, or redistribute this
+   software or any derivative work;
+2. expose the source code, private repository, build artifacts, secrets,
+   certificates, account information, or internal documentation to an
+   unauthorized third party;
+3. remove or alter ownership, copyright, license, or security notices;
+4. use this software to provide commercial services to third parties
+   outside the authorized scope;
+5. reverse engineer, decompile, or bypass technical protection measures
+   in released binary packages, except where applicable law expressly
+   permits such activity.
+
+Authorized users may modify the software for permitted internal use.
+Such modifications remain subject to this license and must not be
+distributed outside the authorized scope.
+
+Third-party dependencies remain governed by their respective licenses.
+This license does not grant any rights to third-party trademarks,
+database products, drivers, SDKs, or services referenced by DBTerm.
+
+The software is provided "as is", without warranty of any kind, express
+or implied, including but not limited to warranties of merchantability,
+fitness for a particular purpose, and non-infringement. In no event
+shall the copyright holder or authorized maintainers be liable for any
+claim, damages, data loss, business interruption, or other liability
+arising from the use of this software.
+
+For commercial licensing, redistribution permission, or written
+authorization, contact the project owner.

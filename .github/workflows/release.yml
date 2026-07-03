@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_notes:
+        description: '本次发布说明，会追加到 Release 正文顶部'
+        required: false
+        default: '常规版本发布，包含最近提交中的功能改进、问题修复和体验优化。'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS Apple Silicon
+            os: macos-latest
+            rust-target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin --bundles dmg
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            experimental: false
+          - label: macOS Intel
+            os: macos-15-intel
+            rust-target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin --bundles dmg
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            experimental: false
+          - label: Windows x64
+            os: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            args: --target x86_64-pc-windows-msvc --bundles msi,nsis
+            rust-targets: x86_64-pc-windows-msvc
+            experimental: false
+          - label: Windows ARM64
+            os: windows-11-arm
+            rust-target: aarch64-pc-windows-msvc
+            args: --target aarch64-pc-windows-msvc --bundles nsis
+            rust-targets: aarch64-pc-windows-msvc
+            experimental: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Read app version
+        id: app-version
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          expected="v${{ steps.app-version.outputs.version }}"
+          actual="${GITHUB_REF_NAME}"
+          if [ "$actual" != "$expected" ]; then
+            echo "Release tag must match package.json version: expected ${expected}, got ${actual}" >&2
+            exit 1
+          fi
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npm test -- --runInBand
+
+      - name: Build and upload release assets
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: '-'
+        with:
+          tagName: v${{ steps.app-version.outputs.version }}
+          releaseName: DBTerm v${{ steps.app-version.outputs.version }}
+          releaseBody: |
+            ${{ inputs.release_notes || '常规版本发布，包含最近提交中的功能改进、问题修复和体验优化。' }}
+
+            ## 安装包
+
+            - macOS Apple Silicon：适用于 M1/M2/M3/M4 等 Apple Silicon 设备。
+            - macOS Intel：适用于 Intel 芯片 Mac。
+            - Windows x64：适用于主流 64 位 Windows 10 / Windows 11。
+            - Windows ARM64：适用于 ARM64 Windows 设备，当前作为实验包提供。
+
+            ## 发布说明
+
+            - 本版本安装包由 GitHub Actions 自动构建。
+            - macOS 未接入 Apple Developer 正式签名和公证前，首次打开可能需要在系统安全设置中允许。
+            - Windows 未接入代码签名证书前，首次安装可能出现系统安全提示。
+            - 发布前请下载对应平台安装包完成启动、连接、SSH、SQL 编辑器和设置页基础回归。
+          releaseDraft: true
+          prerelease: false
+          generateReleaseNotes: true
+          args: ${{ matrix.args }}
+          releaseAssetNamePattern: DBTerm-v[version]-[platform]-[arch][setup].[ext]
