@@ -372,6 +372,30 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
     setSql(tabId, value)
   }, [setSql, tabId])
 
+  const insertSqlAtCursor = useCallback((picked: string) => {
+    const view = editorViewRef.current
+    if (!view) {
+      const next = sqlText.trim() ? `${sqlText.trimEnd()}\n\n${picked}` : picked
+      setSqlDraft(next)
+      return
+    }
+    const { from, to } = view.state.selection.main
+    const doc = view.state.doc.toString()
+    const before = doc.slice(0, from)
+    const after = doc.slice(to)
+    const prefix = before && !before.endsWith('\n') ? '\n' : ''
+    const suffix = after && !after.startsWith('\n') ? '\n' : ''
+    const insert = `${prefix}${picked}${suffix}`
+    view.dispatch({
+      changes: { from, to, insert },
+      selection: { anchor: from + insert.length },
+      scrollIntoView: true,
+    })
+    view.focus()
+    setSqlDraft(view.state.doc.toString())
+    preFormatRef.current = null
+  }, [setSqlDraft, sqlText])
+
   const markSqlSaved = useCallback((saved?: { id: string; name: string }, savedSqlText = sqlText) => {
     savedBaselineRef.current = savedSqlText
     setTabDirty(tabId, false)
@@ -1767,7 +1791,7 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
             <QueryHistoryPanel
               connectionId={connectionId}
               width={historyWidth}
-              onPick={(picked) => { setSqlDraft(picked) }}
+              onPick={insertSqlAtCursor}
               onSaveAsQuery={(sql) => { setSaveSqlOverride(sql); setHistoryOpen(false); setSavedOpen(true) }}
               onClose={() => setHistoryOpen(false)}
             />
