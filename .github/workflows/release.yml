@@ -103,39 +103,203 @@ jobs:
       - name: Test
         run: npm test -- --runInBand
 
-      - name: Build and upload release assets
-        uses: tauri-apps/tauri-action@v1
+      - name: Build release assets
+        env:
+          APPLE_SIGNING_IDENTITY: '-'
+        run: npm run tauri -- build ${{ matrix.args }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbterm-${{ matrix.rust-target }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/msi/*.msi
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/nsis/*.exe
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: publish
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read app version
+        id: app-version
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          expected="v${{ steps.app-version.outputs.version }}"
+          actual="${GITHUB_REF_NAME}"
+          if [ "$actual" != "$expected" ]; then
+            echo "Release tag must match package.json version: expected ${expected}, got ${actual}" >&2
+            exit 1
+          fi
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Rename release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${{ steps.app-version.outputs.version }}"
+          mkdir -p renamed-assets
+
+          while IFS= read -r asset; do
+            filename="$(basename "$asset")"
+            case "$filename" in
+              *.dmg)
+                if [[ "$filename" == *aarch64* || "$filename" == *arm64* ]]; then
+                  target="DBTerm-v${version}-macos-aarch64.dmg"
+                else
+                  target="DBTerm-v${version}-macos-x86_64.dmg"
+                fi
+                ;;
+              *.msi)
+                if [[ "$filename" == *aarch64* || "$filename" == *arm64* ]]; then
+                  target="DBTerm-v${version}-windows-aarch64.msi"
+                else
+                  target="DBTerm-v${version}-windows-x86_64.msi"
+                fi
+                ;;
+              *.exe)
+                if [[ "$filename" == *aarch64* || "$filename" == *arm64* ]]; then
+                  target="DBTerm-v${version}-windows-aarch64-setup.exe"
+                else
+                  target="DBTerm-v${version}-windows-x86_64-setup.exe"
+                fi
+                ;;
+              *)
+                continue
+                ;;
+            esac
+
+            cp "$asset" "renamed-assets/$target"
+          done < <(find release-assets -type f | sort)
+
+      - name: List release assets
+        shell: bash
+        run: find renamed-assets -type f -maxdepth 1 -print | sort
+
+      - name: Write release notes
+        env:
+          INPUT_RELEASE_NOTES: ${{ github.event.inputs.release_notes }}
+        shell: bash
+        run: |
+          if [ -n "${INPUT_RELEASE_NOTES:-}" ]; then
+            printf '%s\n\n' "$INPUT_RELEASE_NOTES" > release-notes.md
+          else
+            cat > release-notes.md <<'EOF'
+          ## 更新内容
+
+          - 优化标签拖拽体验，移动标签时显示清晰的标签预览。
+          - 调整标签排序反馈，拖动经过其他标签时仅显示插入位置，不再误触发选中文本或高亮整块标签。
+          - 改进分屏拖放热区，只在命中有效区域时显示提示，减少普通排序操作干扰。
+          - 增加 SQL 变量识别与替换能力，支持在执行前填写变量值。
+          - 优化查询编辑器交互、连接表单与快捷键配置。
+          - 更新项目文档与界面截图，补充工作台、终端、对象浏览、DBA 面板和权限管理展示。
+          EOF
+          fi
+
+          cat >> release-notes.md <<'EOF'
+          ## 安装包
+
+          - macOS Apple Silicon：适用于 M1/M2/M3/M4 等 Apple Silicon 设备。
+          - macOS Intel：适用于 Intel 芯片 Mac。
+          - Windows x64：适用于主流 64 位 Windows 10 / Windows 11。
+          - Windows ARM64：适用于 ARM64 Windows 设备，当前作为实验包提供。
+
+          ## 发布说明
+
+          - 本版本安装包由 GitHub Actions 自动构建。
+          - macOS 未接入 Apple Developer 正式签名和公证前，首次打开可能需要在系统安全设置中允许。
+          - Windows 未接入代码签名证书前，首次安装可能出现系统安全提示。
+          - 发布前请下载对应平台安装包完成启动、连接、SSH、SQL 编辑器和设置页基础回归。
+          EOF
+
+      - name: Create or update draft release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_SIGNING_IDENTITY: '-'
-        with:
-          tagName: v${{ steps.app-version.outputs.version }}
-          releaseName: DBTerm v${{ steps.app-version.outputs.version }}
-          releaseBody: |
-            ## 更新内容
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-            - 优化标签拖拽体验，移动标签时显示清晰的标签预览。
-            - 调整标签排序反馈，拖动经过其他标签时仅显示插入位置，不再误触发选中文本或高亮整块标签。
-            - 改进分屏拖放热区，只在命中有效区域时显示提示，减少普通排序操作干扰。
-            - 增加 SQL 变量识别与替换能力，支持在执行前填写变量值。
-            - 优化查询编辑器交互、连接表单与快捷键配置。
-            - 更新项目文档与界面截图，补充工作台、终端、对象浏览、DBA 面板和权限管理展示。
+          tag="v${{ steps.app-version.outputs.version }}"
+          title="DBTerm ${tag}"
 
-            ## 安装包
+          retry() {
+            local attempt=1
+            local max_attempts=5
+            local delay=10
+            until "$@"; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                return 1
+              fi
+              echo "Command failed, retrying in ${delay}s (${attempt}/${max_attempts})..." >&2
+              sleep "$delay"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
 
-            - macOS Apple Silicon：适用于 M1/M2/M3/M4 等 Apple Silicon 设备。
-            - macOS Intel：适用于 Intel 芯片 Mac。
-            - Windows x64：适用于主流 64 位 Windows 10 / Windows 11。
-            - Windows ARM64：适用于 ARM64 Windows 设备，当前作为实验包提供。
+          release_state="unknown"
+          for attempt in 1 2 3 4 5; do
+            if gh release view "$tag" >/tmp/release-view.out 2>&1; then
+              release_state="exists"
+              break
+            fi
 
-            ## 发布说明
+            view_output="$(cat /tmp/release-view.out)"
+            if echo "$view_output" | grep -Eiq 'not found|could not find|HTTP 404'; then
+              release_state="missing"
+              break
+            fi
 
-            - 本版本安装包由 GitHub Actions 自动构建。
-            - macOS 未接入 Apple Developer 正式签名和公证前，首次打开可能需要在系统安全设置中允许。
-            - Windows 未接入代码签名证书前，首次安装可能出现系统安全提示。
-            - 发布前请下载对应平台安装包完成启动、连接、SSH、SQL 编辑器和设置页基础回归。
-          releaseDraft: true
-          prerelease: false
-          generateReleaseNotes: true
-          args: ${{ matrix.args }}
-          releaseAssetNamePattern: DBTerm-v[version]-[platform]-[arch][setup].[ext]
+            if [ "$attempt" -eq 5 ]; then
+              echo "$view_output" >&2
+              echo "Unable to determine whether release ${tag} exists after ${attempt} attempts" >&2
+              exit 1
+            fi
+
+            delay=$((10 * attempt))
+            echo "Unable to fetch release ${tag}, retrying in ${delay}s (${attempt}/5)..." >&2
+            sleep "$delay"
+          done
+
+          if [ "$release_state" = "exists" ]; then
+            retry gh release edit "$tag" \
+              --title "$title" \
+              --notes-file release-notes.md \
+              --draft=true \
+              --prerelease=false
+          elif [ "$release_state" = "missing" ]; then
+            retry gh release create "$tag" \
+              --title "$title" \
+              --notes-file release-notes.md \
+              --draft
+          else
+            echo "Unexpected release state: ${release_state}" >&2
+            exit 1
+          fi
+
+          mapfile -t assets < <(find renamed-assets -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \) | sort)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets found" >&2
+            exit 1
+          fi
+
+          retry gh release upload "$tag" "${assets[@]}" --clobber
