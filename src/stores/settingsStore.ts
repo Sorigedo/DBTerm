@@ -351,7 +351,7 @@ export const useSettingsStore = create<SettingsState>()(
       },
       // 快捷键重排：尽量 Mod+单键、同功能统一。每次键位调整都 bump 版本，
       // 将旧持久化的快捷键全量重置为最新默认键位（否则旧 localStorage 不会更新）。
-      version: 9,
+      version: 10,
       migrate: (persisted, version) => {
         const s = (persisted ?? {}) as Partial<SettingsState>
         if (version < 4) {
@@ -380,6 +380,9 @@ export const useSettingsStore = create<SettingsState>()(
         if (version < 9) {
           const { termOpacity: _termOpacity, ...rest } = s as Partial<SettingsState> & { termOpacity?: unknown }
           return rest
+        }
+        if (version < 10) {
+          return { ...s, shortcuts: { ...DEFAULT_SHORTCUTS, ...(s.shortcuts ?? {}) } }
         }
         return s
       },

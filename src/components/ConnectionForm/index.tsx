@@ -549,22 +549,12 @@ export default function ConnectionForm({ initial, initialType, category, onClose
       )
     }
 
-    // 数据库专属：分组网格
+    // 数据库专属：连续网格
     if (category === 'db') {
-      const DB_GROUPS = [
-        { label: '关系型数据库', types: ['mysql','postgres','sqlite','mariadb','sqlServer','oracle'] as ConnType[] },
-        { label: '分布式 / 分析型', types: ['tidb','oceanBase','clickHouse','duckdb'] as ConnType[] },
-        { label: '国产数据库',   types: ['kingBase','openGauss'] as ConnType[] },
-        { label: 'NoSQL',        types: ['redis','mongodb'] as ConnType[] },
-      ]
+      const DB_ORDER = ['mysql','postgres','sqlite','mariadb','sqlServer','oracle','tidb','oceanBase','clickHouse','duckdb','kingBase','openGauss','redis','mongodb'] as ConnType[]
       const q = dbSearch.trim().toLowerCase()
-      const matchGroups = DB_GROUPS.map(g => ({
-        ...g,
-        items: g.types.map(tp => dbTypes.find(t => t.type === tp)).filter(Boolean) as typeof dbTypes,
-      })).map(g => ({
-        ...g,
-        items: q ? g.items.filter(t => t.label.toLowerCase().includes(q) || (t.hint ?? '').toLowerCase().includes(q)) : g.items,
-      })).filter(g => g.items.length > 0)
+      const dbItems = DB_ORDER.map(tp => dbTypes.find(t => t.type === tp)).filter(Boolean) as typeof dbTypes
+      const matchItems = q ? dbItems.filter(t => t.label.toLowerCase().includes(q) || (t.hint ?? '').toLowerCase().includes(q)) : dbItems
 
       return (
         <div className="modal-overlay">
@@ -585,51 +575,36 @@ export default function ConnectionForm({ initial, initialType, category, onClose
               {dbSearch && <button className="picker-search-clear" onClick={() => setDbSearch('')}><X size={11} /></button>}
             </div>
             <div className="modal-body picker-db-body">
-              {matchGroups.map(g => (
-                <div key={g.label} className="picker-group">
-                  <div className="picker-group-label">{g.label}</div>
-                  <div className="picker-group-grid">
-                    {g.items.map(t => {
-                      const notReady = t.type === 'duckdb' && !duckReady
-                      return (
-                        <button key={t.type}
-                          className={`picker-card${notReady ? ' picker-card--dim' : ''}`}
-                          title={notReady ? `需先在「驱动」标签下载驱动` : undefined}
-                          style={{ '--tc': t.color } as React.CSSProperties}
-                          onClick={() => notReady ? pickType(t.type as ConnType, 'drivers') : pickType(t.type as ConnType)}>
-                          <span className="picker-card-icon" style={{ background: t.color + '18', color: t.color }}>
-                            {t.icon}
-                          </span>
-                          <span className="picker-card-name">{t.label}</span>
-                          {t.hint && <span className="picker-card-hint">{t.hint}</span>}
-                          {notReady && <span className="picker-card-badge">需安装驱动</span>}
-                        </button>
-                      )
-                    })}
-                  </div>
-                </div>
-              ))}
+              <div className="picker-group-grid">
+                {matchItems.map(t => {
+                  const notReady = t.type === 'duckdb' && !duckReady
+                  return (
+                    <button key={t.type}
+                      className={`picker-card${notReady ? ' picker-card--dim' : ''}`}
+                      title={notReady ? `需先在「驱动」标签下载驱动` : undefined}
+                      style={{ '--tc': t.color } as React.CSSProperties}
+                      onClick={() => notReady ? pickType(t.type as ConnType, 'drivers') : pickType(t.type as ConnType)}>
+                      <span className="picker-card-icon" style={{ background: t.color + '18', color: t.color }}>
+                        {t.icon}
+                      </span>
+                      <span className="picker-card-name">{t.label}</span>
+                      {t.hint && <span className="picker-card-hint">{t.hint}</span>}
+                      {notReady && <span className="picker-card-badge">需安装驱动</span>}
+                    </button>
+                  )
+                })}
+              </div>
             </div>
           </div>
         </div>
       )
     }
 
-    // 全部：紧凑横列终端 + 分组数据库 + 搜索
-    const DB_GROUPS = [
-      { label: '关系型', types: ['mysql','postgres','sqlite','mariadb','sqlServer','oracle'] as ConnType[] },
-      { label: '分析 / 分布式', types: ['clickHouse','duckdb','tidb','oceanBase'] as ConnType[] },
-      { label: '国产', types: ['kingBase','openGauss'] as ConnType[] },
-      { label: 'NoSQL', types: ['redis','mongodb'] as ConnType[] },
-    ]
+    // 全部：紧凑横列终端 + 连续数据库网格 + 搜索
+    const DB_ORDER = ['mysql','postgres','sqlite','mariadb','sqlServer','oracle','tidb','oceanBase','clickHouse','duckdb','kingBase','openGauss','redis','mongodb'] as ConnType[]
     const q2 = dbSearch.trim().toLowerCase()
-    const allMatchGroups = DB_GROUPS.map(g => ({
-      ...g,
-      items: g.types.map(tp => dbTypes.find(t => t.type === tp)).filter(Boolean) as typeof dbTypes,
-    })).map(g => ({
-      ...g,
-      items: q2 ? g.items.filter(t => t.label.toLowerCase().includes(q2) || (t.hint ?? '').toLowerCase().includes(q2)) : g.items,
-    })).filter(g => g.items.length > 0)
+    const allDbItems = DB_ORDER.map(tp => dbTypes.find(t => t.type === tp)).filter(Boolean) as typeof dbTypes
+    const allMatchItems = q2 ? allDbItems.filter(t => t.label.toLowerCase().includes(q2) || (t.hint ?? '').toLowerCase().includes(q2)) : allDbItems
 
     return (
       <div className="modal-overlay">
@@ -662,30 +637,23 @@ export default function ConnectionForm({ initial, initialType, category, onClose
               </div>
               <div className="picker-all-section-label">数据库</div>
             </>)}
-            {/* 数据库：分组卡片 */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-              {allMatchGroups.map(g => (
-                <div key={g.label}>
-                  <div className="picker-group-label">{g.label}</div>
-                  <div className="picker-group-grid">
-                    {g.items.map(t => {
-                      const notReady = t.type === 'duckdb' && !duckReady
-                      return (
-                        <button key={t.type}
-                          className={`picker-card${notReady ? ' picker-card--dim' : ''}`}
-                          title={notReady ? '需先下载驱动' : undefined}
-                          style={{ '--tc': t.color } as React.CSSProperties}
-                          onClick={() => notReady ? pickType(t.type as ConnType, 'drivers') : pickType(t.type as ConnType)}>
-                          <span className="picker-card-icon" style={{ background: t.color + '18', color: t.color }}>{t.icon}</span>
-                          <span className="picker-card-name">{t.label}</span>
-                          {t.hint && <span className="picker-card-hint">{t.hint}</span>}
-                          {notReady && <span className="picker-card-badge">需安装驱动</span>}
-                        </button>
-                      )
-                    })}
-                  </div>
-                </div>
-              ))}
+            {/* 数据库：连续卡片 */}
+            <div className="picker-group-grid">
+              {allMatchItems.map(t => {
+                const notReady = t.type === 'duckdb' && !duckReady
+                return (
+                  <button key={t.type}
+                    className={`picker-card${notReady ? ' picker-card--dim' : ''}`}
+                    title={notReady ? '需先下载驱动' : undefined}
+                    style={{ '--tc': t.color } as React.CSSProperties}
+                    onClick={() => notReady ? pickType(t.type as ConnType, 'drivers') : pickType(t.type as ConnType)}>
+                    <span className="picker-card-icon" style={{ background: t.color + '18', color: t.color }}>{t.icon}</span>
+                    <span className="picker-card-name">{t.label}</span>
+                    {t.hint && <span className="picker-card-hint">{t.hint}</span>}
+                    {notReady && <span className="picker-card-badge">需安装驱动</span>}
+                  </button>
+                )
+              })}
             </div>
           </div>
         </div>

@@ -3,6 +3,7 @@ import { createPortal, flushSync } from 'react-dom'
 import CodeMirror from '@uiw/react-codemirror'
 import { sql, schemaCompletionSource, StandardSQL, MySQL, MariaSQL, PostgreSQL, SQLite, MSSQL } from '@codemirror/lang-sql'
 import { keymap, EditorView, Decoration, tooltips, type DecorationSet } from '@codemirror/view'
+import { codeFolding, foldEffect, foldGutter, foldService, foldable, foldedRanges, unfoldEffect } from '@codemirror/language'
 
 // 跟随 CSS 变量的编辑器主题（背景/前景/光标均从 app 主题继承，不固定为 oneDark 的 #282c34）
 const _editorDark = EditorView.theme({
@@ -57,7 +58,7 @@ const snippetNavKeymap = keymap.of([
   { key: 'Tab', run: nextSnippetField, shift: prevSnippetField },
   { key: 'Escape', run: clearSnippet },
 ])
-import { Play, RotateCcw, History, GitBranch, Download, AlignLeft, Bookmark, Zap, BookOpen, ShieldAlert, ClipboardList, Undo2, Database, FolderOpen, Layers, ChevronRight, ChevronDown, ChevronUp, MoreHorizontal, Hash, X, Loader2, StopCircle, FilePlus2, Copy, PanelLeft } from 'lucide-react'
+import { Play, RotateCcw, History, GitBranch, Download, AlignLeft, Bookmark, Zap, BookOpen, ShieldAlert, ClipboardList, Undo2, Database, FolderOpen, Layers, ChevronRight, ChevronDown, ChevronUp, MoreHorizontal, Hash, X, Loader2, StopCircle, FilePlus2, Copy, PanelLeft, FoldVertical } from 'lucide-react'
 import DbBrowser from './DbBrowser'
 import ResultTable from './ResultTable'
 import SavedQueriesPanel from './SavedQueriesPanel'
@@ -76,6 +77,7 @@ import { formatDuration } from '../../utils/formatDuration'
 import { appendAuditLog } from '../../utils/auditLog'
 import { markBatchCancelledFrom } from './queryBatchCancel'
 import { hasMysqlDelimiterDirective, hasMysqlUserPreparedStmt, splitSqlStatements, stripSqlComments } from './sqlSplit'
+import { applySqlVariables, findSqlVariables, type SqlVariable } from './sqlVariables'
 
 const QueryHistoryPanel = lazy(() => import('./QueryHistoryPanel'))
 const ExportDialog = lazy(() => import('./ExportDialog'))
@@ -90,6 +92,7 @@ const AuditLogPanel = lazy(() => import('./AuditLogPanel'))
 const TablePeekModal = lazy(() => import('./TablePeekModal'))
 const DdlModal = lazy(() => import('./DdlModal'))
 const RollbackSqlPanel = lazy(() => import('./RollbackSqlPanel'))
+const SqlVariableDialog = lazy(() => import('./SqlVariableDialog'))
 
 function LazySqlPanelFallback() {
   return (
@@ -245,6 +248,81 @@ function parseSingleTable(sqlText: string): { schema: string; table: string } | 
 // 支持主动 kill 正在运行查询的连接类型（MySQL 系走 KILL QUERY，PG 系走 pg_cancel_backend）
 const CANCELABLE_TYPES = new Set(['mysql', 'mariadb', 'tidb', 'oceanBase', 'postgres', 'kingBase', 'openGauss', 'sqlite', 'duckdb'])
 
+function findFoldAtSelection(view: EditorView): { from: number; to: number } | null {
+  const sel = view.state.selection.main
+  let found: { from: number; to: number } | null = null
+  foldedRanges(view.state).between(0, view.state.doc.length, (from, to) => {
+    const cursorInside = sel.empty && sel.from >= from && sel.from <= to
+    const selectionTouches = !sel.empty && from < sel.to && to > sel.from
+    if (cursorInside || selectionTouches) {
+      found = { from, to }
+      return false
+    }
+  })
+  return found
+}
+
+function getFoldedRanges(view: EditorView): Array<{ from: number; to: number }> {
+  const ranges: Array<{ from: number; to: number }> = []
+  foldedRanges(view.state).between(0, view.state.doc.length, (from, to) => {
+    ranges.push({ from, to })
+  })
+  return ranges
+}
+
+function sqlParenFoldRange(doc: string, lineStart: number, lineEnd: number): { from: number; to: number } | null {
+  const len = doc.length
+  let quote: "'" | '"' | '`' | '[' | null = null
+  let lineComment = false
+  let blockComment = false
+  const stack: number[] = []
+  const ranges: Array<{ open: number; close: number }> = []
+
+  for (let i = 0; i < len; i++) {
+    const ch = doc[i]
+    const next = doc[i + 1]
+    if (lineComment) {
+      if (ch === '\n') lineComment = false
+      continue
+    }
+    if (blockComment) {
+      if (ch === '*' && next === '/') { blockComment = false; i++ }
+      continue
+    }
+    if (quote) {
+      if (quote === '[') {
+        if (ch === ']') quote = null
+        continue
+      }
+      if (ch === quote) {
+        if ((quote === '\'' || quote === '"') && next === quote) { i++; continue }
+        quote = null
+      }
+      continue
+    }
+    if (ch === '-' && next === '-') { lineComment = true; i++; continue }
+    if (ch === '/' && next === '*') { blockComment = true; i++; continue }
+    if (ch === '\'') { quote = '\''; continue }
+    if (ch === '"') { quote = '"'; continue }
+    if (ch === '`') { quote = '`'; continue }
+    if (ch === '[') { quote = '['; continue }
+    if (ch === '(') stack.push(i)
+    else if (ch === ')' && stack.length) ranges.push({ open: stack.pop()!, close: i })
+  }
+
+  for (const r of ranges) {
+    const openLine = doc.lastIndexOf('\n', r.open) + 1
+    const closeLine = doc.lastIndexOf('\n', r.close) + 1
+    if (openLine !== lineStart || closeLine === openLine) continue
+    const innerFrom = r.open + 1
+    const innerTo = r.close
+    if (innerTo <= innerFrom) continue
+    return { from: innerFrom, to: innerTo }
+  }
+  if (lineEnd - lineStart > 0) return null
+  return null
+}
+
 export default function SqlEditor({ tabId, connectionId, connType }: Props) {
   // SQL 草稿按顶层 tabId 存储（已扁平化，每个查询标签即一个独立编辑器，无内层子标签）
   const savedSql = useQueryStore((s) => s.sqls[tabId])
@@ -280,6 +358,7 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
   const appColorScheme = useSettingsStore((s) => s.appColorScheme)
   const shortcuts      = useSettingsStore((s) => s.shortcuts)
   const editorViewRef = useRef<EditorView | null>(null)
+  const lastFoldSelectionRef = useRef<{ foldFrom: number; foldTo: number; selFrom: number; selTo: number } | null>(null)
   // DB 分屏面板
   const [dbPanelOpen, setDbPanelOpen] = useState(() => {
     try { return localStorage.getItem(`db-panel-open-${connType}`) === '1' } catch { return false }
@@ -342,6 +421,7 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
   // 编辑器右键菜单 + 导出目标 SQL（区分是否选中）
   const [editorCtx,   setEditorCtx]       = useState<{ x: number; y: number; hasSel: boolean } | null>(null)
   const [exportSql,   setExportSql]       = useState('')
+  const [variablePending, setVariablePending] = useState<{ sql: string; variables: SqlVariable[] } | null>(null)
   // 结果工具栏传送插槽（页签行右侧）
   const [headSlot,    setHeadSlot]        = useState<HTMLDivElement | null>(null)
   const [sqliteAdminOpen, setSqliteAdminOpen] = useState(false)
@@ -371,6 +451,92 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
     setSqlText(value)
     setSql(tabId, value)
   }, [setSql, tabId])
+
+  const foldSelection = useCallback(() => {
+    const view = editorViewRef.current
+    if (!view) return false
+    const sel = view.state.selection.main
+    const hasSelection = sel.from !== sel.to
+    if (!hasSelection) {
+      const effects = []
+      for (let pos = 0; pos < view.state.doc.length;) {
+        const line = view.lineBlockAt(pos)
+        const range = foldable(view.state, line.from, line.to)
+        if (range) effects.push(foldEffect.of(range))
+        pos = (range ? view.lineBlockAt(range.to) : line).to + 1
+      }
+      if (effects.length) view.dispatch({ effects, scrollIntoView: true })
+      view.focus()
+      return true
+    }
+    const from = sel.from
+    const to = sel.to
+    const startLine = view.state.doc.lineAt(from)
+    const rawEndLine = view.state.doc.lineAt(to)
+    const endLine = to === rawEndLine.from && rawEndLine.number > startLine.number
+      ? view.state.doc.line(rawEndLine.number - 1)
+      : rawEndLine
+    if (startLine.number === endLine.number) {
+      toast.info('请选择至少两行 SQL')
+      view.focus()
+      return true
+    }
+    const foldFrom = startLine.to
+    const foldTo = endLine.to
+    if (foldTo <= foldFrom) {
+      toast.info('选区太短，无法收起')
+      view.focus()
+      return true
+    }
+    lastFoldSelectionRef.current = { foldFrom, foldTo, selFrom: from, selTo: to }
+    view.dispatch({
+      effects: foldEffect.of({ from: foldFrom, to: foldTo }),
+      selection: { anchor: startLine.from },
+      scrollIntoView: true,
+    })
+    view.focus()
+    return true
+  }, [])
+
+  const unfoldSelection = useCallback(() => {
+    const view = editorViewRef.current
+    if (!view) return false
+    const folded = findFoldAtSelection(view)
+    if (!folded) {
+      const allFolded = getFoldedRanges(view)
+      if (!view.state.selection.main.empty || allFolded.length === 0) {
+        view.focus()
+        return true
+      }
+      view.dispatch({
+        effects: allFolded.map(range => unfoldEffect.of(range)),
+        scrollIntoView: true,
+      })
+      view.focus()
+      return true
+    }
+    const last = lastFoldSelectionRef.current
+    const restoreSelection = last
+      && last.foldFrom === folded.from
+      && last.foldTo === folded.to
+      && last.selFrom < last.selTo
+      && last.selTo <= view.state.doc.length
+    view.dispatch({
+      effects: unfoldEffect.of(folded),
+      selection: restoreSelection ? { anchor: last.selFrom, head: last.selTo } : undefined,
+      scrollIntoView: true,
+    })
+    if (restoreSelection) lastFoldSelectionRef.current = null
+    view.focus()
+    return true
+  }, [])
+
+  const toggleSqlFold = useCallback(() => {
+    const view = editorViewRef.current
+    if (!view) return
+    if (findFoldAtSelection(view) || (view.state.selection.main.empty && getFoldedRanges(view).length > 0)) unfoldSelection()
+    else foldSelection()
+  }, [foldSelection, unfoldSelection])
 
   const insertSqlAtCursor = useCallback((picked: string) => {
     const view = editorViewRef.current
@@ -1025,6 +1191,15 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectionId, addHistory, txMode, txActive])
 
+  const runSqlWithVariables = useCallback((sqlToRun: string) => {
+    const vars = findSqlVariables(sqlToRun)
+    if (vars.length > 0) {
+      setVariablePending({ sql: sqlToRun, variables: vars })
+      return
+    }
+    runQuery(sqlToRun)
+  }, [runQuery])
+
   // 运行选中 SQL
   const runSelected = useCallback(() => {
     const view = editorViewRef.current
@@ -1033,8 +1208,8 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
       view.state.selection.main.from,
       view.state.selection.main.to,
     ).trim()
-    runQuery(sel || sqlText)
-  }, [sqlText, runQuery])
+    runSqlWithVariables(sel || sqlText)
+  }, [sqlText, runSqlWithVariables])
   const runSelectedRef = useRef(runSelected)
   runSelectedRef.current = runSelected
   const runQueryRef = useRef(runQuery)
@@ -1201,6 +1376,32 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
     const combined: CompletionSource = (ctx) => memberCompletion(ctx, dbSchema) ?? schemaSrc(ctx)
     return [langSupport, langSupport.language.data.of({ autocomplete: combined })]
   }, [dbSchema, sqlDialect])
+  const foldExt = useMemo(() => codeFolding({
+    preparePlaceholder: (state, range) => {
+      const fromLine = state.doc.lineAt(range.from).number
+      const toLine = state.doc.lineAt(range.to).number
+      return Math.max(1, toLine - fromLine + 1)
+    },
+    placeholderDOM: (_view, onclick, lines: number) => {
+      const span = document.createElement('span')
+      span.className = 'cm-sql-fold-placeholder'
+      span.textContent = `... ${lines} 行`
+      span.title = '点击展开'
+      span.addEventListener('click', onclick)
+      return span
+    },
+  }), [])
+  const sqlStructureFoldExt = useMemo(() => [
+    foldService.of((state, lineStart, lineEnd) => sqlParenFoldRange(state.doc.toString(), lineStart, lineEnd)),
+    foldGutter({
+      markerDOM: (open) => {
+        const span = document.createElement('span')
+        span.className = 'cm-sql-fold-marker'
+        span.textContent = open ? '⌄' : '›'
+        return span
+      },
+    }),
+  ], [])
 
   // KB0.3 — CodeMirror 快捷键从 settingsStore 动态生成（改键即时生效）
   // settingsStore combo "Mod+R" → CodeMirror key "Mod-r"
@@ -1223,7 +1424,10 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
     { key: cmKey('sqlCopyLineUp',   'Alt+Shift+ArrowUp'),   run: copyLineUp },
     { key: cmKey('sqlCopyLineDown', 'Alt+Shift+ArrowDown'), run: copyLineDown },
     { key: cmKey('sqlComment',    'Mod+/'),       preventDefault: true, run: toggleLineComment },
-  ])), [shortcuts, sqlText, runExplain])
+    { key: cmKey('sqlFoldSelection',   'Mod+-'),   preventDefault: true, run: foldSelection },
+    { key: cmKey('sqlUnfoldSelection', 'Mod+='),   preventDefault: true, run: unfoldSelection },
+    { key: 'Mod-Shift-=', preventDefault: true, run: unfoldSelection },
+  ])), [shortcuts, sqlText, runExplain, foldSelection, unfoldSelection])
 
 
   // KB1 SQL 编辑器快捷键（非 CodeMirror 部分：格式化、说明、历史、保存）
@@ -1236,6 +1440,8 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
     sqlSave:       () => setSavedOpen(v => !v),
     sqlStop:       () => { if (running) stopQuery() },
     sqlFocusEditor:() => { editorViewRef.current?.focus() },
+    sqlFoldSelection:   () => { foldSelection() },
+    sqlUnfoldSelection: () => { unfoldSelection() },
     sqlTxCommit:   () => { if (txActive) setTxShortcutConfirm('commit') },
     sqlTxRollback: () => { if (txActive) setTxShortcutConfirm('rollback') },
     sqlToggleResult: () => setResultCollapsed(v => !v),
@@ -1388,6 +1594,15 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
           <button className="sql-tool-btn" onClick={formatSql} data-tip="格式化 SQL" data-shortcut={sc('sqlFormat')} disabled={!sqlText.trim()}>
             <AlignLeft size={14} strokeWidth={2} />
           </button>
+          <button
+            className="sql-tool-btn"
+            onClick={toggleSqlFold}
+            data-tip="收起/展开选中 SQL"
+            data-shortcut={`${sc('sqlFoldSelection')} / ${sc('sqlUnfoldSelection')}`}
+            disabled={!sqlText.trim()}
+          >
+            <FoldVertical size={14} strokeWidth={2} />
+          </button>
           <button className="sql-tool-btn" onClick={() => setSavedOpen(true)} data-tip="保存查询（有选中则存选中片段）" data-shortcut={sc('sqlSave')} disabled={!sqlText.trim()}>
             <Bookmark size={14} strokeWidth={2} />
           </button>
@@ -1515,7 +1730,7 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
           <CodeMirror
             value={sqlText}
             height="100%"
-            extensions={[sqlExt, sqlKeymap, snippetNavKeymap, modClickExt, tableHoverField, tableHoverExt, sqlHighlight, _editorTooltips, cmSearchPhrases]}
+            extensions={[sqlExt, sqlStructureFoldExt, foldExt, sqlKeymap, snippetNavKeymap, modClickExt, tableHoverField, tableHoverExt, sqlHighlight, _editorTooltips, cmSearchPhrases]}
             theme={isDark ? _editorDark : _editorLight}
             onCreateEditor={(view) => { editorViewRef.current = view }}
             onChange={(val) => { setSqlDraft(val); preFormatRef.current = null }}
@@ -1914,12 +2129,27 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
         )
       })()}
 
+      {variablePending && (
+        <Suspense fallback={<LazySqlPanelFallback />}>
+          <SqlVariableDialog
+            sql={variablePending.sql}
+            variables={variablePending.variables}
+            onCancel={() => setVariablePending(null)}
+            onRun={(values) => {
+              const pending = variablePending
+              setVariablePending(null)
+              runQuery(applySqlVariables(pending.sql, pending.variables, values))
+            }}
+          />
+        </Suspense>
+      )}
+
       {/* DBA 诊断模板库 */}
       {dbaOpen && (
         <Suspense fallback={<LazySqlPanelFallback />}>
           <DbaTemplatesPanel
             connType={connType}
-            onRun={sql => { setSqlDraft(sql); runQuery(sql); setDbaOpen(false) }}
+            onRun={sql => { setSqlDraft(sql); runSqlWithVariables(sql); setDbaOpen(false) }}
             onClose={() => setDbaOpen(false)}
           />
         </Suspense>

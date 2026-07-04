@@ -152,6 +152,8 @@ export const SHORTCUT_DEFS: ShortcutDef[] = [
   { id: 'sqlStop',         label: '停止执行',           defaultCombo: 'Mod+B',           group: 'SQL 编辑器', scope: 'sql-editor' },
   { id: 'sqlExplain',      label: 'EXPLAIN 执行计划',   defaultCombo: 'Mod+Shift+X',     group: 'SQL 编辑器', scope: 'sql-editor' },
   { id: 'sqlFormat',       label: '格式化 SQL',         defaultCombo: 'Mod+Shift+F',     group: 'SQL 编辑器', scope: 'sql-editor' },
+  { id: 'sqlFoldSelection', label: '收起选中 SQL',       defaultCombo: 'Mod+-',           group: 'SQL 编辑器', scope: 'sql-editor' },
+  { id: 'sqlUnfoldSelection', label: '展开 SQL',         defaultCombo: 'Mod+=',           group: 'SQL 编辑器', scope: 'sql-editor' },
   { id: 'sqlComment',      label: '行注释',             defaultCombo: 'Mod+/',           group: 'SQL 编辑器', scope: 'sql-editor' },
   { id: 'sqlSave',         label: '保存查询',           defaultCombo: 'Mod+S',           group: 'SQL 编辑器', scope: 'sql-editor' },
   { id: 'sqlHistory',      label: '查询历史',           defaultCombo: 'Mod+H',           group: 'SQL 编辑器', scope: 'sql-editor' },

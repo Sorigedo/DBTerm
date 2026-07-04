@@ -24,6 +24,13 @@ interface TermCallbacks {
   reconnect: () => void
 }
 
+interface DragPreview {
+  tabId: string
+  title: string
+  x: number
+  y: number
+}
+
 interface AppState {
   activeView: ActiveView
   connections: ConnConfig[]
@@ -70,7 +77,7 @@ interface AppState {
   cancelCloseConfirm: () => void
   closeOtherTabs: (keepId: string) => void
   closeTabsToRight: (fromId: string) => void
-  moveTab: (fromId: string, toId: string) => void
+  moveTab: (fromId: string, toId: string, position?: 'before' | 'after') => void
   renameTab: (tabId: string, title: string) => void
   setTabMeta: (tabId: string, meta: Record<string, string | undefined>) => void
   setTabDirty: (tabId: string, dirty: boolean) => void
@@ -99,6 +106,8 @@ interface AppState {
   setPaneActive: (pane: 'a' | 'b', tabId: string) => void
   draggingTabId: string | null  // 正在拖拽的标签 id（跨组件共享：标签栏 → 内容区落点）
   setDraggingTab: (id: string | null) => void
+  dragPreview: DragPreview | null
+  setDragPreview: (preview: DragPreview | null) => void
   setPendingRun: (connId: string, sql: string) => void
   clearPendingRun: (connId: string) => void
   // 只填充编辑器、不自动执行（用于 CREATE TABLE 等模板）
@@ -141,6 +150,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   activeBId: null,
   focusedPane: 'a',
   draggingTabId: null,
+  dragPreview: null,
   pendingRun: {},
 
   openSplit: (dir) => set((s) => ({
@@ -168,6 +178,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       : { activeAId: tabId, focusedPane: 'a', activeTabId: tabId }
   ),
   setDraggingTab: (id) => set({ draggingTabId: id }),
+  setDragPreview: (preview) => set({ dragPreview: preview }),
   setActiveView: (view) => set({ activeView: view }),
   openSettings: () => set({ settingsOpen: true }),
   closeSettings: () => set({ settingsOpen: false }),
@@ -366,7 +377,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     })
   },
 
-  moveTab: (fromId, toId) => {
+  moveTab: (fromId, toId, position = 'before') => {
     if (fromId === toId) return
     set((s) => {
       const tabs = [...s.tabs]
@@ -374,7 +385,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       const ti = tabs.findIndex(t => t.id === toId)
       if (fi < 0 || ti < 0) return s
       const [moved] = tabs.splice(fi, 1)
-      tabs.splice(ti, 0, moved)
+      const targetIdx = tabs.findIndex(t => t.id === toId)
+      if (targetIdx < 0) return s
+      tabs.splice(position === 'after' ? targetIdx + 1 : targetIdx, 0, moved)
       return { tabs }
     })
   },

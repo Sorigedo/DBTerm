@@ -1,5 +1,5 @@
 import { lazy, Suspense, useState, useRef, useEffect, useCallback } from 'react'
-import { Wifi, Send } from 'lucide-react'
+import { Wifi, Send, Terminal as TerminalIcon, Database, Table2, Columns3, FileCode2 } from 'lucide-react'
 import TabBar from './TabBar'
 import PaneTabBar from './PaneTabBar'
 import EmptyState from './EmptyState'
@@ -22,6 +22,16 @@ const DbToolPanels = lazy(() => import('../DbTools/DbToolPanels'))
 
 function LazyPaneFallback({ label = '加载中...' }: { label?: string }) {
   return <div className="workspace-lazy-fallback">{label}</div>
+}
+
+function tabPreviewIcon(tab?: WorkspaceTab) {
+  const props = { size: 12, strokeWidth: 1.6, style: { flexShrink: 0 } }
+  if (!tab) return null
+  if (tab.type === 'terminal') return <TerminalIcon {...props} />
+  if (tab.type === 'table-data') return <Table2 {...props} />
+  if (tab.type === 'schema-browser') return <Columns3 {...props} />
+  if (tab.type === 'object-editor') return <FileCode2 {...props} />
+  return <Database {...props} />
 }
 
 function BroadcastBar({ tabs, connections }: { tabs: WorkspaceTab[], connections: ConnConfig[] }) {
@@ -91,6 +101,8 @@ export default function Workspace() {
   const splitRatio     = useAppStore((s) => s.splitRatio)
   const setSplitRatio  = useAppStore((s) => s.setSplitRatio)
   const draggingTabId  = useAppStore((s) => s.draggingTabId)
+  const dragPreview    = useAppStore((s) => s.dragPreview)
+  const setDragPreview = useAppStore((s) => s.setDragPreview)
   const dbToolOpen     = useDbToolsStore((s) => !!s.open)
   const [dropZone, setDropZone] = useState<string | null>(null)  // 当前悬停的落点 key
   const [panelWidth, setPanelWidth] = useState(320)
@@ -191,17 +203,12 @@ export default function Workspace() {
   const handlePaneTabGrab = useCallback((tabId: string, pane: 'a' | 'b', startX: number, startY: number) => {
     const drag = { tabId, pane, startX, startY, started: false }
 
-    const computeKey = (cx: number, cy: number): string => {
-      const el = wrapRef.current
-      if (!el) return 'split-h'
-      const r = el.getBoundingClientRect()
-      const fx = (cx - r.left) / r.width
-      const fy = (cy - r.top) / r.height
+    const computeKey = (cx: number, cy: number): string | null => {
       const { splitOn: so, splitDir: sd } = useAppStore.getState()
-      if (so) return (sd === 'h' ? fx >= 0.5 : fy >= 0.5) ? 'second' : 'main'
-      if (fx >= 0.5) return 'split-h'
-      if (fy >= 0.5) return 'split-v'
-      return 'split-h'
+      const tgt = resolveDropTarget(cx, cy, so, sd)
+      if (!tgt) return null
+      if (tgt.kind === 'pane') return tgt.pane === 'b' ? 'second' : 'main'
+      return tgt.dir === 'v' ? 'split-v' : 'split-h'
     }
 
     const onMove = (e: PointerEvent) => {
@@ -209,17 +216,25 @@ export default function Workspace() {
         if (Math.abs(e.clientX - drag.startX) > 5 || Math.abs(e.clientY - drag.startY) > 5) {
           drag.started = true
           useAppStore.getState().setDraggingTab(drag.tabId)
+          const tab = useAppStore.getState().tabs.find(t => t.id === drag.tabId)
+          setDragPreview(tab ? { tabId: tab.id, title: tab.title, x: e.clientX, y: e.clientY } : null)
         }
       }
-      if (drag.started) setDropZone(computeKey(e.clientX, e.clientY))
+      if (drag.started) {
+        const preview = useAppStore.getState().dragPreview
+        if (preview) setDragPreview({ ...preview, x: e.clientX, y: e.clientY })
+        setDropZone(computeKey(e.clientX, e.clientY))
+      }
     }
 
     const onUp = (e: PointerEvent) => {
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onCancel)
       const st = useAppStore.getState()
       st.setDraggingTab(null)
       setDropZone(null)
+      setDragPreview(null)
       if (!drag.started) return
       const tgt = resolveDropTarget(e.clientX, e.clientY, st.splitOn, st.splitDir)
       if (tgt?.kind === 'pane' && tgt.pane !== drag.pane) {
@@ -230,13 +245,43 @@ export default function Workspace() {
       }
     }
 
+    const onCancel = () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onCancel)
+      useAppStore.getState().setDraggingTab(null)
+      setDropZone(null)
+      setDragPreview(null)
+    }
+
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onCancel)
   }, [moveTabToPane, openSplit])
 
   const paneATabs = tabs.filter(t => !paneBTabIds.includes(t.id))
   const paneBTabs = tabs.filter(t => paneBTabIds.includes(t.id))
   const horiz = splitDir === 'h'
+
+  useEffect(() => {
+    if (!draggingTabId) {
+      setDropZone(null)
+      return
+    }
+
+    const onMove = (e: PointerEvent) => {
+      const st = useAppStore.getState()
+      const tgt = resolveDropTarget(e.clientX, e.clientY, st.splitOn, st.splitDir)
+      if (!tgt) {
+        setDropZone(null)
+        return
+      }
+      setDropZone(tgt.kind === 'pane' ? (tgt.pane === 'b' ? 'second' : 'main') : (tgt.dir === 'v' ? 'split-v' : 'split-h'))
+    }
+
+    window.addEventListener('pointermove', onMove)
+    return () => window.removeEventListener('pointermove', onMove)
+  }, [draggingTabId])
 
   return (
     <div className="workspace">
@@ -409,20 +454,16 @@ export default function Workspace() {
             </div>
           )}
 
-          {/* 全屏透明拖拽 overlay（z-50）：统一接管所有 drag 事件，彻底绕过 xterm canvas 的 z-index 竞争 */}
+          {/* 拖标签到内容区边缘的分屏 / 合并落点；未命中热区时不接管事件，避免影响标签排序。 */}
           {draggingTabId && (splitOn || tabs.filter(t => !t.pinned).length >= 2) && (() => {
             const draggingTab = tabs.find(t => t.id === draggingTabId)
             if (!draggingTab || draggingTab.pinned) return null
 
-            // 根据光标在 overlay 内的相对位置决定操作目标
-            const getZoneKey = (e: React.DragEvent): string | null => {
-              const r = e.currentTarget.getBoundingClientRect()
-              const fx = (e.clientX - r.left) / r.width
-              const fy = (e.clientY - r.top) / r.height
-              if (splitOn) return (horiz ? fx >= 0.5 : fy >= 0.5) ? 'second' : 'main'
-              if (fx >= 0.5) return 'split-h'
-              if (fy >= 0.5) return 'split-v'
-              return 'split-h'  // 默认左右分屏
+            const getZoneKey = (clientX: number, clientY: number): string | null => {
+              const tgt = resolveDropTarget(clientX, clientY, splitOn, splitDir)
+              if (!tgt) return null
+              if (tgt.kind === 'pane') return tgt.pane === 'b' ? 'second' : 'main'
+              return tgt.dir === 'v' ? 'split-v' : 'split-h'
             }
 
             const zoneVisuals = splitOn
@@ -431,41 +472,41 @@ export default function Workspace() {
                      { key: 'second', tip: '移到右屏', style: { top:0, right:0, bottom:0, width:'50%' } as React.CSSProperties }]
                   : [{ key: 'main', tip: '移到上屏', style: { top:0, left:0, right:0, height:'50%' } as React.CSSProperties },
                      { key: 'second', tip: '移到下屏', style: { bottom:0, left:0, right:0, height:'50%' } as React.CSSProperties }])
-              : [{ key: 'split-h', tip: '左右分屏', style: { top:0, right:0, bottom:0, width:'42%' } as React.CSSProperties },
-                 { key: 'split-v', tip: '上下分屏', style: { bottom:0, left:0, width:'58%', height:'42%' } as React.CSSProperties }]
+              : [{ key: 'split-h', tip: '左右分屏', style: { top:0, right:0, bottom:0, width:'22%' } as React.CSSProperties },
+                 { key: 'split-v', tip: '上下分屏', style: { bottom:0, left:0, right:'22%', height:'22%' } as React.CSSProperties }]
 
             return (
               <div
                 key="drag-overlay"
-                style={{ position: 'absolute', top:0, left:0, right:0, bottom:0, zIndex: 50 }}
-                onDragOver={e => {
-                  e.preventDefault()
-                  e.dataTransfer.dropEffect = 'move'
-                  const key = getZoneKey(e)
-                  if (dropZone !== key) setDropZone(key)
-                }}
-                onDragLeave={e => {
-                  if (!e.currentTarget.contains(e.relatedTarget as Node)) setDropZone(null)
-                }}
-                onDrop={e => {
-                  e.preventDefault()
-                  const id = draggingTabId
-                  setDropZone(null)
-                  if (!id) return
-                  const key = getZoneKey(e)
-                  if (splitOn) {
-                    moveTabToPane(id, key === 'second' ? 'b' : 'a')
-                  } else {
-                    openSplit(key === 'split-v' ? 'v' : 'h')
-                    moveTabToPane(id, 'b')
-                  }
-                }}
+                style={{ position: 'absolute', top:0, left:0, right:0, bottom:0, zIndex: 50, pointerEvents: 'none' }}
               >
                 {zoneVisuals.map(z => (
                   <div
                     key={z.key}
                     className={`wsplit-zone${dropZone === z.key ? ' over' : ''}`}
-                    style={{ position: 'absolute', pointerEvents: 'none', ...z.style }}
+                    style={{ position: 'absolute', pointerEvents: 'auto', ...z.style }}
+                    onDragOver={e => {
+                      e.preventDefault()
+                      e.dataTransfer.dropEffect = 'move'
+                      const key = getZoneKey(e.clientX, e.clientY)
+                      if (dropZone !== key) setDropZone(key)
+                    }}
+                    onDragLeave={() => setDropZone(null)}
+                    onDrop={e => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      const id = draggingTabId
+                      setDropZone(null)
+                      if (!id) return
+                      const key = getZoneKey(e.clientX, e.clientY)
+                      if (!key) return
+                      if (splitOn) {
+                        moveTabToPane(id, key === 'second' ? 'b' : 'a')
+                      } else {
+                        openSplit(key === 'split-v' ? 'v' : 'h')
+                        moveTabToPane(id, 'b')
+                      }
+                    }}
                   >
                     <span className="wsplit-zone__tip">{z.tip}</span>
                   </div>
@@ -497,6 +538,18 @@ export default function Workspace() {
           <DbToolPanels />
         </Suspense>
       )}
+      {dragPreview && (() => {
+        const tab = tabs.find(t => t.id === dragPreview.tabId)
+        return (
+          <div
+            className="tab-drag-preview"
+            style={{ transform: `translate3d(${dragPreview.x + 12}px, ${dragPreview.y + 12}px, 0)` }}
+          >
+            {tabPreviewIcon(tab)}
+            <span className="tab-drag-preview__label">{dragPreview.title}</span>
+          </div>
+        )
+      })()}
     </div>
   )
 }

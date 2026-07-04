@@ -45,6 +45,7 @@ export default function PaneTabBar({ pane, paneTabs, activeId, focused, style, o
   const renameTab       = useAppStore(s => s.renameTab)
   const connections     = useAppStore(s => s.connections)
   const tabs            = useAppStore(s => s.tabs)
+  const draggingTabId   = useAppStore(s => s.draggingTabId)
   const settings        = useSettingsStore()
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameVal, setRenameVal] = useState('')
@@ -129,6 +130,7 @@ export default function PaneTabBar({ pane, paneTabs, activeId, focused, style, o
   }
 
   function handleMouseEnter(tabId: string) {
+    if (useAppStore.getState().draggingTabId) return
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current)
     const { tabHoverActivate } = useSettingsStore.getState()
     if (tabHoverActivate === 'never') return
@@ -172,7 +174,7 @@ export default function PaneTabBar({ pane, paneTabs, activeId, focused, style, o
           return (
           <div
             key={tab.id}
-            className={`pane-tab${tab.id === activeId ? ' active' : ''}`}
+            className={`pane-tab${tab.id === activeId ? ' active' : ''}${draggingTabId === tab.id ? ' dragging' : ''}`}
             onPointerDown={e => {
               if (e.button !== 0) return
               e.stopPropagation()

@@ -9,8 +9,7 @@ import { useSettingsStore } from '../../stores/settingsStore'
 import { displayShortcutStr, SHORTCUT_DEFS } from '../../utils/shortcuts'
 import { wid } from '../../utils/windowTag'
 import { useWheelScroll } from '../../utils/wheelScroll'
-import { openNewAppWindowWithTab, reattachTabToWindow } from '../../utils/multiWindow'
-import { findWindowLabelAtCursor } from '../../utils/windowRegistry'
+import { openNewAppWindowWithTab } from '../../utils/multiWindow'
 import { markDetaching, clearDetaching, snapshotTerminal } from '../../utils/adopt'
 import { toast } from '../../stores/toastStore'
 import QuickConnectDialog from '../Terminal/QuickConnectDialog'
@@ -19,33 +18,33 @@ import type { TabMouseAction } from '../../stores/settingsStore'
 
 const isTauriEnv = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 
-/** 可否撕离到新窗口：仅非固定、非对象编辑（草稿不持久化会丢失），且在 Tauri 环境 */
+/** 鍙惁鎾曠鍒版柊绐楀彛锛氫粎闈炲浐瀹氥€侀潪瀵硅薄缂栬緫锛堣崏绋夸笉鎸佷箙鍖栦細涓㈠け锛夛紝涓斿湪 Tauri 鐜 */
 function canTearOffTab(tab?: WorkspaceTab): boolean {
   return isTauriEnv && !!tab && !tab.pinned && tab.type !== 'object-editor'
 }
 
-/** 撕离：新建窗口接管该标签的活会话，再从本窗口关闭它（force 跳过未保存确认） */
+/** 鎾曠锛氭柊寤虹獥鍙ｆ帴绠¤鏍囩鐨勬椿浼氳瘽锛屽啀浠庢湰绐楀彛鍏抽棴瀹冿紙force 璺宠繃鏈繚瀛樼‘璁わ級 */
 function tearOffTab(tab: WorkspaceTab, closeTab: (id: string, force?: boolean) => void): void {
   if (!canTearOffTab(tab)) return
-  // 撕离前抓取终端当前画面快照（含滚屏），让新窗口能还原历史内容
+  // 鎾曠鍓嶆姄鍙栫粓绔綋鍓嶇敾闈㈠揩鐓э紙鍚粴灞忥級锛岃鏂扮獥鍙ｈ兘杩樺師鍘嗗彶鍐呭
   const snapshot = tab.type === 'terminal' ? snapshotTerminal(tab.id) : null
-  // 查询页：抓取未保存的 SQL 草稿一并迁移，避免新窗口空白
+  // 鏌ヨ椤碉細鎶撳彇鏈繚瀛樼殑 SQL 鑽夌涓€骞惰縼绉伙紝閬垮厤鏂扮獥鍙ｇ┖鐧?
   const sqlDraft = tab.type === 'query' ? (useQueryStore.getState().sqls[tab.id] ?? null) : null
   markDetaching(tab.id)
   openNewAppWindowWithTab(tab, snapshot, sqlDraft)
     .then(() => closeTab(tab.id, true))
-    .catch((e) => toast.error(`移到新窗口失败：${String(e)}`))
+    .catch((e) => toast.error(`绉诲埌鏂扮獥鍙ｅけ璐ワ細${String(e)}`))
     .finally(() => setTimeout(() => clearDetaching(tab.id), 1500))
 }
 
-/** 中间省略截断 */
+/** 涓棿鐪佺暐鎴柇 */
 function truncateMiddle(text: string, max = 20): string {
   if (text.length <= max) return text
   const half = Math.floor((max - 1) / 2)
-  return text.slice(0, half) + '…' + text.slice(-half)
+  return text.slice(0, half) + '...' + text.slice(-half)
 }
 
-/** 右键上下文菜单 */
+/** 鍙抽敭涓婁笅鏂囪彍鍗?*/
 function TabCtxMenu({
   tabId, x, y, onClose, onRename,
 }: {
@@ -79,9 +78,9 @@ function TabCtxMenu({
   }
 
   const items: Array<{ label: string; action: () => void; danger?: boolean; shortcut?: string } | 'divider'> = [
-    { label: '关闭标签', action: () => { requestCloseTab(tabId); onClose() }, danger: true, shortcut: scStr('closeTab') },
-    { label: '关闭其他标签', action: () => { closeOtherTabs(tabId); onClose() } },
-    ...(hasRight ? [{ label: '关闭右侧标签', action: () => { closeTabsToRight(tabId); onClose() } } as const] : []),
+    { label: '鍏抽棴鏍囩', action: () => { requestCloseTab(tabId); onClose() }, danger: true, shortcut: scStr('closeTab') },
+    { label: '鍏抽棴鍏朵粬鏍囩', action: () => { closeOtherTabs(tabId); onClose() } },
+    ...(hasRight ? [{ label: '鍏抽棴鍙充晶鏍囩', action: () => { closeTabsToRight(tabId); onClose() } } as const] : []),
     'divider',
     ...(canSplit
       ? [
@@ -89,7 +88,7 @@ function TabCtxMenu({
           { label: '在下方分屏显示', action: () => { openSplit('v'); moveTabToPane(tabId, 'b'); onClose() } } as const,
         ] : []),
     ...(inB
-      ? [{ label: '移回主屏', action: () => { moveTabToPane(tabId, 'a'); onClose() } } as const] : []),
+      ? [{ label: '绉诲洖涓诲睆', action: () => { moveTabToPane(tabId, 'a'); onClose() } } as const] : []),
     ...(canTearOff && tab
       ? [{ label: '移到新窗口', action: () => { tearOffTab(tab, closeTab); onClose() } } as const] : []),
     { label: '重命名', action: () => { onRename(); onClose() } },
@@ -121,11 +120,11 @@ export default function TabBar() {
     tabs, activeTabId, connections,
     setActiveTab, closeTab, requestCloseTab, openTab, openQueryTab, renameTab, moveTab,
     termDisconnected, termCallbacks, setTermDisconnected,
-    splitOn, splitDir, openSplit, closeSplit, moveTabToPane, setDraggingTab,
+    splitOn, splitDir, openSplit, closeSplit, moveTabToPane, setDraggingTab, setDragPreview,
   } = useAppStore()
   const [quickConnOpen, setQuickConnOpen] = useState(false)
 
-  // 点按钮开空分屏；同方向再点 = 取消
+  // 鐐规寜閽紑绌哄垎灞忥紱鍚屾柟鍚戝啀鐐?= 鍙栨秷
   const toggleSplit = (dir: 'h' | 'v') => {
     if (splitOn && splitDir === dir) closeSplit()
     else openSplit(dir)
@@ -139,7 +138,7 @@ export default function TabBar() {
       closeTab(snap.id)
       setTimeout(() => {
         openTab({ id: snap.id, connectionId: snap.connectionId, title: snap.title, type: snap.type })
-        // 在重新打开之后清除断开状态，避免被旧的 ssh:disconnected 事件覆盖
+        // 鍦ㄩ噸鏂版墦寮€涔嬪悗娓呴櫎鏂紑鐘舵€侊紝閬垮厤琚棫鐨?ssh:disconnected 浜嬩欢瑕嗙洊
         setTermDisconnected(snap.id, false)
       }, 80)
     }
@@ -163,10 +162,13 @@ export default function TabBar() {
   const overflowBtnRef  = useRef<HTMLButtonElement>(null)
   const dragTabRef      = useRef<string | null>(null)
   const dragOverRef     = useRef<string | null>(null)
-  const reorderedRef    = useRef(false)   // 本次拖拽是否已在标签栏内完成排序（命中某个标签的 onDrop）
+  const pointerDragRef  = useRef<{ tabId: string; startX: number; startY: number; started: boolean } | null>(null)
   const [dragOverId, setDragOverId] = useState<string | null>(null)
+  const [dragInsertSide, setDragInsertSide] = useState<'before' | 'after'>('before')
+  const [dragInsertX, setDragInsertX] = useState<number | null>(null)
+  const [draggingId, setDraggingId] = useState<string | null>(null)
 
-  // 鼠标滚轮垂直滚动 → 横向滚动 tab 栏（纯横向容器，统一规则见 utils/wheelScroll）
+  // 榧犳爣婊氳疆鍨傜洿婊氬姩 鈫?妯悜婊氬姩 tab 鏍忥紙绾í鍚戝鍣紝缁熶竴瑙勫垯瑙?utils/wheelScroll锛?
   useWheelScroll(scrollRef, { horizontalOnly: true })
 
   const activeTab  = tabs.find((t) => t.id === activeTabId)
@@ -178,7 +180,7 @@ export default function TabBar() {
   const isTermDisconnected  = isLocalDisconnected || isSshDisconnected
   const activeTermCbs = isLocalTerm ? termCallbacks[activeTab?.id ?? ''] : undefined
 
-  // 格式化 tab 标题
+  // 鏍煎紡鍖?tab 鏍囬
   function tabIcon(tab: WorkspaceTab) {
     if (tab.type === 'terminal')       return <Terminal size={12} strokeWidth={1.5} style={{ flexShrink: 0 }} />
     if (tab.type === 'table-data')     return <Table2 size={12} strokeWidth={1.5} style={{ flexShrink: 0 }} />
@@ -188,7 +190,7 @@ export default function TabBar() {
   }
 
   function getTitle(tab: WorkspaceTab): string {
-    // 仅终端套用 user@host 格式；query / object-editor / schema-browser / table-data 标题本身具名
+    // 浠呯粓绔鐢?user@host 鏍煎紡锛泀uery / object-editor / schema-browser / table-data 鏍囬鏈韩鍏峰悕
     if (tab.type !== 'terminal') return tab.title
     const conn = connections.find(c => c.id === tab.connectionId)
     if (!conn) return tab.title
@@ -198,7 +200,7 @@ export default function TabBar() {
     return tab.title
   }
 
-  // 根据截断模式处理显示文本；仅终端同连接多开时附加序号（query 标题已含序号）
+  // 鏍规嵁鎴柇妯″紡澶勭悊鏄剧ず鏂囨湰锛涗粎缁堢鍚岃繛鎺ュ寮€鏃堕檮鍔犲簭鍙凤紙query 鏍囬宸插惈搴忓彿锛?
   function getDisplayTitle(tab: WorkspaceTab): string {
     const title = getTitle(tab)
     let display = title
@@ -212,7 +214,7 @@ export default function TabBar() {
     return settings.tabTextTruncate === 'middle' ? truncateMiddle(display, 20) : display
   }
 
-  // 执行鼠标动作（直接读 getState() 避免闭包问题）
+  // 鎵ц榧犳爣鍔ㄤ綔锛堢洿鎺ヨ getState() 閬垮厤闂寘闂锛?
   function handleTabAction(action: TabMouseAction, tab: WorkspaceTab, clientX?: number, clientY?: number) {
     const isTerminal = tab.type === 'terminal'
     switch (action) {
@@ -234,7 +236,7 @@ export default function TabBar() {
         }
         break
 
-      // ── SSH 终端专用：新建终端标签页（多开）─────────────────────
+      // 鈹€鈹€ SSH 缁堢涓撶敤锛氭柊寤虹粓绔爣绛鹃〉锛堝寮€锛夆攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
       case 'new':
       case 'duplicate-ssh':
         if (isTerminal) {
@@ -243,14 +245,14 @@ export default function TabBar() {
         }
         break
 
-      // ── 通用：复制当前标签页 ─────────────────────────────────────
+      // 鈹€鈹€ 閫氱敤锛氬鍒跺綋鍓嶆爣绛鹃〉 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
       case 'duplicate':
         openTab({ ...tab, id: wid(`${tab.connectionId}-dup-${Date.now()}`) })
         break
     }
   }
 
-  // 提交重命名
+  // 鎻愪氦閲嶅懡鍚?
   const renameValRef = useRef(renameVal)
   renameValRef.current = renameVal
 
@@ -259,8 +261,9 @@ export default function TabBar() {
     setRenamingId(null)
   }
 
-  // hover 激活
+  // hover 婵€娲?
   function handleMouseEnter(tabId: string) {
+    if (draggingId || useAppStore.getState().draggingTabId) return
     const { tabHoverActivate } = useSettingsStore.getState()
     if (tabHoverActivate === 'never') return
     const delay = tabHoverActivate === 'immediately' ? 0
@@ -270,6 +273,146 @@ export default function TabBar() {
 
   function handleMouseLeave() {
     if (hoverTimerRef.current) { clearTimeout(hoverTimerRef.current); hoverTimerRef.current = null }
+  }
+
+  function clearTabInsertHint() {
+    dragOverRef.current = null
+    setDragOverId(null)
+    setDragInsertX(null)
+  }
+
+  function clearDragVisuals() {
+    setDraggingId(null)
+    setDragPreview(null)
+    clearTabInsertHint()
+  }
+
+  function resolveTabInsert(clientX: number): { targetId: string; side: 'before' | 'after'; markerX: number } | null {
+    const bar = scrollRef.current
+    const fromId = dragTabRef.current
+    if (!bar || !fromId) return null
+
+    const els = Array.from(bar.querySelectorAll<HTMLElement>('[data-tab-id]'))
+      .filter(el => el.dataset.tabId && el.dataset.tabId !== fromId)
+    if (els.length === 0) return null
+
+    const barLeft = bar.getBoundingClientRect().left
+    for (const el of els) {
+      const r = el.getBoundingClientRect()
+      if (clientX < r.left + r.width / 2) {
+        return { targetId: el.dataset.tabId!, side: 'before', markerX: r.left - barLeft + bar.scrollLeft }
+      }
+    }
+
+    const last = els[els.length - 1]
+    const r = last.getBoundingClientRect()
+    return { targetId: last.dataset.tabId!, side: 'after', markerX: r.right - barLeft + bar.scrollLeft }
+  }
+
+  function updateTabInsertHint(clientX: number): ReturnType<typeof resolveTabInsert> {
+    const target = resolveTabInsert(clientX)
+    if (!target) {
+      clearTabInsertHint()
+      return null
+    }
+    dragOverRef.current = target.targetId
+    setDragOverId(target.targetId)
+    setDragInsertSide(target.side)
+    setDragInsertX(target.markerX)
+    return target
+  }
+
+  function beginPointerDrag(e: React.PointerEvent, tab: WorkspaceTab, isRenaming: boolean) {
+    if (e.button !== 0 || isRenaming || tab.pinned) return
+    if ((e.target as HTMLElement).closest('button,input')) return
+    e.preventDefault()
+    e.stopPropagation()
+    window.getSelection()?.removeAllRanges()
+
+    pointerDragRef.current = { tabId: tab.id, startX: e.clientX, startY: e.clientY, started: false }
+
+    const onMove = (ev: PointerEvent) => {
+      const drag = pointerDragRef.current
+      if (!drag) return
+      const moved = Math.abs(ev.clientX - drag.startX) > 5 || Math.abs(ev.clientY - drag.startY) > 5
+      if (!drag.started && moved) {
+        drag.started = true
+        dragTabRef.current = drag.tabId
+        setDraggingTab(drag.tabId)
+        setDraggingId(drag.tabId)
+        const tabNow = useAppStore.getState().tabs.find(t => t.id === drag.tabId)
+        setDragPreview({ tabId: drag.tabId, title: tabNow ? getDisplayTitle(tabNow) : '', x: ev.clientX, y: ev.clientY })
+        document.body.classList.add('tab-dragging')
+      }
+      if (!drag.started) return
+      const preview = useAppStore.getState().dragPreview
+      if (preview) setDragPreview({ ...preview, x: ev.clientX, y: ev.clientY })
+
+      const bar = scrollRef.current
+      const br = bar?.getBoundingClientRect()
+      if (br && ev.clientX >= br.left && ev.clientX <= br.right && ev.clientY >= br.top && ev.clientY <= br.bottom) {
+        updateTabInsertHint(ev.clientX)
+      } else {
+        clearTabInsertHint()
+      }
+    }
+
+    const onUp = (ev: PointerEvent) => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onCancel)
+
+      const drag = pointerDragRef.current
+      pointerDragRef.current = null
+      dragTabRef.current = null
+      document.body.classList.remove('tab-dragging')
+      setDraggingTab(null)
+      setDragPreview(null)
+      clearDragVisuals()
+      if (!drag || !drag.started) return
+
+      const st = useAppStore.getState()
+      const tabNow = st.tabs.find(t => t.id === drag.tabId)
+      if (tabNow?.pinned) return
+
+      const tgt = resolveDropTarget(ev.clientX, ev.clientY, st.splitOn, st.splitDir)
+      if (tgt?.kind === 'split') {
+        openSplit(tgt.dir)
+        moveTabToPane(drag.tabId, 'b')
+        return
+      }
+      if (tgt?.kind === 'pane') {
+        moveTabToPane(drag.tabId, tgt.pane)
+        return
+      }
+
+      const bar = scrollRef.current
+      const br = bar?.getBoundingClientRect()
+      const inTabBar = !!br && ev.clientX >= br.left && ev.clientX <= br.right && ev.clientY >= br.top && ev.clientY <= br.bottom
+      if (inTabBar) {
+        dragTabRef.current = drag.tabId
+        const insert = updateTabInsertHint(ev.clientX)
+        dragTabRef.current = null
+        if (insert && insert.targetId !== drag.tabId) moveTab(drag.tabId, insert.targetId, insert.side)
+        clearTabInsertHint()
+      }
+    }
+
+    const onCancel = () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onCancel)
+      pointerDragRef.current = null
+      dragTabRef.current = null
+      document.body.classList.remove('tab-dragging')
+      setDraggingTab(null)
+      setDragPreview(null)
+      clearDragVisuals()
+    }
+
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onCancel)
   }
 
   return (
@@ -288,94 +431,10 @@ export default function TabBar() {
             <div
               key={tab.id}
               data-tab-id={tab.id}
-              className={`tab${isActive ? ' active' : ''}${dragOverId === tab.id && dragTabRef.current !== tab.id ? ' tab--drag-over' : ''}`}
-              draggable={!isRenaming && !tab.pinned}
-              onDragStart={(e) => {
-                dragTabRef.current = tab.id
-                setDraggingTab(tab.id)   // 通知内容区显示分屏落点
-                e.dataTransfer.effectAllowed = 'move'
-                // WKWebView 需要 setData 才会触发后续 dragover/drop（否则同窗口内拖动排序失效）
-                try { e.dataTransfer.setData('text/plain', tab.id) } catch { /* ignore */ }
-              }}
-              onDragOver={(e) => {
-                e.preventDefault()
-                if (dragTabRef.current && dragTabRef.current !== tab.id) {
-                  dragOverRef.current = tab.id
-                  setDragOverId(tab.id)
-                }
-              }}
-              onDragLeave={() => {
-                if (dragOverRef.current === tab.id) {
-                  dragOverRef.current = null
-                  setDragOverId(null)
-                }
-              }}
-              onDrop={(e) => {
-                e.preventDefault()
-                const fromId = dragTabRef.current
-                if (fromId && fromId !== tab.id) { moveTab(fromId, tab.id); reorderedRef.current = true }
-                dragOverRef.current = null
-                setDragOverId(null)
-              }}
-              onDragEnd={(e) => {
-                const id = dragTabRef.current
-                const reordered = reorderedRef.current
-                dragTabRef.current = null
-                dragOverRef.current = null
-                reorderedRef.current = false
-                setDragOverId(null)
-                setDraggingTab(null)   // 拖拽结束，撤掉落点层
-                if (!id) return
-                // 已在标签栏内完成排序（命中某个标签的 onDrop，浏览器环境）→ 绝不撕离/合并
-                if (reordered) return
-                const cx = e.clientX, cy = e.clientY
-                // 在本窗口内释放 → 按 X 排序（WKWebView 下 drop 不触发，改在 dragend 按 clientX 计算位置）
-                const insideWindow = cx > 0 && cy > 0 && cx < window.innerWidth && cy < window.innerHeight
-                if (insideWindow) {
-                  const bar = scrollRef.current
-                  if (bar) {
-                    // 落在标签栏下方（内容区）→ 按光标位置新建分屏（onDrop 在 WKWebView 不可靠，改用 dragend）
-                    if (cy > bar.getBoundingClientRect().bottom) {
-                      // 用实时 store 状态，避免 zone onDrop 已创建分屏后再次 openSplit
-                      const curState = useAppStore.getState()
-                      const tab = curState.tabs.find(t => t.id === id)
-                      if (tab?.pinned) return
-                      const tgt = resolveDropTarget(cx, cy, curState.splitOn, curState.splitDir)
-                      if (tgt?.kind === 'split') { openSplit(tgt.dir); moveTabToPane(id, 'b') }
-                      else if (tgt?.kind === 'pane') moveTabToPane(id, tgt.pane)
-                      return
-                    }
-                    const els = Array.from(bar.querySelectorAll<HTMLElement>('[data-tab-id]'))
-                    let targetId: string | null = els.length ? (els[els.length - 1].dataset.tabId ?? null) : null
-                    for (const el of els) {
-                      const r = el.getBoundingClientRect()
-                      if (cx < r.left + r.width / 2) { targetId = el.dataset.tabId ?? null; break }
-                    }
-                    if (targetId && targetId !== id) moveTab(id, targetId)
-                  }
-                  return
-                }
-                // 在窗口外释放 → 合并到光标所在窗口，或撕离到桌面
-                const t = tabs.find(x => x.id === id)
-                if (!t || !canTearOffTab(t)) { if (t) tearOffTab(t, closeTab); return }
-                // 用 OS 全局光标位置判定落点是否在别的窗口上（拖拽事件坐标跨窗口不可信）
-                void (async () => {
-                  const targetLabel = await findWindowLabelAtCursor()
-                  if (targetLabel) {
-                    // 拖到另一个 DBTerm 窗口 → 合并到该窗口（拖回）
-                    const snapshot = t.type === 'terminal' ? snapshotTerminal(t.id) : null
-                    const sqlDraft = t.type === 'query' ? (useQueryStore.getState().sqls[t.id] ?? null) : null
-                    markDetaching(t.id)
-                    reattachTabToWindow(targetLabel, t, snapshot, sqlDraft)
-                      .then(() => closeTab(t.id, true))
-                      .catch((err) => toast.error(`合并到目标窗口失败：${String(err)}`))
-                      .finally(() => setTimeout(() => clearDetaching(t.id), 1500))
-                  } else {
-                    // 落在空白桌面 → 新开窗口（撕离）
-                    tearOffTab(t, closeTab)
-                  }
-                })()
-              }}
+              className={`tab${isActive ? ' active' : ''}${draggingId === tab.id ? ' dragging' : ''}`}
+              data-insert-side={dragOverId === tab.id && dragTabRef.current !== tab.id ? dragInsertSide : undefined}
+              draggable={false}
+              onPointerDown={(e) => beginPointerDrag(e, tab, isRenaming)}
               onClick={() => !isRenaming && setActiveTab(tab.id)}
               onDoubleClick={(e) => {
                 e.preventDefault()
@@ -394,13 +453,13 @@ export default function TabBar() {
               onMouseEnter={() => handleMouseEnter(tab.id)}
               onMouseLeave={() => handleMouseLeave()}
             >
-              {/* 编号 */}
+              {/* 缂栧彿 */}
               {showNum && <span className="tab__num">{idx + 1}</span>}
 
-              {/* 图标：terminal=SSH图标，table-data=表格，schema-browser=列，其余=DB */}
+              {/* 鍥炬爣锛歵erminal=SSH鍥炬爣锛宼able-data=琛ㄦ牸锛宻chema-browser=鍒楋紝鍏朵綑=DB */}
               {tabIcon(tab)}
 
-              {/* 标题 / 重命名输入框 */}
+              {/* 鏍囬 / 閲嶅懡鍚嶈緭鍏ユ */}
               {isRenaming ? (
                 <input
                   ref={renameInputRef}
@@ -424,12 +483,12 @@ export default function TabBar() {
                 </span>
               )}
 
-              {/* 关闭按钮（固定标签不可关闭） */}
+              {/* 鍏抽棴鎸夐挳锛堝浐瀹氭爣绛句笉鍙叧闂級 */}
               {!tab.pinned && (
                 <button
                   className="tab__close"
                   onClick={(e) => { e.stopPropagation(); requestCloseTab(tab.id) }}
-                  data-tip="关闭"
+                  data-tip="鍏抽棴"
                 >
                   <X size={11} strokeWidth={2} />
                 </button>
@@ -437,20 +496,26 @@ export default function TabBar() {
             </div>
           )
         })}
+        {dragInsertX != null && (
+          <div
+            className="tab-insert-marker"
+            style={{ left: dragInsertX }}
+          />
+        )}
       </div>
 
-      {/* 新建查询（仅数据库连接显示；终端/SSH 标签不显示，避免无意义的禁用按钮）*/}
+      {/* 新建查询 */}
       {!!activeConn && activeConn.type !== 'ssh' && activeConn.type !== 'local' && (
         <button
           className="tab-new-query"
           onClick={() => { if (activeTab) openQueryTab(activeTab.connectionId) }}
-          data-tip="新建查询"
+          data-tip="鏂板缓鏌ヨ"
         >
           <Plus size={14} strokeWidth={2} />
         </button>
       )}
 
-      {/* 标签溢出下拉 */}
+      {/* 鏍囩婧㈠嚭涓嬫媺 */}
       <div className="tab-overflow">
         <button
           ref={overflowBtnRef}
@@ -492,32 +557,32 @@ export default function TabBar() {
         )}
       </div>
 
-      {/* 分屏按钮（≥2 个标签时显示）*/}
+      {/* 分屏按钮 */}
       {tabs.length >= 2 && (
         <div className="tab-split-btns">
           <button
             className={`tab-split-btn${splitOn && splitDir === 'h' ? ' active' : ''}`}
             onClick={() => toggleSplit('h')}
-            data-tip={splitOn && splitDir === 'h' ? '取消分屏' : '左右分屏'}
+            data-tip={splitOn && splitDir === 'h' ? '鍙栨秷鍒嗗睆' : '宸﹀彸鍒嗗睆'}
           >
             <SquareSplitHorizontal size={14} strokeWidth={1.8} />
           </button>
           <button
             className={`tab-split-btn${splitOn && splitDir === 'v' ? ' active' : ''}`}
             onClick={() => toggleSplit('v')}
-            data-tip={splitOn && splitDir === 'v' ? '取消分屏' : '上下分屏'}
+            data-tip={splitOn && splitDir === 'v' ? '鍙栨秷鍒嗗睆' : '涓婁笅鍒嗗睆'}
           >
             <SquareSplitVertical size={14} strokeWidth={1.8} />
           </button>
         </div>
       )}
 
-      {/* SSH 工具栏：面板/广播/快连 合并为下拉，断开/重连保持独立可见 */}
+      {/* SSH 宸ュ叿鏍忥細闈㈡澘/骞挎挱/蹇繛 鍚堝苟涓轰笅鎷夛紝鏂紑/閲嶈繛淇濇寔鐙珛鍙 */}
       {isSSH && (
         <div className="ssh-actions">
           <SshToolsMenu isLocalTerm={isLocalTerm} onQuickConn={() => setQuickConnOpen(true)} />
 
-          {/* 本地终端：断开 / 重连 */}
+          {/* 鏈湴缁堢锛氭柇寮€ / 閲嶈繛 */}
           {isLocalTerm && activeTermCbs && (
             <>
               <div className="ssh-actions__sep" />
@@ -525,7 +590,7 @@ export default function TabBar() {
                 <button
                   className="ssh-action-btn ssh-action-btn--reconnect"
                   onClick={activeTermCbs.reconnect}
-                  data-tooltip="重新连接"
+                  data-tooltip="閲嶆柊杩炴帴"
                 >
                   <RefreshCw size={13} strokeWidth={2} />
                 </button>
@@ -533,7 +598,7 @@ export default function TabBar() {
                 <button
                   className="ssh-action-btn ssh-action-btn--disconnect"
                   onClick={activeTermCbs.disconnect}
-                  data-tooltip="断开连接"
+                  data-tooltip="鏂紑杩炴帴"
                 >
                   <Power size={13} strokeWidth={2} />
                 </button>
@@ -541,14 +606,14 @@ export default function TabBar() {
             </>
           )}
 
-          {/* SSH 会话：断开 / 重连按钮 */}
+          {/* SSH 浼氳瘽锛氭柇寮€ / 閲嶈繛鎸夐挳 */}
           {!isLocalTerm && isSSH && activeTab && (
             <>
               <div className="ssh-actions__sep" />
               {isSshDisconnected ? (
                 <button
                   className="ssh-action-btn ssh-action-btn--reconnect"
-                  data-tooltip="重新连接"
+                  data-tooltip="閲嶆柊杩炴帴"
                   onClick={reconnectSsh}
                 >
                   <RefreshCw size={13} strokeWidth={2} />
@@ -556,7 +621,7 @@ export default function TabBar() {
               ) : (
                 <button
                   className="ssh-action-btn ssh-action-btn--disconnect"
-                  data-tooltip="断开 SSH"
+                  data-tooltip="鏂紑 SSH"
                   onClick={() => {
                     const isTauri = '__TAURI_INTERNALS__' in window
                     if (!isTauri) return
@@ -573,7 +638,7 @@ export default function TabBar() {
         </div>
       )}
 
-      {/* 右键上下文菜单 */}
+      {/* 鍙抽敭涓婁笅鏂囪彍鍗?*/}
       {ctxMenu && (
         <TabCtxMenu
           tabId={ctxMenu.tabId}
