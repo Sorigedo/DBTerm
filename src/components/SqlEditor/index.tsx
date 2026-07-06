@@ -78,6 +78,7 @@ import { appendAuditLog } from '../../utils/auditLog'
 import { markBatchCancelledFrom } from './queryBatchCancel'
 import { hasMysqlDelimiterDirective, hasMysqlUserPreparedStmt, splitSqlStatements, stripSqlComments } from './sqlSplit'
 import { applySqlVariables, findSqlVariables, type SqlVariable } from './sqlVariables'
+import { memberColumnsForAlias, selectAliasColumnsBefore, stripQuoteIdent } from './sqlCompletion'
 
 const QueryHistoryPanel = lazy(() => import('./QueryHistoryPanel'))
 const ExportDialog = lazy(() => import('./ExportDialog'))
@@ -141,6 +142,7 @@ const tableHoverField = StateField.define<DecorationSet>({
   create() { return Decoration.none },
   update(deco, tr) {
     deco = deco.map(tr.changes)
+    if (tr.docChanged || tr.selection) deco = Decoration.none
     for (const e of tr.effects) {
       if (e.is(setTableHover)) {
         deco = e.value ? Decoration.set([tableHoverMark.range(e.value.from, e.value.to)]) : Decoration.none
@@ -173,54 +175,30 @@ export interface EditCtx {
  * 识别"单表简单 SELECT"：只有这种结果才允许行内编辑。
  * 含 JOIN / GROUP BY / UNION / 子查询 / 多表的一律不可编辑。
  */
-// ── 子查询感知的「别名.列」补全 ───────────────────────────────────────────────
-// CodeMirror lang-sql 内置补全的别名解析对子查询里的 `from 表 别名` 解析不全，
-// 导致 `(select x.col from t x ...)` 中 `x.` 无任何列提示。这里改用「全文扫描所有
-// from/join（含子查询）」自建 别名→表 映射，方言无关，所有库通用。
-function stripQuoteIdent(s: string): string {
-  return s.replace(/^[`"[]/, '').replace(/[`"\]]$/, '')
-}
-const ALIAS_STOP_WORDS = new Set([
-  'where', 'on', 'using', 'inner', 'left', 'right', 'outer', 'full', 'cross',
-  'join', 'group', 'order', 'having', 'union', 'limit', 'set', 'as', 'and', 'or', 'select', 'values',
-])
-/** 扫描整条 SQL 的 from/join，建立 别名(小写)→表名 与 表名(小写)→表名 映射（含子查询） */
-function buildAliasMap(doc: string): Record<string, string> {
-  const map: Record<string, string> = {}
-  const re = /\b(?:from|join)\s+([`"[]?[\w.]+[`"\]]?)\s*(?:\bas\s+)?([`"[]?[A-Za-z_]\w*[`"\]]?)?/gi
-  let m: RegExpExecArray | null
-  while ((m = re.exec(doc))) {
-    let table = stripQuoteIdent(m[1])
-    if (table.includes('.')) table = table.split('.').pop() ?? table
-    if (!table) continue
-    map[table.toLowerCase()] = table
-    if (m[2]) {
-      const alias = stripQuoteIdent(m[2])
-      if (alias && !ALIAS_STOP_WORDS.has(alias.toLowerCase())) map[alias.toLowerCase()] = table
-    }
-  }
-  return map
-}
-/** 大小写不敏感地取某表的列名 */
-function columnsOfTable(dbSchema: Record<string, string[]>, table: string): string[] {
-  if (dbSchema[table]?.length) return dbSchema[table]
-  const lc = table.toLowerCase()
-  for (const k of Object.keys(dbSchema)) if (k.toLowerCase() === lc) return dbSchema[k]
-  return []
-}
 /** `别名.` / `表名.` 成员补全：返回该表列名；非成员上下文返回 null（交回内置补全） */
-function memberCompletion(ctx: CompletionContext, dbSchema: Record<string, string[]>): CompletionResult | null {
+function memberCompletion(ctx: CompletionContext, dbSchema: Record<string, string[]>, connType: ConnType): CompletionResult | null {
   const before = ctx.matchBefore(/[`"[\]\w$]+\.[\w$]*$/)
   if (!before || before.from === before.to) return null
   const dot = before.text.lastIndexOf('.')
   const alias = stripQuoteIdent(before.text.slice(0, dot))
   if (!alias) return null
-  const table = buildAliasMap(ctx.state.doc.toString())[alias.toLowerCase()]
-  if (!table) return null
-  const cols = columnsOfTable(dbSchema, table)
+  const cols = memberColumnsForAlias(ctx.state.doc.toString(), dbSchema, alias, connType)
   if (!cols.length) return null
   return {
     from: before.from + dot + 1,
+    options: cols.map(c => ({ label: c, type: 'property' })),
+    validFor: /^[\w$]*$/,
+  }
+}
+
+/** 子查询 select 输出列补全：例如 `count(*) kind_num ... order by kin|`。 */
+function selectOutputCompletion(ctx: CompletionContext, connType: ConnType): CompletionResult | null {
+  const word = ctx.matchBefore(/[\w$]*$/)
+  if (!word || (!ctx.explicit && word.from === word.to)) return null
+  const cols = selectAliasColumnsBefore(ctx.state.doc.toString(), ctx.pos, connType)
+  if (!cols.length) return null
+  return {
+    from: word.from,
     options: cols.map(c => ({ label: c, type: 'property' })),
     validFor: /^[\w$]*$/,
   }
@@ -707,10 +685,29 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
     },
     // 移出/点击/滚动/失焦都立刻清除，避免悬停提示浮窗残留
     mouseleave(_e, view) { clearTableHover(view); return false },
+    mouseout(_e, view) { clearTableHover(view); return false },
     mousedown(_e, view) { clearTableHover(view); return false },
+    keydown(_e, view) { clearTableHover(view); return false },
     wheel(_e, view) { clearTableHover(view); return false },
     blur(_e, view) { clearTableHover(view); return false },
+    scroll(_e, view) { clearTableHover(view); return false },
   }), [])
+
+  useEffect(() => {
+    const clear = () => {
+      const view = editorViewRef.current
+      if (view) clearTableHover(view)
+    }
+    const scroller = editorViewRef.current?.scrollDOM
+    scroller?.addEventListener('scroll', clear, { passive: true })
+    window.addEventListener('scroll', clear, true)
+    window.addEventListener('resize', clear)
+    return () => {
+      scroller?.removeEventListener('scroll', clear)
+      window.removeEventListener('scroll', clear, true)
+      window.removeEventListener('resize', clear)
+    }
+  }, [])
 
   // 事务模式状态
   const [txMode, setTxMode] = useState(false)
@@ -1373,9 +1370,12 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
   const sqlExt = useMemo(() => {
     const langSupport = sql({ dialect: sqlDialect, upperCaseKeywords: true })  // 仅关键字补全
     const schemaSrc = schemaCompletionSource({ dialect: sqlDialect, schema: dbSchema })
-    const combined: CompletionSource = (ctx) => memberCompletion(ctx, dbSchema) ?? schemaSrc(ctx)
+    const combined: CompletionSource = (ctx) =>
+      memberCompletion(ctx, dbSchema, connType)
+      ?? selectOutputCompletion(ctx, connType)
+      ?? schemaSrc(ctx)
     return [langSupport, langSupport.language.data.of({ autocomplete: combined })]
-  }, [dbSchema, sqlDialect])
+  }, [connType, dbSchema, sqlDialect])
   const foldExt = useMemo(() => codeFolding({
     preparePlaceholder: (state, range) => {
       const fromLine = state.doc.lineAt(range.from).number
@@ -1832,15 +1832,15 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
           {!resultCollapsed && (
           <div className="sql-result-body">
             {running && !hasMulti ? (
-              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 12, height: '100%', color: 'var(--text-muted)' }}>
-                <Loader2 size={22} className="spin" style={{ color: 'var(--accent)' }} />
-                <div style={{ fontSize: 13 }}>执行中… <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text)' }}>{(elapsedMs / 1000).toFixed(1)}s</span></div>
+              <div className="sql-running-placeholder">
+                <Loader2 size={22} className="spin sql-running-placeholder__icon" />
+                <div className="sql-running-placeholder__text">执行中… <span>{(elapsedMs / 1000).toFixed(1)}s</span></div>
                 {runToken ? (
-                  <button className="sql-stop-btn" onClick={stopQuery}>
+                  <button className="sql-stop-btn sql-stop-btn--center" onClick={stopQuery}>
                     <StopCircle size={14} /> 停止查询
                   </button>
                 ) : (
-                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>此连接类型不支持中途取消</span>
+                  <span className="sql-running-placeholder__hint">此连接类型不支持中途取消</span>
                 )}
               </div>
             ) : resultTab === 'msg' ? (

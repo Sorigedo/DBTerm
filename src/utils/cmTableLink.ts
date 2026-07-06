@@ -9,6 +9,7 @@ const tableHoverField = StateField.define<DecorationSet>({
   create() { return Decoration.none },
   update(deco, tr) {
     deco = deco.map(tr.changes)
+    if (tr.docChanged || tr.selection) deco = Decoration.none
     for (const e of tr.effects) {
       if (e.is(setTableHover)) {
         deco = e.value ? Decoration.set([tableHoverMark.range(e.value.from, e.value.to)]) : Decoration.none
@@ -70,9 +71,12 @@ export function makeTableLinkExtensions(opts: {
     },
     // 鼠标移出 / 点击 / 滚动 / 失焦 都立刻清除悬停提示，避免浮窗残留（点击预览、滚动后尤其明显）
     mouseleave(_e, view) { clearHover(view); return false },
+    mouseout(_e, view) { clearHover(view); return false },
     mousedown(_e, view) { clearHover(view); return false },
+    keydown(_e, view) { clearHover(view); return false },
     wheel(_e, view) { clearHover(view); return false },
     blur(_e, view) { clearHover(view); return false },
+    scroll(_e, view) { clearHover(view); return false },
   })
   return [modClickExt, tableHoverField, tableHoverExt]
 }

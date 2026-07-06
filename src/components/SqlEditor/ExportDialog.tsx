@@ -266,6 +266,7 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
   }, [connectionId, sqlText, filePath, format, encoding, insertTable, taskId])
 
   const cancelExport = async () => {
+    window.getSelection()?.removeAllRanges()
     try {
       const { invoke } = await import('@tauri-apps/api/core')
       await invoke('db_cancel_export', { taskId })

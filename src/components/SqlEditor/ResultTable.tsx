@@ -332,6 +332,10 @@ export default function ResultTable({
     for (let i = lo; i <= hi; i++) next.add(String(i))
     setSelectedRows(next)
   }, [])
+  const blurEditorOrInput = () => {
+    const ae = document.activeElement as HTMLElement | null
+    if (ae && (ae.classList.contains('cm-content') || ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA')) ae.blur()
+  }
   // ── 单元格区域选择（按可视行 r / 可视列 v）──────────────────────────────
   function onCellMouseDown(e: React.MouseEvent, r: number, v: number) {
     if (e.button !== 0) return
@@ -339,6 +343,8 @@ export default function ResultTable({
     if (t.closest('input, textarea, button')) return
     if (e.shiftKey && cellSel) { setCellSel({ a: cellSel.a, f: { r, v } }); return }
     e.preventDefault()
+    // preventDefault 会保留 SQL 编辑器焦点，导致 Mod+C 被输入框保护逻辑跳过。
+    blurEditorOrInput()
     cellDragRef.current = true
     setCellSel({ a: { r, v }, f: { r, v } })
     setFocusedCell(null)
@@ -352,8 +358,7 @@ export default function ResultTable({
     if (e.button !== 0) return
     e.preventDefault()
     // preventDefault 会保留原焦点（常为编辑器）→ 让结果区快捷键(复制/Space 等)失效；主动失焦
-    const ae = document.activeElement as HTMLElement | null
-    if (ae && (ae.classList.contains('cm-content') || ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA')) ae.blur()
+    blurEditorOrInput()
     setFocusedCell(null)   // 选行与选单元格互斥
     setCellSel(null)
     if (e.shiftKey && lastClickedRow.current !== null) {
