@@ -1242,6 +1242,7 @@ body.tab-dragging .tab.active:hover {
 .dbt-action-table .dbt-null { color: var(--text-muted); font-style: italic; }
 .modal-box {
   width: 580px;
+  max-width: calc(100vw - 32px);
   max-height: 88vh;
   background: var(--surface);
   border: 1px solid var(--border);
@@ -5196,7 +5197,7 @@ body.tab-dragging .tab.active:hover {
 
 /* Larger modal for SSH tabbed form */
 .modal-box--lg {
-  width: 700px;
+  width: min(760px, calc(100vw - 48px));
 }
 
 /* Narrow modal for 2-item terminal type picker */
@@ -7091,24 +7092,45 @@ body.resizing {
   flex-direction: column;
 }
 .dbf-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: 136px minmax(0, 1fr);
   align-items: center;
-  gap: 16px;
+  column-gap: 16px;
   padding: 10px 0;
   border-bottom: 1px solid var(--border-subtle);
 }
 .dbf-row:last-child { border-bottom: none; }
 .dbf-row--flags { align-items: flex-start; padding-top: 12px; }
 .dbf-label {
-  width: 76px;
-  flex-shrink: 0;
+  min-width: 0;
   font-size: 13px;
   color: var(--text);
   text-align: right;
   line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.dbf-val { flex: 1; min-width: 0; }
+.dbf-label .field-hint {
+  display: block;
+  margin: 2px 0 0;
+  line-height: 1.25;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.dbf-val { min-width: 0; }
 .dbf-val--colors { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+
+@media (max-width: 640px) {
+  .dbf-row {
+    grid-template-columns: 1fr;
+    row-gap: 6px;
+    align-items: flex-start;
+  }
+  .dbf-label {
+    text-align: left;
+  }
+}
 
 /* ── DB Form: 自定义 radio / checkbox ── */
 .dbf-val input[type="radio"] {
