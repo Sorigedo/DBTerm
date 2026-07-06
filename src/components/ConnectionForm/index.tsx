@@ -1396,7 +1396,7 @@ function DbForm({ form, patch, selType, password, setPassword, showPwd,
                     </div>
                   </div>
                   <div className="dbf-row">
-                    <span className="dbf-label">authSource <span className="field-hint">认证库</span></span>
+                    <span className="dbf-label">认证库 <span className="field-hint">authSource</span></span>
                     <div className="dbf-val">
                       <input placeholder="admin（默认）"
                         value={extra.mongoAuthSource ?? ''}
@@ -1411,7 +1411,7 @@ function DbForm({ form, patch, selType, password, setPassword, showPwd,
               {isPg && (
                 <>
                   <div className="dbf-row">
-                    <span className="dbf-label">search_path <span className="field-hint">可选，逗号分隔</span></span>
+                    <span className="dbf-label">搜索路径 <span className="field-hint">search_path</span></span>
                     <div className="dbf-val">
                       <input placeholder="public, myschema（留空使用数据库默认）"
                         value={extra.pgSearchPath}
@@ -1420,7 +1420,7 @@ function DbForm({ form, patch, selType, password, setPassword, showPwd,
                     </div>
                   </div>
                   <div className="dbf-row">
-                    <span className="dbf-label">application_name</span>
+                    <span className="dbf-label">应用名称 <span className="field-hint">application_name</span></span>
                     <div className="dbf-val">
                       <input placeholder="DBTerm（默认）"
                         value={extra.pgAppName}
@@ -1576,7 +1576,7 @@ function DbForm({ form, patch, selType, password, setPassword, showPwd,
                     </div>
                   </div>
                   <div className="dbf-row dbf-row--flags">
-                    <span className="dbf-label">Schema</span>
+                    <span className="dbf-label">默认 Schema</span>
                     <div className="dbf-val">
                       <input placeholder="留空则使用登录用户 schema（可选）"
                         value={extra.oraSchema}

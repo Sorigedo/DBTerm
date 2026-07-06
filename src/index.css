@@ -7093,9 +7093,9 @@ body.resizing {
 }
 .dbf-row {
   display: grid;
-  grid-template-columns: 136px minmax(0, 1fr);
+  grid-template-columns: 112px minmax(0, 1fr);
   align-items: center;
-  column-gap: 16px;
+  column-gap: 14px;
   padding: 10px 0;
   border-bottom: 1px solid var(--border-subtle);
 }
