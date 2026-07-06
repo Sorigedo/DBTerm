@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { splitSqlStatements } from './sqlSplit.ts'
+import { hasMysqlUserVariable, splitSqlStatements } from './sqlSplit.ts'
 
 test('mysql delimiter directives split routine body as one statement', () => {
   const sql = `DELIMITER //
@@ -54,4 +54,11 @@ SELECT 1 FROM dual;`
 END;`,
     'SELECT 1 FROM dual',
   ])
+})
+
+test('mysql user variable detection ignores comments and strings', () => {
+  assert.equal(hasMysqlUserVariable('SET @sql := "SELECT 1"'), true)
+  assert.equal(hasMysqlUserVariable('SELECT @sql'), true)
+  assert.equal(hasMysqlUserVariable("SELECT 'a@b'"), false)
+  assert.equal(hasMysqlUserVariable('-- @sql\nSELECT 1'), false)
 })

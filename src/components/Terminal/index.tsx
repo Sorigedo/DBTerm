@@ -146,6 +146,38 @@ function readCurrentShellCommand(xterm: XTerm): string {
   }
 }
 
+function parsePromptCwd(line: string): string | null {
+  const clean = line
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\r/g, '')
+  if (!/[#$%]\s*$/.test(clean)) return null
+  const beforePrompt = clean.replace(/[#$%]\s*$/, '').trimEnd()
+  if (!beforePrompt) return null
+  const candidates = [
+    /(?:^|[:\s])(\/[^\s#$%]+)\s*$/u,
+    /(?:^|[:\s])(~(?:\/[^\s#$%]*)?)\s*$/u,
+  ]
+  for (const re of candidates) {
+    const m = re.exec(beforePrompt)
+    if (!m) continue
+    return m[1]
+  }
+  return null
+}
+
+function readPromptCwd(xterm: XTerm): string | null {
+  try {
+    const buf = xterm.buffer.active
+    for (let row = buf.baseY + buf.cursorY; row >= Math.max(0, buf.baseY + buf.cursorY - 3); row--) {
+      const line = buf.getLine(row)
+      if (!line) continue
+      const cwd = parsePromptCwd(line.translateToString(true))
+      if (cwd) return cwd
+    }
+  } catch { /* ignore */ }
+  return null
+}
+
 /** xterm 光标字符坐标 → 容器内像素坐标 */
 function getCursorPx(xterm: XTerm, container: HTMLElement) {
   const screen = container.querySelector('.xterm-screen') as HTMLElement | null
@@ -206,6 +238,7 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
   const inputBufRef     = useRef('')
   const mountedRef      = useRef(true)
   const hasNavigatedRef = useRef(false)
+  const lastCwdRef      = useRef('')
 
   const [disconnected, setDisconnected] = useState(false)
   const disconnectedRef                 = useRef(false)
@@ -257,6 +290,7 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
   // 细粒度订阅：避免 appStore 任意变化都触发终端重渲染
   const registerTermCallbacks   = useAppStore((s) => s.registerTermCallbacks)
   const unregisterTermCallbacks = useAppStore((s) => s.unregisterTermCallbacks)
+  const setTermCwd              = useAppStore((s) => s.setTermCwd)
   const openEditConn            = useAppStore((s) => s.openEditConn)
   const connections             = useAppStore((s) => s.connections)
   const allHistory     = useCommandHistoryStore((s) => s.commands)
@@ -273,6 +307,13 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
     },
     [addCommandRaw, connectionId]
   )
+
+  const updatePromptCwd = useCallback((term: XTerm) => {
+    const cwd = readPromptCwd(term)
+    if (!cwd || cwd === lastCwdRef.current) return
+    lastCwdRef.current = cwd
+    setTermCwd(sessionId, cwd)
+  }, [sessionId, setTermCwd])
 
   const isLocal = connType === 'local'
   const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -681,12 +722,25 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
     // 吞掉所有键盘输入、把输出改投传输通道，造成 vim 等全屏应用「进来键盘鼠标失效、画面冻住」。
     // 触发串可能跨分片，故保留上段尾部 (markLen-1 字节) 与本段拼接检测。
     let trzszTail = ''
+    let cwdRaf = 0
+    const scheduleCwdUpdate = () => {
+      cancelAnimationFrame(cwdRaf)
+      cwdRaf = requestAnimationFrame(() => {
+        const t = xtermRef.current
+        if (t) updatePromptCwd(t)
+      })
+    }
     const feedServerOutput = (bytes: Uint8Array) => {
       if (isRecording(sessionId)) {
         addFrame(sessionId, LATIN1.decode(bytes))
       }
       const f = trzszFilterRef.current
-      if (!f) { const c = colorizeLog(bytes); xterm.write(c ?? bytes); return }
+      if (!f) {
+        const c = colorizeLog(bytes)
+        xterm.write(c ?? bytes)
+        scheduleCwdUpdate()
+        return
+      }
       if (f.isTransferringFiles()) { f.processServerOutput(bytes); return }
       const text = LATIN1.decode(bytes)
       if ((trzszTail + text).includes(TRZSZ_MARK)) {
@@ -696,6 +750,7 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
         const c = colorizeLog(bytes); xterm.write(c ?? bytes)
         trzszTail = text.length >= TRZSZ_MARK.length ? text.slice(-(TRZSZ_MARK.length - 1)) : (trzszTail + text).slice(-(TRZSZ_MARK.length - 1))
       }
+      scheduleCwdUpdate()
     }
 
     // 撕离支持：登记「序列化当前画面」闭包（仅用稳定公开 buffer API，纯文本含滚屏），供新窗口还原
@@ -862,6 +917,7 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
       }
       // 回车：只有主动导航后才执行补全项，否则执行原始输入
       if (data === '\r') {
+        updatePromptCwd(xterm)
         if (hasDropdown && hasNavigatedRef.current) {
           acceptRef.current(suggs[activeIdxRef.current]?.cmd ?? suggs[0].cmd, true)
           return
@@ -1157,6 +1213,7 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
       mountedRef.current = false
       cancelAnimationFrame(shiftRaf)
       cancelAnimationFrame(resizeRaf)
+      cancelAnimationFrame(cwdRaf)
       ro.disconnect()
       unlisten.forEach((fn) => fn())
       searchMatchesRef.current = []

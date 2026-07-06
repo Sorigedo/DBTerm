@@ -34,6 +34,7 @@ interface CtxMenu {
 
 interface Props {
   sessionId: string
+  initialPath?: string
   onClose: () => void
 }
 
@@ -117,7 +118,7 @@ function ContextMenu({ menu, items, onClose }: {
 
 // ── 主组件 ──────────────────────────────────────────────────
 
-export default function FileManagerPanel({ sessionId, onClose }: Props) {
+export default function FileManagerPanel({ sessionId, initialPath, onClose }: Props) {
   const [path, setPath]           = useState('/')
   const [entries, setEntries]     = useState<FileEntry[]>([])
   const [loading, setLoading]     = useState(false)
@@ -132,9 +133,11 @@ export default function FileManagerPanel({ sessionId, onClose }: Props) {
   const [pathEditing, setPathEditing] = useState(false)
   const [pathInput, setPathInput]     = useState('')
   const [ctxMenu, setCtxMenu]         = useState<CtxMenu | null>(null)
+  const [dragOver, setDragOver]       = useState(false)
   const [dialog, setDialog]           = useState<null | { title: string; desc: string; onOk: () => void }>(null)
   const [chmodTarget, setChmodTarget] = useState<FileEntry | null>(null)
   const [chmodValue, setChmodValue]   = useState('')
+  const panelRef = useRef<HTMLDivElement>(null)
   const pathInputRef = useRef<HTMLInputElement>(null)
   // 在线编辑器（非受控 textarea 避免 1MB 字符串每键 diff）
   const [editor, setEditor] = useState<{ path: string; original: string; saving: boolean } | null>(null)
@@ -213,10 +216,26 @@ export default function FileManagerPanel({ sessionId, onClose }: Props) {
     }
   }, [sessionId])
 
-  // 起始路径：连接配置的 SFTP 默认路径 → 远程 $HOME → 根目录；
+  const joinRemotePath = (base: string, name: string): string =>
+    base === '/' ? `/${name}` : `${base.replace(/\/$/, '')}/${name}`
+
+  const normalizeInitialPath = (p?: string): string | null => {
+    if (!p) return null
+    const s = p.trim()
+    if (!s || s === '~') return null
+    if (s.startsWith('/')) return s
+    return null
+  }
+
+  // 起始路径：当前 shell 目录 → 连接配置的 SFTP 默认路径 → 远程 $HOME → 根目录；
   // 默认路径不可访问时展示警告而不是静默回退
   useEffect(() => {
     let stale = false
+    const shellPath = normalizeInitialPath(initialPath)
+    if (shellPath) {
+      loadDir(shellPath).catch(() => {})
+      return () => { stale = true }
+    }
     import('@tauri-apps/api/core').then(({ invoke }) =>
       invoke<{ path: string; warning: string | null }>('get_file_start_path', { id: sessionId })
         .then((r) => {
@@ -229,7 +248,11 @@ export default function FileManagerPanel({ sessionId, onClose }: Props) {
         .catch((e) => { if (!stale) { setError(String(e)); loadDir('/') } })
     ).catch(() => loadDir('/'))
     return () => { stale = true }
-  }, [loadDir, sessionId])
+  }, [initialPath, loadDir, sessionId])
+
+  useEffect(() => {
+    if (!editor) panelRef.current?.focus()
+  }, [editor])
 
   // SFTP 传输进度事件
   useEffect(() => {
@@ -397,7 +420,7 @@ export default function FileManagerPanel({ sessionId, onClose }: Props) {
       try {
         const { invoke } = await import('@tauri-apps/api/core')
         await invoke('upload_dir', { id: sessionId, remoteBase: path, localPath, transferId: tid })
-        updateTransfer(tid, { status: 'done', message: `已上传至：${path}/${dirname}` })
+        updateTransfer(tid, { status: 'done', message: `已上传至：${joinRemotePath(path, dirname)}` })
         loadDir(path)
       } catch (e) {
         updateTransfer(tid, { status: 'error', message: String(e) })
@@ -422,19 +445,75 @@ export default function FileManagerPanel({ sessionId, onClose }: Props) {
     }
   }
 
+  const uploadDirByPath = async (localPath: string) => {
+    const dirname = localPath.split('/').filter(Boolean).pop() ?? localPath
+    const tid = `uld-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    addTransfer({ id: tid, type: 'upload', filename: `${dirname}/`, status: 'progress', transferred: 0 })
+    try {
+      const { invoke } = await import('@tauri-apps/api/core')
+      await invoke('upload_dir', { id: sessionId, remoteBase: path, localPath, transferId: tid })
+      updateTransfer(tid, { status: 'done', message: `已上传至：${joinRemotePath(path, dirname)}` })
+      loadDir(path)
+    } catch (e) {
+      updateTransfer(tid, { status: 'error', message: String(e) })
+    }
+  }
+
   const uploadByPath = async (localPath: string) => {
     const filename = localPath.split('/').pop() ?? localPath
     const tid = `ul-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     addTransfer({ id: tid, type: 'upload', filename, status: 'progress', transferred: 0 })
     try {
-      const remotePath = `${path.replace(/\/$/, '')}/${filename}`
+      const remotePath = joinRemotePath(path, filename)
       const { invoke } = await import('@tauri-apps/api/core')
       await invoke('upload_file_path', { id: sessionId, remotePath, localPath, transferId: tid })
       updateTransfer(tid, { status: 'done', message: `已上传至：${remotePath}` })
       loadDir(path)
     } catch (e) {
-      updateTransfer(tid, { status: 'error', message: String(e) })
+      const msg = String(e)
+      if (msg.includes('只支持上传单个文件') || msg.includes('Is a directory') || msg.includes('目录')) {
+        removeTransfer(tid)
+        uploadDirByPath(localPath)
+        return
+      }
+      updateTransfer(tid, { status: 'error', message: msg })
     }
+  }
+
+  const localPathsFromDataTransfer = (dt: DataTransfer | null): string[] => {
+    if (!dt) return []
+    const paths: string[] = []
+    for (const file of Array.from(dt.files)) {
+      const p = (file as File & { path?: string }).path
+      if (p) paths.push(p)
+    }
+    return paths
+  }
+
+  const uploadLocalPaths = (paths: string[]) => {
+    const uniq = Array.from(new Set(paths.filter(Boolean)))
+    for (const p of uniq) uploadByPath(p)
+  }
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setDragOver(false)
+    const paths = localPathsFromDataTransfer(e.dataTransfer)
+    if (!paths.length) {
+      setError('未能读取拖入文件路径，请使用上传按钮选择文件')
+      return
+    }
+    uploadLocalPaths(paths)
+  }
+
+  const handlePaste = (e: React.ClipboardEvent) => {
+    const t = e.target as HTMLElement
+    if (t.closest('input, textarea, [contenteditable="true"]')) return
+    const paths = localPathsFromDataTransfer(e.clipboardData)
+    if (!paths.length) return
+    e.preventDefault()
+    uploadLocalPaths(paths)
   }
 
   const cancelTransfer = (tid: string) => {
@@ -454,7 +533,7 @@ export default function FileManagerPanel({ sessionId, onClose }: Props) {
     if (!name) return
     try {
       const { invoke } = await import('@tauri-apps/api/core')
-      await invoke('create_dir', { id: sessionId, path: `${path.replace(/\/$/, '')}/${name}` })
+      await invoke('create_dir', { id: sessionId, path: joinRemotePath(path, name) })
       loadDir(path)
     } catch (e) {
       setError(String(e))
@@ -562,7 +641,18 @@ export default function FileManagerPanel({ sessionId, onClose }: Props) {
   }
 
   return (
-    <div className="ssh-panel">
+    <div
+      className={`ssh-panel file-panel${dragOver ? ' file-panel--drag' : ''}`}
+      ref={panelRef}
+      tabIndex={0}
+      onPaste={handlePaste}
+      onDragEnter={(e) => { e.preventDefault(); setDragOver(true) }}
+      onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; setDragOver(true) }}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragOver(false)
+      }}
+      onDrop={handleDrop}
+    >
       <div className="ssh-panel__header">
         <span className="ssh-panel__title">
           <Folder size={13} strokeWidth={1.8} />
@@ -594,6 +684,14 @@ export default function FileManagerPanel({ sessionId, onClose }: Props) {
           </button>
         </div>
       </div>
+
+      {dragOver && (
+        <div className="file-drop-overlay">
+          <Upload size={20} strokeWidth={2} />
+          <span>松开上传到当前目录</span>
+          <small>{path}</small>
+        </div>
+      )}
 
       {/* 路径栏 */}
       <div className="file-breadcrumb">

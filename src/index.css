@@ -947,7 +947,7 @@ body.resizing .asset-panel {
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 6px;
-  min-width: 156px;
+  min-width: 176px;
   box-shadow: 0 8px 32px rgba(0,0,0,0.18), 0 2px 8px rgba(0,0,0,0.08);
 }
 .ssh-menu__item {
@@ -957,6 +957,14 @@ body.resizing .asset-panel {
   background: transparent; color: var(--text);
   cursor: pointer; text-align: left;
   transition: background 0.1s, color 0.1s;
+}
+.ssh-menu__item span { flex: 1; }
+.ssh-menu__item kbd {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  font-weight: var(--fw-regular);
 }
 .ssh-menu__item:hover { background: var(--surface-hover); }
 .ssh-menu__item.active { color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
@@ -2315,6 +2323,11 @@ body.tab-dragging .tab.active:hover {
   background: var(--border-subtle);
   margin: 0 2px;
 }
+.ssh-actions__quick {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
 .ssh-action-btn {
   width: 28px;
   height: 28px;
@@ -2714,6 +2727,42 @@ body.tab-dragging .tab.active:hover {
 }
 
 .file-list { display: flex; flex-direction: column; }
+.file-panel {
+  position: relative;
+  outline: none;
+}
+.file-panel--drag .ssh-panel__body {
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
+}
+.file-drop-overlay {
+  position: absolute;
+  inset: 48px 10px 30px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px dashed var(--accent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface) 88%, var(--accent));
+  color: var(--accent);
+  pointer-events: none;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.16);
+}
+.file-drop-overlay span {
+  font-size: 13px;
+  font-weight: var(--fw-semibold);
+}
+.file-drop-overlay small {
+  max-width: calc(100% - 28px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
 .file-list-header {
   display: flex;
   align-items: center;

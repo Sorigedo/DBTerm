@@ -85,6 +85,7 @@ export default function Workspace() {
   const tabs           = useAppStore((s) => s.tabs)
   const activeTabId    = useAppStore((s) => s.activeTabId)
   const activeSshPanel = useAppStore((s) => s.activeSshPanel)
+  const termCwd        = useAppStore((s) => s.termCwd)
   const connections    = useAppStore((s) => s.connections)
   const broadcastMode  = useAppStore((s) => s.broadcastMode)
   const markTabError   = useAppStore((s) => s.markTabError)
@@ -521,7 +522,12 @@ export default function Workspace() {
           <>
             <div className="resize-handle resize-handle--right" onMouseDown={onPanelDragStart} />
             <Suspense fallback={<LazyPaneFallback label="正在加载 SSH 工具..." />}>
-              <SshSidePanel sessionId={activeTab!.connectionId} panelWidth={panelWidth} onRunCommand={runCommand} />
+              <SshSidePanel
+                sessionId={activeTab!.connectionId}
+                initialPath={activeTab ? termCwd[activeTab.id] : undefined}
+                panelWidth={panelWidth}
+                onRunCommand={runCommand}
+              />
             </Suspense>
           </>
         )}

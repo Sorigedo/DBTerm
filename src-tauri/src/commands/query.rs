@@ -1484,6 +1484,7 @@ fn needs_text_protocol(sql: &str) -> bool {
     is_routine_ddl
         || is_call
         || is_user_prepared_stmt
+        || has_mysql_user_variable(sql)
         || upper.starts_with("CHECK TABLE")
         || upper.starts_with("ANALYZE TABLE")
         || upper.starts_with("OPTIMIZE TABLE")
@@ -1502,9 +1503,69 @@ fn has_mysql_user_prepared_stmt_command(sql: &str) -> bool {
     })
 }
 
+fn has_mysql_user_variable(sql: &str) -> bool {
+    let mut chars = sql.char_indices().peekable();
+    let mut quote: Option<char> = None;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    while let Some((i, ch)) = chars.next() {
+        let next = chars.peek().map(|(_, c)| *c);
+        if line_comment {
+            if ch == '\n' { line_comment = false; }
+            continue;
+        }
+        if block_comment {
+            if ch == '*' && next == Some('/') {
+                block_comment = false;
+                let _ = chars.next();
+            }
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == '\\' {
+                let _ = chars.next();
+                continue;
+            }
+            if ch == q && next == Some(q) {
+                let _ = chars.next();
+                continue;
+            }
+            if ch == q { quote = None; }
+            continue;
+        }
+        if ch == '-' && next == Some('-') {
+            line_comment = true;
+            let _ = chars.next();
+            continue;
+        }
+        if ch == '#' {
+            line_comment = true;
+            continue;
+        }
+        if ch == '/' && next == Some('*') {
+            block_comment = true;
+            let _ = chars.next();
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = Some(ch);
+            continue;
+        }
+        if ch == '@' {
+            let prev = sql[..i].chars().next_back().unwrap_or(' ');
+            if prev.is_ascii_alphanumeric() || prev == '_' { continue; }
+            let after = &sql[i + ch.len_utf8()..];
+            if after.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
-    use super::needs_text_protocol;
+    use super::{has_mysql_user_variable, needs_text_protocol};
 
     #[test]
     fn mysql_user_prepared_statement_commands_use_text_protocol() {
@@ -1515,6 +1576,14 @@ mod tests {
         assert!(needs_text_protocol("/* dbterm-cancel:abc123 */ PREPARE stmt FROM 'SELECT 1'"));
         assert!(needs_text_protocol("SET @sql = 'SELECT 1'; PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt"));
     }
+
+    #[test]
+    fn mysql_user_variables_ignore_strings_and_comments() {
+        assert!(has_mysql_user_variable("SET @x := 1"));
+        assert!(has_mysql_user_variable("SELECT @x"));
+        assert!(!has_mysql_user_variable("SELECT 'a@b'"));
+        assert!(!has_mysql_user_variable("-- @x\nSELECT 1"));
+    }
 }
 
 /// Admin commands like CHECK/ANALYZE/OPTIMIZE TABLE require text protocol.
@@ -1524,10 +1593,17 @@ fn mysql_admin_query(
     mut conn: sqlx::mysql::MySqlConnection,
     _tunnel: Option<std::sync::Arc<crate::db_tunnel::DbTunnel>>,
     tagged_sql: String,
+    database: Option<String>,
     start: Instant,
 ) -> futures::future::BoxFuture<'static, Result<QueryResult, String>> {
     Box::pin(async move {
         use sqlx::{Column, Executor, Row};
+        if let Some(db) = database.as_deref().filter(|s| !s.is_empty()) {
+            (&mut conn)
+                .execute(sqlx::raw_sql(&format!("USE `{}`", db.replace('`', ""))))
+                .await
+                .map_err(|e| format!("切换数据库失败: {e}"))?;
+        }
         let rows = (&mut conn)
             .fetch_all(sqlx::raw_sql(&tagged_sql))
             .await
@@ -1559,7 +1635,7 @@ async fn mysql_query(config: &ConnConfig, password: Option<&str>, sql: &str) -> 
     if needs_text_protocol(sql) {
         let conn = pool.acquire().await.map_err(|e| format!("获取连接失败: {e}"))?.detach();
         let start = Instant::now();
-        return mysql_admin_query(conn, None, tagged, start).await;
+        return mysql_admin_query(conn, None, tagged, config.database.clone(), start).await;
     }
 
     let mut conn = pool.acquire().await.map_err(|e| format!("获取连接失败: {e}"))?;

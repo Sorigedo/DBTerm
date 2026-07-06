@@ -44,6 +44,7 @@ interface AppState {
   editingConn: ConnConfig | null
   activeSshPanel: SshPanelType | null
   broadcastMode: boolean
+  termCwd: Record<string, string>
   termDisconnected: Record<string, boolean>
   termCallbacks: Record<string, TermCallbacks>
   settingsOpen: boolean
@@ -52,6 +53,7 @@ interface AppState {
   setActiveView: (view: ActiveView) => void
   openSettings: () => void
   closeSettings: () => void
+  setTermCwd: (id: string, cwd: string) => void
   setTermDisconnected: (id: string, val: boolean) => void
   registerTermCallbacks: (id: string, cbs: TermCallbacks) => void
   unregisterTermCallbacks: (id: string) => void
@@ -139,6 +141,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   editingConn: null,
   activeSshPanel: null,
   broadcastMode: false,
+  termCwd: {},
   termDisconnected: {},
   termCallbacks: {},
   settingsOpen: false,
@@ -328,6 +331,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => {
       const { tabCloseActivate } = useSettingsStore.getState()
       const next = s.tabs.filter((t) => t.id !== tabId)
+      const termCwd = { ...s.termCwd }
+      delete termCwd[tabId]
       const inB = s.paneBTabIds.includes(tabId)
       const paneBTabIds = s.paneBTabIds.filter((id) => id !== tabId)
       // 在所属屏内挑相邻标签接替活动
@@ -351,6 +356,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         activeAId, activeBId, focusedPane,
         activeTabId: focusedPane === 'b' ? activeBId : activeAId,
         splitOn,
+        termCwd,
         closeConfirm: s.closeConfirm === tabId ? null : s.closeConfirm,
       }
     })
@@ -440,6 +446,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => ({ activeSshPanel: s.activeSshPanel === panel ? null : panel })),
   closeSshPanel: () => set({ activeSshPanel: null }),
   setBroadcastMode: (broadcastMode) => set({ broadcastMode }),
+  setTermCwd: (id, cwd) =>
+    set((s) => ({ termCwd: { ...s.termCwd, [id]: cwd } })),
   setPendingRun: (connId, sql) =>
     set((s) => ({ pendingRun: { ...s.pendingRun, [connId]: sql } })),
   clearPendingRun: (connId) =>

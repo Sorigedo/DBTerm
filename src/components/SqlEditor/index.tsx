@@ -76,7 +76,7 @@ import { isPgFamily } from '../../utils/sqlDialect'
 import { formatDuration } from '../../utils/formatDuration'
 import { appendAuditLog } from '../../utils/auditLog'
 import { markBatchCancelledFrom } from './queryBatchCancel'
-import { hasMysqlDelimiterDirective, hasMysqlUserPreparedStmt, splitSqlStatements, stripSqlComments } from './sqlSplit'
+import { hasMysqlDelimiterDirective, hasMysqlUserPreparedStmt, hasMysqlUserVariable, splitSqlStatements, stripSqlComments } from './sqlSplit'
 import { applySqlVariables, findSqlVariables, type SqlVariable } from './sqlVariables'
 import { memberColumnsForAlias, selectAliasColumnsBefore, stripQuoteIdent } from './sqlCompletion'
 
@@ -714,6 +714,8 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
   const [txActive, setTxActive] = useState(false)
   const [txShortcutConfirm, setTxShortcutConfirm] = useState<'commit' | 'rollback' | null>(null)
   const [dangerPending, setDangerPending] = useState<{ sql: string; warnings: string[] } | null>(null)
+  const msgPanelRef = useRef<HTMLDivElement>(null)
+  const summaryPanelRef = useRef<HTMLDivElement>(null)
   // 生产环境写操作二次确认（envLabel='prod' 时写语句执行前弹窗）
   const [prodPending, setProdPending] = useState<{ sql: string; count: number } | null>(null)
   // K5 多结果 tab
@@ -727,6 +729,20 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
   const [resultCollapsed, setResultCollapsed] = useState(false)
   const [resultClosed, setResultClosed] = useState(false)   // 关闭结果区（执行后自动重新打开）
   const resizeRef = useRef<{ startY: number; startH: number } | null>(null)
+  const selectPanelText = useCallback((el: HTMLElement | null) => {
+    if (!el) return
+    const range = document.createRange()
+    range.selectNodeContents(el)
+    const sel = window.getSelection()
+    sel?.removeAllRanges()
+    sel?.addRange(range)
+  }, [])
+  const handleResultTextKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'a' || e.shiftKey || e.altKey) return
+    e.preventDefault()
+    e.stopPropagation()
+    selectPanelText(e.currentTarget)
+  }, [selectPanelText])
   const startResize = useCallback((e: React.MouseEvent) => {
     resizeRef.current = { startY: e.clientY, startH: resultH }
     const onMove = (ev: MouseEvent) => {
@@ -978,10 +994,10 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
 
     // 过滤掉“仅注释/空白”的语句，避免把纯注释当命令发给数据库（MySQL 1295）
     const isMysqlFamilyConn = ['mysql', 'mariadb', 'tidb', 'oceanBase'].includes(connType)
-    const keepMysqlPreparedScript = isMysqlFamilyConn
-      && hasMysqlUserPreparedStmt(trimmed)
+    const keepMysqlSessionScript = isMysqlFamilyConn
+      && (hasMysqlUserPreparedStmt(trimmed) || hasMysqlUserVariable(trimmed))
       && !hasMysqlDelimiterDirective(trimmed)
-    const stmts = keepMysqlPreparedScript
+    const stmts = keepMysqlSessionScript
       ? [trimmed]
       : splitSqlStatements(trimmed, connType).filter(s => stripSqlComments(s) !== '')
     if (stmts.length === 0) return // 仅注释/空白：静默不执行
@@ -1844,7 +1860,13 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
                 )}
               </div>
             ) : resultTab === 'msg' ? (
-              <div className="sql-msglog">
+              <div
+                ref={msgPanelRef}
+                className="sql-msglog"
+                tabIndex={0}
+                onMouseDown={() => msgPanelRef.current?.focus()}
+                onKeyDown={handleResultTextKeyDown}
+              >
                 {(() => { const done = msgs.filter(m => m.status === 'ok' || m.status === 'err' || m.status === 'cancelled'); return done.length === 0 ? <div className="sql-msglog__empty">{running ? '执行中…' : '暂无消息'}</div> : done.map((m, i) => (
                   <div key={i} className="sql-msglog__item">
                     <div className="sql-msglog__sql">
@@ -1858,7 +1880,13 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
                 )) })()}
               </div>
             ) : resultTab === 'sum' ? (
-              <div className="sql-summary">
+              <div
+                ref={summaryPanelRef}
+                className="sql-summary"
+                tabIndex={0}
+                onMouseDown={() => summaryPanelRef.current?.focus()}
+                onKeyDown={handleResultTextKeyDown}
+              >
                 <div className="sql-summary__stats">
                   {running ? (
                     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: 'var(--accent)' }}>

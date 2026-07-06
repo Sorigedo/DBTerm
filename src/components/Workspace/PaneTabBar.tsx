@@ -256,7 +256,7 @@ export default function PaneTabBar({ pane, paneTabs, activeId, focused, style, o
       {/* SSH 终端：显示 SSH 工具下拉（同主标签栏） */}
       {isSSH && (
         <div style={{ display: 'flex', alignItems: 'center', borderLeft: '1px solid var(--border-subtle)' }}>
-          <SshToolsMenu isLocalTerm={isLocalTerm} />
+          <SshToolsMenu isLocalTerm={isLocalTerm} shortcutsEnabled={focused} />
         </div>
       )}
 

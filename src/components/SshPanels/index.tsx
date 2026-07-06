@@ -8,11 +8,12 @@ import { useAppStore } from '../../stores/appStore'
 
 interface Props {
   sessionId: string
+  initialPath?: string
   panelWidth?: number
   onRunCommand?: (cmd: string) => void
 }
 
-export default function SshSidePanel({ sessionId, panelWidth, onRunCommand }: Props) {
+export default function SshSidePanel({ sessionId, initialPath, panelWidth, onRunCommand }: Props) {
   const { activeSshPanel, closeSshPanel } = useAppStore()
 
   if (!activeSshPanel) return null
@@ -22,7 +23,7 @@ export default function SshSidePanel({ sessionId, panelWidth, onRunCommand }: Pr
   return (
     <div className="ssh-side-panel" style={panelWidth ? { width: panelWidth } : undefined}>
       {activeSshPanel === 'perf'      && <PerfPanel {...props} />}
-      {activeSshPanel === 'files'     && <FileManagerPanel {...props} />}
+      {activeSshPanel === 'files'     && <FileManagerPanel {...props} initialPath={initialPath} />}
       {activeSshPanel === 'history'   && <CommandHistoryPanel {...props} onRunCommand={onRunCommand} />}
       {activeSshPanel === 'snippets'  && <SnippetsPanel {...props} onRunCommand={onRunCommand} />}
       {activeSshPanel === 'tunnel'    && <TunnelPanel {...props} />}

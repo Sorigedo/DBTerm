@@ -124,6 +124,41 @@ export function hasMysqlUserPreparedStmt(sql: string): boolean {
   })
 }
 
+export function hasMysqlUserVariable(sql: string): boolean {
+  let quote: "'" | '"' | '`' | null = null
+  let lineComment = false
+  let blockComment = false
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i]
+    const next = sql[i + 1]
+    if (lineComment) {
+      if (ch === '\n') lineComment = false
+      continue
+    }
+    if (blockComment) {
+      if (ch === '*' && next === '/') { blockComment = false; i++ }
+      continue
+    }
+    if (quote) {
+      if (ch === '\\') { i++; continue }
+      if (ch === quote && next === quote) { i++; continue }
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === '-' && next === '-') { lineComment = true; i++; continue }
+    if (ch === '#') { lineComment = true; continue }
+    if (ch === '/' && next === '*') { blockComment = true; i++; continue }
+    if (ch === "'" || ch === '"' || ch === '`') { quote = ch; continue }
+    if (ch === '@') {
+      const prev = sql[i - 1] ?? ''
+      if (/[A-Za-z0-9_]/.test(prev)) continue
+      const rest = sql.slice(i + 1)
+      if (/^[A-Za-z0-9_$]+/.test(rest)) return true
+    }
+  }
+  return false
+}
+
 export function hasMysqlDelimiterDirective(sql: string): boolean {
   return sql.split(/\r?\n/).some(line => lineDirective(line, 'mysql')?.kind === 'delimiter')
 }

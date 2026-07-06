@@ -145,6 +145,9 @@ export const SHORTCUT_DEFS: ShortcutDef[] = [
   { id: 'openSettings',    label: '打开设置',           defaultCombo: 'Mod+,',           group: '全局',      scope: 'global' },
   { id: 'newWindow',       label: '新建窗口',           defaultCombo: 'Mod+Alt+N',       group: '全局',      scope: 'global' },
   { id: 'dbCollapseAll',   label: '展开/收起所有库树',  defaultCombo: 'Mod+M',           group: '全局',      scope: 'global' },
+  { id: 'sshFiles',        label: 'SSH 文件管理',       defaultCombo: 'Mod+Alt+F',       group: '全局',      scope: 'global' },
+  { id: 'sshHistory',      label: 'SSH 命令历史',       defaultCombo: 'Mod+Alt+H',       group: '全局',      scope: 'global' },
+  { id: 'sshPerf',         label: 'SSH 性能面板',       defaultCombo: 'Mod+Alt+P',       group: '全局',      scope: 'global' },
   // ── SQL 编辑器
   { id: 'sqlRunAll',       label: '执行（选中或全部）', defaultCombo: 'Mod+R',           group: 'SQL 编辑器', scope: 'sql-editor' },
   { id: 'sqlRunSelected',  label: '执行选中 SQL',       defaultCombo: 'Mod+Shift+R',     group: 'SQL 编辑器', scope: 'sql-editor' },
