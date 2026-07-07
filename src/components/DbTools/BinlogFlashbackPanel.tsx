@@ -4,7 +4,6 @@
 import { useState, useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { X, RefreshCw, Undo2, Copy, AlertTriangle, CheckCircle } from 'lucide-react'
-import { isMysqlFamily } from '../../utils/sqlDialect'
 
 interface Props {
   connectionId: string
@@ -30,7 +29,7 @@ interface BinlogEvent {
 type Step = 'check' | 'select' | 'events' | 'flashback'
 
 export default function BinlogFlashbackPanel({ connectionId, connType, onClose }: Props) {
-  const supported = isMysqlFamily(connType)
+  const supported = connType === 'mysql' || connType === 'mariadb'
   const [step, setStep] = useState<Step>('check')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -110,7 +109,7 @@ export default function BinlogFlashbackPanel({ connectionId, connType, onClose }
     try {
       const { invoke } = await import('@tauri-apps/api/core')
       type R = { columns: string[]; rows: (string | null)[][] }
-      let sql = `SHOW BINLOG EVENTS IN '${selectedLog}'`
+      let sql = `SHOW BINLOG EVENTS IN '${selectedLog.replace(/'/g, "''")}'`
       if (fromPos) sql += ` FROM ${fromPos}`
       sql += ` LIMIT 200`
       const res = await invoke<R>('execute_query', { id: connectionId, sql })
@@ -157,7 +156,7 @@ export default function BinlogFlashbackPanel({ connectionId, connType, onClose }
 
   const fmtSize = (b: number) => b > 1024 * 1024 ? `${(b / 1024 / 1024).toFixed(1)}M` : `${(b / 1024).toFixed(0)}K`
 
-  // 闪回（binlog）为 MySQL / MariaDB 专属，其它数据库类型不执行任何 binlog 查询
+  // 闪回（binlog）为 MySQL / MariaDB 专属；TiDB / OceanBase 是分布式架构，不执行 MySQL binlog 查询。
   if (!supported) {
     return createPortal(
       <div className="cdlg-overlay" onMouseDown={onClose}>

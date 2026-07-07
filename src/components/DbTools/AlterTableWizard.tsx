@@ -279,7 +279,7 @@ export default function AlterTableWizard({ connectionId, schema, table, connType
       try {
         const { invoke } = await import('@tauri-apps/api/core')
         type R = { columns: string[]; rows: (string | null)[][] }
-        const tref = schema ? `\`${schema}\`.\`${table}\`` : `\`${table}\``
+        const tref = tableRefDialect(connType, schema, table)
         const res = await invoke<R>('execute_query', { id: connectionId, sql: `SHOW CREATE TABLE ${tref}` })
         const ddl = res.rows[0]?.[1] ?? ''
         // PERIOD FOR apptime (start_col, end_col)

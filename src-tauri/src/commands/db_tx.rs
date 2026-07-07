@@ -232,6 +232,13 @@ async fn run_on_mysql(
     }
 }
 
+async fn mysql_exec_text(conn: &mut sqlx::mysql::MySqlConnection, sql: &str) -> Result<(), String> {
+    use sqlx::Executor;
+    conn.execute(sqlx::raw_sql(sql)).await
+        .map(|_| ())
+        .map_err(|e| format!("{e}"))
+}
+
 async fn run_on_pg(
     conn: &mut sqlx::postgres::PgConnection,
     sql: &str,
@@ -330,6 +337,7 @@ async fn run_on_sqlite(
 #[tauri::command]
 pub async fn db_begin_tx(
     id: String,
+    database: Option<String>,
     storage: State<'_, StorageState>,
     tx_state: State<'_, TxState>,
     duck_pool: State<'_, DuckPool>,
@@ -345,21 +353,33 @@ pub async fn db_begin_tx(
         }
     }
 
-    let (config, password) = load_conn(&id, &storage).await?;
+    let (mut config, password) = load_conn(&id, &storage).await?;
     let pwd = password.as_deref();
     // 只读连接：事务整体以 READ ONLY 起，写操作由引擎直接拒绝（最强保证）
     let read_only = config.read_only == Some(true);
 
     let conn = match config.conn_type {
         ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => {
+            if let Some(db) = database.as_deref().filter(|s| !s.is_empty()) {
+                config.database = Some(db.to_string());
+            }
             let mut c = open_mysql(&config, pwd).await?;
+            if let Some(db) = config.database.as_deref().filter(|s| !s.is_empty()) {
+                mysql_exec_text(&mut c, &format!("USE `{}`", db.replace('`', "``"))).await
+                    .map_err(|e| format!("切换数据库失败: {e}"))?;
+            }
             let begin = if read_only { "START TRANSACTION READ ONLY" } else { "BEGIN" };
-            sqlx::query(begin).execute(&mut c).await
+            mysql_exec_text(&mut c, begin).await
                 .map_err(|e| format!("BEGIN 失败: {e}"))?;
             TxConn::MySql(c)
         }
         ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
             let mut c = open_pg(&config, pwd).await?;
+            if let Some(schema) = database.as_deref().filter(|s| !s.is_empty()) {
+                let safe_schema = schema.replace('"', "\"\"");
+                sqlx::query(&format!("SET search_path TO \"{safe_schema}\"")).execute(&mut c).await
+                    .map_err(|e| format!("切换 schema 失败: {e}"))?;
+            }
             let begin = if read_only { "BEGIN READ ONLY" } else { "BEGIN" };
             sqlx::query(begin).execute(&mut c).await
                 .map_err(|e| format!("BEGIN 失败: {e}"))?;
@@ -474,8 +494,8 @@ pub async fn db_commit_tx(
     };
     let mut tx = tx_arc.lock().await;
     match &mut tx.conn {
-        TxConn::MySql(conn)  => sqlx::query("COMMIT").execute(&mut *conn).await
-            .map(|_| ()).map_err(|e| format!("COMMIT 失败: {e}")),
+        TxConn::MySql(conn)  => mysql_exec_text(conn, "COMMIT").await
+            .map_err(|e| format!("COMMIT 失败: {e}")),
         TxConn::Pg(conn)     => sqlx::query("COMMIT").execute(&mut *conn).await
             .map(|_| ()).map_err(|e| format!("COMMIT 失败: {e}")),
         TxConn::Sqlite(conn) => sqlx::query("COMMIT").execute(&mut *conn).await
@@ -519,8 +539,8 @@ pub async fn db_rollback_tx(
     };
     let mut tx = tx_arc.lock().await;
     match &mut tx.conn {
-        TxConn::MySql(conn)  => sqlx::query("ROLLBACK").execute(&mut *conn).await
-            .map(|_| ()).map_err(|e| format!("ROLLBACK 失败: {e}")),
+        TxConn::MySql(conn)  => mysql_exec_text(conn, "ROLLBACK").await
+            .map_err(|e| format!("ROLLBACK 失败: {e}")),
         TxConn::Pg(conn)     => sqlx::query("ROLLBACK").execute(&mut *conn).await
             .map(|_| ()).map_err(|e| format!("ROLLBACK 失败: {e}")),
         TxConn::Sqlite(conn) => sqlx::query("ROLLBACK").execute(&mut *conn).await

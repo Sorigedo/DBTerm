@@ -2,6 +2,7 @@
 import { useState, useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { X, RefreshCw, Zap, AlertTriangle, Copy, Play } from 'lucide-react'
+import { qid, sqlStr } from '../../utils/sqlDialect'
 
 interface Props {
   connectionId: string
@@ -38,7 +39,8 @@ function fmtSize(mb: number) {
   return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb.toFixed(1)} MB`
 }
 
-export default function OnlineDdlPanel({ connectionId, schema, onClose, onRunSql }: Props) {
+export default function OnlineDdlPanel({ connectionId, schema, connType, onClose, onRunSql }: Props) {
+  const supported = connType === 'mysql' || connType === 'mariadb'
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [tables, setTables] = useState<TableInfo[]>([])
@@ -67,7 +69,7 @@ export default function OnlineDdlPanel({ connectionId, schema, onClose, onRunSql
                ROUND(DATA_LENGTH / 1024 / 1024, 2) AS data_mb,
                ROUND(INDEX_LENGTH / 1024 / 1024, 2) AS index_mb
               FROM information_schema.TABLES
-              WHERE TABLE_SCHEMA = '${schema}' AND TABLE_TYPE = 'BASE TABLE'
+              WHERE TABLE_SCHEMA = ${sqlStr(schema)} AND TABLE_TYPE = 'BASE TABLE'
               ORDER BY DATA_LENGTH DESC
               LIMIT 50`,
       })
@@ -92,7 +94,7 @@ export default function OnlineDdlPanel({ connectionId, schema, onClose, onRunSql
 
   const genNativeDdl = () => {
     if (!selectedTable || !ddlText.trim()) return ''
-    return `ALTER TABLE \`${schema}\`.\`${selectedTable}\`\n  ${ddlText.trim()},\n  ALGORITHM=${algorithm}, LOCK=${lock};`
+    return `ALTER TABLE ${qid(connType, schema)}.${qid(connType, selectedTable)}\n  ${ddlText.trim()},\n  ALGORITHM=${algorithm}, LOCK=${lock};`
   }
 
   const genPtOscCmd = () => {
@@ -131,6 +133,32 @@ export default function OnlineDdlPanel({ connectionId, schema, onClose, onRunSql
       : `执行 ALTER TABLE？\n\n${sql}`
     if (!window.confirm(confirmMsg)) return
     if (onRunSql) { onRunSql(sql); onClose() }
+  }
+
+  if (!supported) {
+    return createPortal(
+      <div className="cdlg-overlay" onMouseDown={onClose}>
+        <div
+          className="cdlg-box"
+          onMouseDown={e => e.stopPropagation()}
+          style={{ width: 460, display: 'flex', flexDirection: 'column', borderRadius: 14, overflow: 'hidden' }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
+            <Zap size={14} color="var(--accent)" />
+            <span style={{ fontWeight: 600, fontSize: 13 }}>在线大表改表</span>
+            <button onClick={onClose} style={{ marginLeft: 'auto', color: 'var(--text-muted)', padding: 4, lineHeight: 0 }}><X size={13} /></button>
+          </div>
+          <div style={{ padding: 32, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, textAlign: 'center' }}>
+            <AlertTriangle size={28} color="var(--warning)" />
+            <div style={{ fontSize: 13, color: 'var(--text)', lineHeight: 1.7 }}>
+              在线大表改表仅支持 MySQL / MariaDB。<br />
+              <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>TiDB / OceanBase 请使用各自的分布式运维面板查看 DDL 任务。</span>
+            </div>
+          </div>
+        </div>
+      </div>,
+      document.body
+    )
   }
 
   return createPortal(

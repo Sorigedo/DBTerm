@@ -18,6 +18,7 @@ export interface ToolDef {
 }
 
 const isMysql = (c: ConnType) => ['mysql', 'mariadb', 'tidb', 'oceanBase'].includes(c)
+const isMysqlNative = (c: ConnType) => ['mysql', 'mariadb'].includes(c)
 const isPg = (c: ConnType) => ['postgres', 'kingBase', 'openGauss'].includes(c)
 const is = (...types: ConnType[]) => (c: ConnType) => types.includes(c)
 const any = () => true
@@ -34,8 +35,8 @@ export const TOOL_CATALOG: ToolDef[] = [
   { tool: 'backupRestore', label: '备份恢复',      cat: 'object', icon: <RotateCcw size={12} />,   show: (c) => isMysql(c) || isPg(c) },
   { tool: 'exportCenter',  label: '导出任务中心',  cat: 'object', icon: <Download size={12} />,    show: any },
   { tool: 'scheduler',     label: '定时任务',      cat: 'object', icon: <Clock size={12} />,       show: isMysql },
-  { tool: 'binlogFb',      label: 'Binlog 闪回',   cat: 'object', icon: <Undo2 size={12} />,       show: isMysql },
-  { tool: 'onlineDdl',     label: '在线大表改表',  cat: 'object', icon: <Zap size={12} />,         show: isMysql },
+  { tool: 'binlogFb',      label: 'Binlog 闪回',   cat: 'object', icon: <Undo2 size={12} />,       show: isMysqlNative },
+  { tool: 'onlineDdl',     label: '在线大表改表',  cat: 'object', icon: <Zap size={12} />,         show: isMysqlNative },
 
   // ── 高级 / 专属（按数据库类型）──
   { tool: 'galera',        label: 'Galera 集群',    cat: 'advanced', icon: <Network size={12} />,         show: is('mariadb') },

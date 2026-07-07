@@ -3,6 +3,7 @@ import { useState, useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { X, RefreshCw, Edit3, Check, XCircle, Hash, Plus, Trash2, Zap } from 'lucide-react'
 import { invoke } from '@tauri-apps/api/core'
+import { qid } from '../../utils/sqlDialect'
 
 interface SequenceInfo {
   tableName: string
@@ -39,6 +40,8 @@ interface CreateSeqForm {
 
 export default function SequencePanel({ connectionId, connType, schema, onClose }: Props) {
   const isMaria = connType === 'mariadb'
+  const q = (s: string) => qid(connType, s)
+  const seqRef = (name: string) => schema ? `${q(schema)}.${q(name)}` : q(name)
   const [activeTab, setActiveTab] = useState<'autoInc' | 'native'>(isMaria ? 'native' : 'autoInc')
 
   // AUTO_INCREMENT 状态
@@ -94,7 +97,7 @@ export default function SequencePanel({ connectionId, connType, schema, onClose 
       type R = { columns: string[]; rows: (string | null)[][] }
       const res = await invoke<R>('execute_query', {
         id: connectionId,
-        sql: `SELECT NEXTVAL(\`${schema}\`.\`${seqName}\`)`,
+        sql: `SELECT NEXTVAL(${seqRef(seqName)})`,
       })
       const val = res.rows[0]?.[0]
       setMariaMsg(`NEXTVAL(${seqName}) = ${val}`)
@@ -114,7 +117,7 @@ export default function SequencePanel({ connectionId, connType, schema, onClose 
       type R = { columns: string[]; rows: (string | null)[][] }
       await invoke<R>('execute_query', {
         id: connectionId,
-        sql: `SELECT SETVAL(\`${schema}\`.\`${setvalTarget.name}\`, ${v})`,
+        sql: `SELECT SETVAL(${seqRef(setvalTarget.name)}, ${v})`,
       })
       setMariaMsg(`已将序列 ${setvalTarget.name} 设置为 ${v}`)
       setSetvalTarget(null)
@@ -127,7 +130,11 @@ export default function SequencePanel({ connectionId, connType, schema, onClose 
   const doCreate = async () => {
     const { name, start, increment, minVal, maxVal, cycle } = createForm
     if (!name.trim()) { setMariaMsg('序列名不能为空'); return }
-    const sql = `CREATE OR REPLACE SEQUENCE \`${schema}\`.\`${name.trim()}\` START WITH ${start} INCREMENT BY ${increment} MINVALUE ${minVal} MAXVALUE ${maxVal}${cycle ? ' CYCLE' : ' NOCYCLE'}`
+    if (![start, increment, minVal, maxVal].every(v => /^-?\d+$/.test(v.trim()))) {
+      setMariaMsg('起始值、步长、最小值、最大值必须为整数')
+      return
+    }
+    const sql = `CREATE OR REPLACE SEQUENCE ${seqRef(name.trim())} START WITH ${start.trim()} INCREMENT BY ${increment.trim()} MINVALUE ${minVal.trim()} MAXVALUE ${maxVal.trim()}${cycle ? ' CYCLE' : ' NOCYCLE'}`
     if (!window.confirm(`确认创建序列？\n\n${sql}`)) return
     setCreateSaving(true)
     setMariaMsg('')
@@ -153,7 +160,7 @@ export default function SequencePanel({ connectionId, connType, schema, onClose 
       type R = { columns: string[]; rows: (string | null)[][] }
       await invoke<R>('execute_query', {
         id: connectionId,
-        sql: `DROP SEQUENCE \`${schema}\`.\`${seqName}\``,
+        sql: `DROP SEQUENCE ${seqRef(seqName)}`,
       })
       setMariaMsg(`序列 ${seqName} 已删除`)
       setDropConfirm(null)

@@ -225,6 +225,7 @@ function parseSingleTable(sqlText: string): { schema: string; table: string } | 
 
 // 支持主动 kill 正在运行查询的连接类型（MySQL 系走 KILL QUERY，PG 系走 pg_cancel_backend）
 const CANCELABLE_TYPES = new Set(['mysql', 'mariadb', 'tidb', 'oceanBase', 'postgres', 'kingBase', 'openGauss', 'sqlite', 'duckdb'])
+const TX_SUPPORTED_TYPES = new Set<ConnType>(['mysql', 'mariadb', 'tidb', 'oceanBase', 'postgres', 'kingBase', 'openGauss', 'sqlite', 'duckdb', 'sqlServer', 'oracle'])
 
 function findFoldAtSelection(view: EditorView): { from: number; to: number } | null {
   const sel = view.state.selection.main
@@ -809,6 +810,45 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
     })()
     return () => { alive = false }
   }, [connectionId])
+
+  const syncTxStatus = useCallback(async () => {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core')
+      const active = await invoke<boolean>('db_tx_status', { id: connectionId })
+      setTxActive(active)
+      if (active) setTxMode(true)
+      return active
+    } catch {
+      return txActive
+    }
+  }, [connectionId, txActive])
+
+  const handleToggleTxMode = useCallback(() => {
+    if (!TX_SUPPORTED_TYPES.has(connType)) {
+      setTxMode(false)
+      setTxActive(false)
+      setError('当前数据库不支持传统手动事务')
+      toast.warning('当前数据库不支持传统手动事务')
+      return
+    }
+    if (txActive) {
+      setTxMode(true)
+      setError('当前已有活跃事务，请先提交或回滚后再关闭手动提交模式')
+      toast.warning('请先提交或回滚当前事务')
+      return
+    }
+    setTxMode(v => !v)
+  }, [connType, txActive])
+
+  const beginTx = useCallback(async () => {
+    if (!TX_SUPPORTED_TYPES.has(connType)) {
+      throw new Error('当前数据库不支持传统手动事务')
+    }
+    const { invoke } = await import('@tauri-apps/api/core')
+    await invoke('db_begin_tx', { id: connectionId, database: currentSchemaRef.current || undefined })
+    setTxMode(true)
+    setTxActive(true)
+  }, [connectionId, connType])
   // 行内编辑上下文：单表查询 + 存在主键且主键列都在结果中才可编辑
   const [editCtx, setEditCtx] = useState<EditCtx | null>(null)
   // MariaDB 非事务引擎提示（Aria/MyISAM 不支持事务回滚）
@@ -916,6 +956,17 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
     return /^(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE|REPLACE|RENAME|MERGE|UPSERT|GRANT|REVOKE|LOAD\s+DATA|CALL)\b/.test(upper)
   }
 
+  /** 适合由“手动提交模式”自动 BEGIN 的语句：仅 DML，避开各方言 DDL/权限/过程的隐式提交差异 */
+  const isTransactionalDml = (trimmed: string) => {
+    if (!TX_SUPPORTED_TYPES.has(connType)) return false
+    const upper = stripSqlComments(trimmed).trim().toUpperCase()
+    if (/^(INSERT|UPDATE|DELETE|MERGE|UPSERT)\b/.test(upper)) return true
+    if (['mysql', 'mariadb', 'tidb', 'oceanBase'].includes(connType)) {
+      return /^(REPLACE|LOAD\s+DATA)\b/.test(upper)
+    }
+    return false
+  }
+
   /** I1 危险 SQL 检测：返回警告列表，为空表示安全 */
   const detectDangerSql = (trimmed: string): string[] => {
     const warnings: string[] = []
@@ -962,6 +1013,7 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
 
   // 仅 MySQL/PG 系支持主动 kill 正在运行的查询；事务连接不注入（kill 会破坏事务连接）
   const canCancel = !txActive && CANCELABLE_TYPES.has(connType)
+  const txSupported = TX_SUPPORTED_TYPES.has(connType)
   const newCancelToken = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
   // 给 SQL 注入取消标记注释；单次执行/批量里的每条语句都使用独立 token，停止时按当前 token 取消。
   const markSql = (s: string, token?: string | null): string => {
@@ -1006,10 +1058,17 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
 
     // 写操作守卫（覆盖单/多语句）—— 逐条做 SQL 级校验
     const writeStmts = stmts.filter(isWriteSql)
+    const txDmlStmts = stmts.filter(isTransactionalDml)
     // 只读模式：拦截一切写操作（DML/DDL/权限），不可绕过
     if ((activeConn?.readonly ?? activeConn?.readOnly) && writeStmts.length > 0) {
       setMultiResults([]); setResult(null)
       setError('此连接为只读模式，已拦截写操作（INSERT / UPDATE / DELETE / DDL 等）')
+      return
+    }
+    if (txMode && !txActive && txDmlStmts.length > 0 && writeStmts.length > txDmlStmts.length) {
+      setMultiResults([]); setResult(null)
+      setError('批量 SQL 同时包含 DML 和 DDL / 权限 / 存储过程等语句，无法安全自动 BEGIN；请拆分执行或手动控制事务')
+      toast.warning('请拆分批量 SQL 后再执行')
       return
     }
     // 生产环境：可读可写，但写操作执行前需二次确认
@@ -1019,9 +1078,21 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
     }
 
     const effectiveLimit = limitOverride !== undefined ? limitOverride : queryLimit
+    let executeInTx = txActive
 
     // K5 — 多语句检测：有多条语句时走 multi-result 流程
     if (stmts.length > 1) {
+      if (txMode && !executeInTx && txDmlStmts.length > 0) {
+        try {
+          await beginTx()
+          executeInTx = true
+          toast.info('已自动开始事务')
+        } catch (e) {
+          setMultiResults([]); setResult(null)
+          setError(String(e))
+          return
+        }
+      }
       setMultiResults(stmts.map(s => ({ sql: s, result: null, error: '' })))
       setResult(null); setError('')
       setResultTab('sum')   // 多语句：停在「摘要」页，实时看每条进度（执行中/等待/成功/错误）
@@ -1036,16 +1107,18 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
           })
           break
         }
-        const token = canCancel ? newCancelToken() : null
+        const token = (!executeInTx && CANCELABLE_TYPES.has(connType)) ? newCancelToken() : null
         runTokenRef.current = token
         setRunToken(token)
         try {
-          const res = await inv<QueryResult>('execute_query', {
-            id: connectionId,
-            sql: markSql(s, token),
-            database: currentSchemaRef.current || undefined,
-            rowLimit: effectiveLimit ?? undefined,
-          })
+          const res = await inv<QueryResult>(executeInTx ? 'db_exec_in_tx' : 'execute_query', executeInTx
+            ? { id: connectionId, sql: markSql(s, token) }
+            : {
+                id: connectionId,
+                sql: markSql(s, token),
+                database: currentSchemaRef.current || undefined,
+                rowLimit: effectiveLimit ?? undefined,
+              })
           if (cancelRequestedRef.current) {
             flushSync(() => {
               setMultiResults(prev => markBatchCancelledFrom(prev, si))
@@ -1075,6 +1148,10 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
               : prev.map((r, i) => i === si ? { ...r, error: errStr } : r))
           })
           addHistory(connectionId, s, false, { error: (cancelled ? '查询已取消' : errStr).slice(0, 200) })
+          if (executeInTx && errStr.includes('没有活跃事务')) {
+            await syncTxStatus()
+            break
+          }
           if (cancelled) break
         } finally {
           runTokenRef.current = null
@@ -1096,10 +1173,21 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
       setDangerPending({ sql: trimmed, warnings })
       return
     }
+    if (txMode && !executeInTx && txDmlStmts.length > 0) {
+      try {
+        await beginTx()
+        executeInTx = true
+        toast.info('已自动开始事务')
+      } catch (e) {
+        setMultiResults([]); setResult(null)
+        setError(String(e))
+        return
+      }
+    }
 
     setMultiResults([])
     cancelRequestedRef.current = false
-    const token = canCancel ? newCancelToken() : null
+    const token = (!executeInTx && CANCELABLE_TYPES.has(connType)) ? newCancelToken() : null
     runTokenRef.current = token
     setRunToken(token)
     setRunning(true)
@@ -1107,12 +1195,14 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
     setResult(null)
     try {
       const { invoke } = await import('@tauri-apps/api/core')
-      const res = await invoke<QueryResult>(txActive ? 'db_exec_in_tx' : 'execute_query', {
-        id: connectionId,
-        sql: markSql(trimmed, token),
-        database: currentSchemaRef.current || undefined,
-        ...(txActive ? {} : { rowLimit: effectiveLimit ?? undefined }),
-      })
+      const res = await invoke<QueryResult>(executeInTx ? 'db_exec_in_tx' : 'execute_query', executeInTx
+        ? { id: connectionId, sql: markSql(trimmed, token) }
+        : {
+            id: connectionId,
+            sql: markSql(trimmed, token),
+            database: currentSchemaRef.current || undefined,
+            rowLimit: effectiveLimit ?? undefined,
+          })
       setResult(res)
       addHistory(connectionId, trimmed, true, {
         executionTimeMs: res.executionTimeMs,
@@ -1139,15 +1229,11 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
         })
       }
 
-      // 手动事务模式：非 SELECT 语句标记事务进行中
-      if (txMode && !trimmed.toUpperCase().startsWith('SELECT')) {
-        setTxActive(true)
-      }
-
       // 可编辑性由「当前结果集」effect 统一判定（支持多结果集）
     } catch (e) {
       const errStr = String(e)
       setError(errStr)
+      if (executeInTx && errStr.includes('没有活跃事务')) syncTxStatus()
       addHistory(connectionId, trimmed, false, { error: errStr.slice(0, 200) })
       if (isWriteSql(trimmed)) {
         appendAuditLog({
@@ -1166,7 +1252,7 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
       setQueryLimit(dbQueryLimit)
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionId, connType, addHistory, activeConn, txMode, txActive, queryLimit, dbQueryLimit])
+  }, [connectionId, connType, addHistory, activeConn, txMode, txActive, queryLimit, dbQueryLimit, syncTxStatus, beginTx])
 
   /** 危险 SQL 确认后直接执行（跳过 danger check） */
   const runQueryForced = useCallback(async (sqlToRun: string) => {
@@ -1178,21 +1264,34 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
     setRunning(true)
     setError('')
     setResult(null)
+    let executeInTx = txActive
+    if (txMode && !txActive && isTransactionalDml(trimmed)) {
+      try {
+        await beginTx()
+        executeInTx = true
+        toast.info('已自动开始事务')
+      } catch (e) {
+        setError(String(e))
+        setRunning(false)
+        return
+      }
+    }
     try {
       const { invoke } = await import('@tauri-apps/api/core')
       cancelRequestedRef.current = false
-      const token = canCancel ? newCancelToken() : null
+      const token = (!executeInTx && CANCELABLE_TYPES.has(connType)) ? newCancelToken() : null
       runTokenRef.current = token
       setRunToken(token)
-      const res = await invoke<QueryResult>(txActive ? 'db_exec_in_tx' : 'execute_query', {
-        id: connectionId, sql: markSql(trimmed, token), database: currentSchemaRef.current || undefined,
-      })
+      const res = await invoke<QueryResult>(executeInTx ? 'db_exec_in_tx' : 'execute_query', executeInTx
+        ? { id: connectionId, sql: markSql(trimmed, token) }
+        : { id: connectionId, sql: markSql(trimmed, token), database: currentSchemaRef.current || undefined })
       setResult(res)
       addHistory(connectionId, trimmed, true)
-      if (txMode && !trimmed.toUpperCase().startsWith('SELECT')) setTxActive(true)
       setEditCtx(null)
     } catch (e) {
-      setError(String(e))
+      const errStr = String(e)
+      setError(errStr)
+      if (executeInTx && errStr.includes('没有活跃事务')) syncTxStatus()
       addHistory(connectionId, trimmed, false)
     } finally {
       lastElapsedRef.current = Date.now() - runStartRef.current
@@ -1202,7 +1301,7 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
       cancelRequestedRef.current = false
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionId, addHistory, txMode, txActive])
+  }, [connectionId, connType, addHistory, txMode, txActive, syncTxStatus, beginTx])
 
   const runSqlWithVariables = useCallback((sqlToRun: string) => {
     const vars = findSqlVariables(sqlToRun)
@@ -1501,8 +1600,7 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
     try {
       const { invoke } = await import('@tauri-apps/api/core')
       if (stmt === 'BEGIN') {
-        await invoke('db_begin_tx', { id: connectionId })
-        setTxActive(true)
+        await beginTx()
       } else if (stmt === 'COMMIT') {
         await invoke('db_commit_tx', { id: connectionId })
         setTxActive(false)
@@ -1514,10 +1612,11 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
       }
     } catch (e) {
       setError(String(e))
+      syncTxStatus()
     } finally {
       setRunning(false)
     }
-  }, [connectionId])
+  }, [connectionId, syncTxStatus, beginTx])
 
   return (
     <div className="sql-editor-layout">
@@ -1698,19 +1797,23 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
               <div className="sql-more-menu sql-more-menu--right sql-tx-menu" onMouseLeave={() => setTxMenuOpen(false)}>
                 <div className="sql-tx-menu__head">事务控制</div>
                 {/* 模式开关：直接显示当前状态 */}
-                <button className="sql-tx-menu__mode" onClick={() => { setTxMode(v => !v); setTxActive(false) }}>
+                <button className="sql-tx-menu__mode" onClick={handleToggleTxMode} disabled={!txSupported}>
                   <span>手动提交模式</span>
                   <span className={`sql-tx-switch${txMode ? ' on' : ''}`}><span className="sql-tx-switch__dot" /></span>
                 </button>
-                {connType === 'clickHouse' ? (
-                  <div className="sql-tx-menu__hint">ClickHouse 不支持传统事务（MergeTree 引擎按块原子写入）。</div>
+                {!txSupported ? (
+                  <div className="sql-tx-menu__hint">
+                    {connType === 'clickHouse'
+                      ? 'ClickHouse 不支持传统事务（MergeTree 引擎按块原子写入）。'
+                      : '当前连接类型不支持传统手动事务。'}
+                  </div>
                 ) : (
                   <>
                     {!txMode && (
                       <div className="sql-tx-menu__hint">
                         {connType === 'oracle'
-                          ? 'Oracle 事务：BEGIN 建立持久连接，DML 不自动提交，确认后 COMMIT，出错可 ROLLBACK 全部撤销。'
-                          : '开启后：BEGIN 暂存改动，确认无误 COMMIT 提交，出错可 ROLLBACK 全部撤销。'}
+                          ? '开启后：首次 DML 自动进入事务，也可手动 BEGIN；DDL 可能隐式提交。'
+                          : '开启后：首次 DML 自动 BEGIN，也可手动 BEGIN；DDL/权限语句按数据库规则处理。'}
                       </div>
                     )}
                     {txMode && (
@@ -1726,7 +1829,7 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
                           <Undo2 size={14} />回滚（ROLLBACK）
                         </button>
                         <div className="sql-tx-menu__status" style={{ color: txActive ? 'var(--warning)' : 'var(--text-muted)' }}>
-                          {txActive ? '● 事务进行中，记得提交或回滚' : '未开始 · 点「开始事务」'}
+                          {txActive ? '● 事务进行中，记得提交或回滚' : '未开始 · DML 会自动 BEGIN'}
                         </div>
                       </>
                     )}

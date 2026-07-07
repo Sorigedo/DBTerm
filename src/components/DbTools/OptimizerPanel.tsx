@@ -3,6 +3,7 @@ import { useState, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { createPortal } from 'react-dom'
 import { X, RefreshCw, Settings, BarChart2, AlertTriangle, Check } from 'lucide-react'
+import { qid, sqlStr } from '../../utils/sqlDialect'
 
 interface Props {
   connectionId: string
@@ -43,6 +44,7 @@ export default function OptimizerPanel({ connectionId, schema, onClose, embedded
   const [histTable, setHistTable] = useState('')
   const [analyzeRunning, setAnalyzeRunning] = useState(false)
   const [tableList, setTableList] = useState<string[]>([])
+  const q = (s: string) => qid('mariadb', s)
   useEffect(() => {
     if (!schema) return
     invoke<{ name: string; isView: boolean }[]>('list_tables', { id: connectionId, schema })
@@ -90,7 +92,7 @@ export default function OptimizerPanel({ connectionId, schema, onClose, embedded
                      nulls_ratio, avg_length, \
                      avg_frequency, hist_type \
               FROM mysql.column_stats \
-              WHERE db_name = '${schema}' \
+              WHERE db_name = ${sqlStr(schema)} \
               ORDER BY table_name, column_name \
               LIMIT 200`,
       })
@@ -143,14 +145,15 @@ export default function OptimizerPanel({ connectionId, schema, onClose, embedded
 
   const doAnalyze = async () => {
     if (!histTable.trim()) { setMsg('请先输入表名'); return }
-    if (!window.confirm(`确认执行 ANALYZE TABLE \`${schema}\`.\`${histTable}\` PERSISTENT FOR ALL？\n\n此操作将扫描全表并更新直方图统计信息，可能对大表有一定性能影响。`)) return
+    const target = `${q(schema)}.${q(histTable.trim())}`
+    if (!window.confirm(`确认执行 ANALYZE TABLE ${target} PERSISTENT FOR ALL？\n\n此操作将扫描全表并更新直方图统计信息，可能对大表有一定性能影响。`)) return
     setAnalyzeRunning(true); setMsg('')
     try {
       const { invoke } = await import('@tauri-apps/api/core')
       type R = { columns: string[]; rows: (string | null)[][] }
       await invoke<R>('execute_query', {
         id: connectionId,
-        sql: `ANALYZE TABLE \`${schema}\`.\`${histTable.trim()}\` PERSISTENT FOR ALL`,
+        sql: `ANALYZE TABLE ${target} PERSISTENT FOR ALL`,
       })
       setMsg(`✓ ${histTable} 直方图统计更新完成`)
       loadHistogram()

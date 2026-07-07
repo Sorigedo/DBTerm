@@ -1,6 +1,6 @@
 {
   "name": "dbterm",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
     "dev:desktop": "cd src-tauri && cargo tauri dev",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test \"src/**/*.test.ts\"",
+    "audit:db-features": "node scripts/audit-db-features.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",

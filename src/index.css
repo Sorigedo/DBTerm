@@ -4101,6 +4101,11 @@ body.tab-dragging .tab.active:hover {
   color: var(--text); font-size: 12.5px; cursor: pointer;
 }
 .sql-tx-menu__mode:hover { background: var(--surface-hover); }
+.sql-tx-menu__mode:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.sql-tx-menu__mode:disabled:hover { background: transparent; }
 .sql-tx-switch {
   width: 30px; height: 17px; border-radius: 9px;
   background: var(--surface-2); border: 1px solid var(--border);

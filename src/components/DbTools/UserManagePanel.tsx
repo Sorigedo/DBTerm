@@ -4,6 +4,7 @@ import { createPortal } from 'react-dom'
 import { X, RefreshCw, UserPlus, Trash2, Key, Shield, AlertTriangle, Plus, Minus } from 'lucide-react'
 import { invoke } from '@tauri-apps/api/core'
 import SearchableSelect from './SearchableSelect'
+import { qid, sqlStr } from '../../utils/sqlDialect'
 
 interface DbUser {
   name: string
@@ -58,6 +59,8 @@ export default function UserManagePanel({ connectionId, connType, onClose }: Pro
 
   const isPg     = ['postgres', 'kingBase', 'openGauss'].includes(connType)
   const isMaria  = connType === 'mariadb'
+  const q = (s: string) => qid(connType, s)
+  const mysqlAccount = (name: string, host: string) => `${sqlStr(name)}@${sqlStr(host)}`
 
   // MA5.1 — MariaDB 角色状态
   const [roles, setRoles]           = useState<string[]>([])
@@ -101,7 +104,7 @@ export default function UserManagePanel({ connectionId, connType, onClose }: Pro
     setActing(true); setMsg('')
     try {
       type R = { columns: string[]; rows: (string | null)[][] }
-      await invoke<R>('execute_query', { id: connectionId, sql: `CREATE ROLE \`${newRoleName.trim()}\`` })
+      await invoke<R>('execute_query', { id: connectionId, sql: `CREATE ROLE ${q(newRoleName.trim())}` })
       setMsg(`角色 ${newRoleName} 创建成功`)
       setNewRoleName('')
       loadRoles()
@@ -115,7 +118,7 @@ export default function UserManagePanel({ connectionId, connType, onClose }: Pro
     setActing(true); setMsg('')
     try {
       type R = { columns: string[]; rows: (string | null)[][] }
-      await invoke<R>('execute_query', { id: connectionId, sql: `DROP ROLE \`${name}\`` })
+      await invoke<R>('execute_query', { id: connectionId, sql: `DROP ROLE ${q(name)}` })
       setMsg(`角色 ${name} 已删除`)
       loadRoles()
     } catch (e) { setMsg(String(e)) }
@@ -124,7 +127,9 @@ export default function UserManagePanel({ connectionId, connType, onClose }: Pro
 
   const grantRole = async () => {
     if (!grantRoleUser || !grantRoleName) { setMsg('请填写用户和角色名'); return }
-    const sql = `GRANT \`${grantRoleName}\` TO '${grantRoleUser}'`
+    const u = users.find(x => `${x.name}@${x.host}` === grantRoleUser)
+    if (!u) { setMsg('用户不存在，请刷新后重试'); return }
+    const sql = `GRANT ${q(grantRoleName)} TO ${mysqlAccount(u.name, u.host)}`
     if (!window.confirm(`确认执行：${sql}？`)) return
     setActing(true); setMsg('')
     try {
@@ -137,7 +142,10 @@ export default function UserManagePanel({ connectionId, connType, onClose }: Pro
 
   const setDefaultRole = async () => {
     if (!defaultRoleUser || !defaultRoleName) { setMsg('请填写用户和默认角色'); return }
-    const sql = `SET DEFAULT ROLE \`${defaultRoleName}\` FOR '${defaultRoleUser}'`
+    const u = users.find(x => `${x.name}@${x.host}` === defaultRoleUser)
+    if (!u) { setMsg('用户不存在，请刷新后重试'); return }
+    const role = defaultRoleName === 'NONE' ? 'NONE' : q(defaultRoleName)
+    const sql = `SET DEFAULT ROLE ${role} FOR ${mysqlAccount(u.name, u.host)}`
     if (!window.confirm(`确认执行：${sql}？`)) return
     setActing(true); setMsg('')
     try {
@@ -442,7 +450,7 @@ export default function UserManagePanel({ connectionId, connType, onClose }: Pro
                   <SearchableSelect value={grantRoleUser} mono={false}
                     placeholder="— 选择用户 —" searchPlaceholder="搜索用户…"
                     onChange={setGrantRoleUser}
-                    items={users.map(u => ({ value: `'${u.name}'@'${u.host}'`, label: `${u.name}@${u.host}` }))} />
+                    items={users.map(u => ({ value: `${u.name}@${u.host}`, label: `${u.name}@${u.host}` }))} />
                   <SearchableSelect value={grantRoleName} mono={false}
                     placeholder="— 选择角色 —" searchPlaceholder="搜索角色…"
                     onChange={setGrantRoleName} options={roles} />
@@ -459,7 +467,7 @@ export default function UserManagePanel({ connectionId, connType, onClose }: Pro
                   <SearchableSelect value={defaultRoleUser} mono={false}
                     placeholder="— 选择用户 —" searchPlaceholder="搜索用户…"
                     onChange={setDefaultRoleUser}
-                    items={users.map(u => ({ value: `'${u.name}'@'${u.host}'`, label: `${u.name}@${u.host}` }))} />
+                    items={users.map(u => ({ value: `${u.name}@${u.host}`, label: `${u.name}@${u.host}` }))} />
                   <SearchableSelect value={defaultRoleName} mono={false}
                     placeholder="— 选择角色 —" searchPlaceholder="搜索角色…"
                     onChange={setDefaultRoleName}
