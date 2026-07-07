@@ -2163,10 +2163,10 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
             sql={variablePending.sql}
             variables={variablePending.variables}
             onCancel={() => setVariablePending(null)}
-            onRun={(values) => {
+            onRun={(values, modes) => {
               const pending = variablePending
               setVariablePending(null)
-              runQuery(applySqlVariables(pending.sql, pending.variables, values))
+              runQuery(applySqlVariables(pending.sql, pending.variables, values, modes))
             }}
           />
         </Suspense>

@@ -4,6 +4,8 @@ export interface SqlVariable {
   to: number
 }
 
+export type SqlVariableMode = 'literal' | 'raw'
+
 export function findSqlVariables(sqlText: string): SqlVariable[] {
   const vars: SqlVariable[] = []
   let quote: "'" | '"' | '`' | '[' | null = null
@@ -48,17 +50,23 @@ export function findSqlVariables(sqlText: string): SqlVariable[] {
   return vars
 }
 
-function sqlLiteral(value: string): string {
+function sqlLiteral(value: string, mode: SqlVariableMode = 'literal'): string {
+  if (mode === 'raw') return value.trim() || 'NULL'
   if (/^null$/i.test(value.trim())) return 'NULL'
   return `'${value.replace(/'/g, "''")}'`
 }
 
-export function applySqlVariables(sqlText: string, variables: SqlVariable[], values: Record<string, string>): string {
+export function applySqlVariables(
+  sqlText: string,
+  variables: SqlVariable[],
+  values: Record<string, string>,
+  modes: Record<string, SqlVariableMode> = {},
+): string {
   let out = ''
   let pos = 0
   for (const v of variables) {
     out += sqlText.slice(pos, v.from)
-    out += sqlLiteral(values[v.name] ?? '')
+    out += sqlLiteral(values[v.name] ?? '', modes[v.name] ?? 'literal')
     pos = v.to
   }
   out += sqlText.slice(pos)

@@ -3815,8 +3815,8 @@ body.tab-dragging .tab.active:hover {
 }
 
 .sql-var-dialog {
-  width: 520px;
-  max-width: min(520px, calc(100vw - 32px));
+  width: 680px;
+  max-width: min(680px, calc(100vw - 32px));
 }
 .sql-var-dialog__body {
   display: flex;
@@ -3843,22 +3843,41 @@ body.tab-dragging .tab.active:hover {
 }
 .sql-var-dialog__row {
   display: grid;
-  grid-template-columns: 140px minmax(0, 1fr);
+  grid-template-columns: 150px minmax(0, 1fr) auto;
   align-items: center;
   gap: 10px;
   color: var(--text);
   font-size: 12.5px;
 }
-.sql-var-dialog__row > span {
+.sql-var-dialog__row > label:first-child {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: var(--font-mono);
   color: var(--text-muted);
 }
+.sql-var-dialog__mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  user-select: none;
+}
+.sql-var-dialog__mode input {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+}
+.sql-var-dialog__preview-head {
+  margin-bottom: -6px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: var(--fw-medium);
+}
 .sql-var-dialog__preview {
   margin: 0;
-  max-height: 140px;
+  max-height: 220px;
   overflow: auto;
   background: var(--surface-2);
   border: 1px solid var(--border);
@@ -3869,6 +3888,13 @@ body.tab-dragging .tab.active:hover {
   font-size: 12px;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+@media (max-width: 640px) {
+  .sql-var-dialog__row {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
 }
 
 /* ── SQL 查询历史侧栏 ──────────────────────────────────────── */

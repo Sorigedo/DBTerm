@@ -14,6 +14,16 @@ test('findSqlVariables detects named variables outside strings and comments', ()
   assert.deepEqual(findSqlVariables(sql).map(v => v.name), ['id', 'note', 'day'])
 })
 
+test('findSqlVariables detects variables adjacent to operators and function punctuation', () => {
+  const sql = `
+    select count(1)
+    from xmg_dynamic_sn_order b
+    where b.order_callback_time>=:monthdate
+      and b.order_callback_time<adddate(:monthdate,interval 1 month)
+  `
+  assert.deepEqual(findSqlVariables(sql).map(v => v.name), ['monthdate', 'monthdate'])
+})
+
 test('findSqlVariables skips quoted identifiers and dialect-specific quoted strings', () => {
   const sql = `
     select [schema:name], \`col:name\`, "alias:name", 'http://host/:path'
@@ -39,5 +49,14 @@ test('applySqlVariables treats null text as SQL NULL', () => {
   assert.equal(
     applySqlVariables(sql, vars, { deletedAt: 'null' }),
     `select * from users where deleted_at is NULL`,
+  )
+})
+
+test('applySqlVariables can replace raw SQL expressions', () => {
+  const sql = `select * from orders where id = :id and created_at >= :fromDate`
+  const vars = findSqlVariables(sql)
+  assert.equal(
+    applySqlVariables(sql, vars, { id: '42', fromDate: "DATE '2026-06-01'" }, { id: 'raw', fromDate: 'raw' }),
+    `select * from orders where id = 42 and created_at >= DATE '2026-06-01'`,
   )
 })
