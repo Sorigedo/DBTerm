@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { FileCode2, X, Copy, Loader2, TableProperties } from 'lucide-react'
 import type { ConnType } from '../../types'
@@ -21,6 +21,8 @@ interface QueryResult {
 }
 
 const RECENT_LIMIT = 50
+const DEFAULT_COL_WIDTH = 180
+type PeekActiveRegion = 'ddl' | 'data' | null
 
 // 标识符引用：按方言选择引用符
 function quoteIdent(connType: ConnType, ident: string): string {
@@ -40,12 +42,67 @@ export default function TablePeekModal({ connectionId, connType, schema, table, 
   const [dataLoading, setDataLoading] = useState(false)
   const [dataError, setDataError] = useState('')
   const [dataLoaded, setDataLoaded] = useState(false)
+  const [colOrder, setColOrder] = useState<number[]>([])
+  const [colWidths, setColWidths] = useState<Map<number, number>>(new Map())
+  const [draggingCol, setDraggingCol] = useState<number | null>(null)
+  const [dragOverCol, setDragOverCol] = useState<number | null>(null)
+  const [colDragPreview, setColDragPreview] = useState<{ title: string; x: number; y: number } | null>(null)
+  const [activeRegion, setActiveRegion] = useState<PeekActiveRegion>(null)
+  const colElemRefs = useRef<Map<number, HTMLTableColElement>>(new Map())
+  const ddlWrapRef = useRef<HTMLDivElement>(null)
+  const dataWrapRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    setColOrder(dataResult ? dataResult.columns.map((_, i) => i) : [])
+    setColWidths(new Map())
+    setDraggingCol(null)
+    setDragOverCol(null)
+    setColDragPreview(null)
+  }, [dataResult?.columns])
+
+  const selectElementContents = useCallback((el: HTMLElement | null) => {
+    if (!el) return
+    const range = document.createRange()
+    range.selectNodeContents(el)
+    const sel = window.getSelection()
+    sel?.removeAllRanges()
+    sel?.addRange(range)
+  }, [])
+
+  const buildRecentDataTsv = useCallback(() => {
+    if (!dataResult || dataResult.columns.length === 0) return ''
+    const cols = colOrder.map(ci => dataResult.columns[ci] ?? '')
+    const rows = dataResult.rows.map(row => colOrder.map(ci => row[ci] ?? '').join('\t'))
+    return [cols.join('\t'), ...rows].join('\n')
+  }, [dataResult, colOrder])
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onClose()
+        return
+      }
+      if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey) return
+      const key = e.key.toLowerCase()
+      if (key !== 'a' && key !== 'c') return
+      if (activeRegion === 'ddl' && ddl) {
+        e.preventDefault()
+        if (key === 'a') selectElementContents(ddlWrapRef.current)
+        else navigator.clipboard.writeText(ddl).catch(() => {})
+        return
+      }
+      if (activeRegion === 'data' && dataResult) {
+        e.preventDefault()
+        if (key === 'a') selectElementContents(dataWrapRef.current)
+        else navigator.clipboard.writeText(buildRecentDataTsv()).catch(() => {})
+      }
+    }
     document.addEventListener('keydown', onKey)
-    return () => document.removeEventListener('keydown', onKey)
-  }, [onClose])
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      document.body.classList.remove('column-dragging')
+    }
+  }, [activeRegion, buildRecentDataTsv, dataResult, ddl, onClose, selectElementContents])
 
   // 挂载即加载 DDL
   useEffect(() => {
@@ -91,6 +148,91 @@ export default function TablePeekModal({ connectionId, connType, schema, table, 
     }
   }, [connectionId, connType, schema, table])
 
+  const moveCol = useCallback((from: number, to: number) => {
+    setColOrder(order => {
+      const fromPos = order.indexOf(from)
+      const toPos = order.indexOf(to)
+      if (fromPos < 0 || toPos < 0 || fromPos === toPos) return order
+      const next = [...order]
+      const [moved] = next.splice(fromPos, 1)
+      next.splice(toPos, 0, moved)
+      return next
+    })
+  }, [])
+
+  const startColResize = useCallback((e: React.MouseEvent, ci: number, orderIdx: number) => {
+    e.stopPropagation()
+    e.preventDefault()
+    const colEl = colElemRefs.current.get(orderIdx)
+    const th = (e.currentTarget as HTMLElement).closest('th') as HTMLElement | null
+    if (!th) return
+    const startX = e.clientX
+    const startW = th.getBoundingClientRect().width || colWidths.get(ci) || DEFAULT_COL_WIDTH
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+    const onMove = (ev: MouseEvent) => {
+      const w = Math.max(72, Math.min(520, startW + ev.clientX - startX))
+      if (colEl) {
+        colEl.style.width = `${w}px`
+        colEl.style.minWidth = `${w}px`
+      }
+    }
+    const onUp = (ev: MouseEvent) => {
+      const w = Math.max(72, Math.min(520, startW + ev.clientX - startX))
+      if (colEl) {
+        colEl.style.width = ''
+        colEl.style.minWidth = ''
+      }
+      setColWidths(prev => new Map(prev).set(ci, w))
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }, [colWidths])
+
+  const startColDrag = useCallback((e: React.MouseEvent, ci: number) => {
+    if (e.button !== 0) return
+    e.preventDefault()
+    window.getSelection()?.removeAllRanges()
+    const startX = e.clientX
+    let active = false
+    let over: number | null = null
+    let bodyMarked = false
+    const onMove = (ev: MouseEvent) => {
+      if (!active && Math.abs(ev.clientX - startX) < 5) return
+      if (!active) {
+        active = true
+        bodyMarked = true
+        document.body.classList.add('column-dragging')
+        setDraggingCol(ci)
+      }
+      setColDragPreview({ title: dataResult?.columns[ci] ?? '', x: ev.clientX, y: ev.clientY })
+      const el = document.elementFromPoint(ev.clientX, ev.clientY)
+      const th = el?.closest('[data-peek-colidx]') as HTMLElement | null
+      const idx = th ? parseInt(th.dataset.peekColidx ?? '', 10) : NaN
+      const next = Number.isNaN(idx) ? null : idx
+      if (next !== over) {
+        over = next
+        setDragOverCol(next)
+      }
+    }
+    const onUp = () => {
+      if (active && over != null && over !== ci) moveCol(ci, over)
+      setDraggingCol(null)
+      setDragOverCol(null)
+      setColDragPreview(null)
+      if (bodyMarked) document.body.classList.remove('column-dragging')
+      window.getSelection()?.removeAllRanges()
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }, [dataResult, moveCol])
+
   return createPortal(
     <div className="modal-overlay" onMouseDown={onClose}>
       <div className="modal-box table-peek" onMouseDown={e => e.stopPropagation()}>
@@ -121,11 +263,13 @@ export default function TablePeekModal({ connectionId, connType, schema, table, 
             </div>
           )}
           {ddlError && <div className="result-error" style={{ margin: '4px 0' }}>{ddlError}</div>}
-          {!ddlLoading && !ddlError && (
-            ddl
-              ? <SqlCodeView code={ddl} connType={connType} className="table-peek__ddl-cm" />
-              : <pre className="table-peek__ddl">（无 DDL）</pre>
-          )}
+          <div ref={ddlWrapRef} onMouseDown={() => setActiveRegion('ddl')}>
+            {!ddlLoading && !ddlError && (
+              ddl
+                ? <SqlCodeView code={ddl} connType={connType} className="table-peek__ddl-cm" wrap />
+                : <pre className="table-peek__ddl">（无 DDL）</pre>
+            )}
+          </div>
 
           {/* 近期数据区 */}
           <div className="table-peek__section-head" style={{ marginTop: 14 }}>
@@ -141,21 +285,55 @@ export default function TablePeekModal({ connectionId, connType, schema, table, 
             dataResult.columns.length === 0 || dataResult.rows.length === 0 ? (
               <div className="result-placeholder" style={{ padding: 20 }}><span>暂无数据</span></div>
             ) : (
-              <div className="table-peek__data">
+              <div className="table-peek__data" ref={dataWrapRef} onMouseDown={() => setActiveRegion('data')}>
                 <table className="table-peek__table">
+                  <colgroup>
+                    {colOrder.map((ci, orderIdx) => {
+                      const w = colWidths.get(ci) ?? DEFAULT_COL_WIDTH
+                      return (
+                        <col
+                          key={`${dataResult.columns[ci]}-${ci}`}
+                          ref={el => { if (el) colElemRefs.current.set(orderIdx, el); else colElemRefs.current.delete(orderIdx) }}
+                          style={{ width: w, minWidth: w }}
+                        />
+                      )
+                    })}
+                  </colgroup>
                   <thead>
-                    <tr>{dataResult.columns.map((c, i) => <th key={i}>{c}</th>)}</tr>
+                    <tr>
+                      {colOrder.map((ci, orderIdx) => {
+                        const col = dataResult.columns[ci]
+                        const w = colWidths.get(ci) ?? DEFAULT_COL_WIDTH
+                        return (
+                          <th
+                            key={ci}
+                            title={col}
+                            data-peek-colidx={ci}
+                            className={`${draggingCol === ci ? ' col-dragging' : ''}${dragOverCol === ci && draggingCol !== ci ? ' col-drag-over' : ''}`}
+                            style={{ width: w, minWidth: w }}
+                            onMouseDown={(e) => startColDrag(e, ci)}
+                          >
+                            <span>{col}</span>
+                            <div className="table-peek__th-resizer" onMouseDown={(e) => startColResize(e, ci, orderIdx)} />
+                          </th>
+                        )
+                      })}
+                    </tr>
                   </thead>
                   <tbody>
                     {dataResult.rows.map((row, ri) => (
                       <tr key={ri}>
-                        {row.map((cell, ci) => (
-                          <td key={ci}>
+                        {colOrder.map((ci) => {
+                          const cell = row[ci] ?? null
+                          const w = colWidths.get(ci) ?? DEFAULT_COL_WIDTH
+                          return (
+                          <td key={ci} title={cell ?? 'NULL'} style={{ width: w, maxWidth: w }}>
                             {cell === null
                               ? <span className="table-peek__null">NULL</span>
                               : cell}
                           </td>
-                        ))}
+                          )
+                        })}
                       </tr>
                     ))}
                   </tbody>
@@ -164,6 +342,15 @@ export default function TablePeekModal({ connectionId, connType, schema, table, 
             )
           )}
         </div>
+        {colDragPreview && (
+          <div
+            className="column-drag-preview"
+            style={{ transform: `translate3d(${colDragPreview.x + 12}px, ${colDragPreview.y + 12}px, 0)` }}
+          >
+            <span className="column-drag-preview__icon">›_</span>
+            <span className="column-drag-preview__label">{colDragPreview.title}</span>
+          </div>
+        )}
       </div>
     </div>,
     document.body

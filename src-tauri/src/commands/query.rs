@@ -488,9 +488,11 @@ pub async fn execute_query(
         if !db.is_empty() { config.database = Some(db.to_string()); }
     }
 
-    // SqlServer 用 TOP N 语法，暂不自动注入行数限制
     if config.conn_type == ConnType::SqlServer {
-        return dispatch_ss_query(&id, &config, &sql, &ss_pool).await;
+        let (ss_sql, limit_applied) = apply_sqlserver_row_limit(&sql, row_limit);
+        let mut r = dispatch_ss_query(&id, &config, &ss_sql, &ss_pool).await?;
+        r.truncated = limit_applied;
+        return Ok(r);
     }
     // Oracle 不支持 LIMIT，用 FETCH FIRST n ROWS ONLY；已含 FETCH/ROWNUM 子句时不再追加
     if config.conn_type == ConnType::Oracle {
@@ -1340,6 +1342,45 @@ fn has_limit_clause(sql: &str) -> bool {
         i += 1;
     }
     false
+}
+
+fn has_sqlserver_row_limit(sql: &str) -> bool {
+    let upper = strip_leading_comments(sql).to_uppercase();
+    upper.starts_with("SELECT TOP ")
+        || upper.starts_with("SELECT DISTINCT TOP ")
+        || upper.contains(" FETCH NEXT ")
+        || upper.contains(" FETCH FIRST ")
+        || upper.contains(" OFFSET ")
+}
+
+fn apply_sqlserver_row_limit(sql: &str, row_limit: Option<u64>) -> (String, bool) {
+    let Some(lim) = row_limit else { return (sql.to_string(), false) };
+    if lim == 0 || !is_query_stmt(sql) || has_sqlserver_row_limit(sql) {
+        return (sql.to_string(), false);
+    }
+
+    let base = sql.trim_end().trim_end_matches(';').trim_end();
+    let rest = strip_leading_comments(base);
+    let prefix_len = base.len().saturating_sub(rest.len());
+    let upper = rest.to_uppercase();
+    let insert_at = if upper.starts_with("SELECT DISTINCT ") {
+        Some("SELECT DISTINCT".len())
+    } else if upper.starts_with("SELECT ") {
+        Some("SELECT".len())
+    } else {
+        None
+    };
+
+    if let Some(pos) = insert_at {
+        let abs = prefix_len + pos;
+        let mut out = String::with_capacity(base.len() + 16);
+        out.push_str(&base[..abs]);
+        out.push_str(&format!(" TOP {lim}"));
+        out.push_str(&base[abs..]);
+        (out, true)
+    } else {
+        (sql.to_string(), false)
+    }
 }
 
 pub(crate) fn is_query_stmt(sql: &str) -> bool {

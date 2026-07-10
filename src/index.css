@@ -1062,6 +1062,45 @@ body.tab-dragging * {
   user-select: none !important;
   -webkit-user-select: none !important;
 }
+body.column-dragging,
+body.column-dragging * {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+  cursor: grabbing !important;
+}
+.column-drag-preview {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 10001;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 280px;
+  height: 34px;
+  padding: 0 13px;
+  border: 1px solid color-mix(in srgb, var(--accent) 62%, var(--border));
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--surface) 90%, var(--accent));
+  color: var(--text-bright);
+  box-shadow: 0 12px 32px rgba(0,0,0,0.28), 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+  pointer-events: none;
+  opacity: 0.98;
+}
+.column-drag-preview__icon {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+.column-drag-preview__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+}
 body.tab-dragging .tab.active:hover {
   background: var(--surface);
   color: var(--text-bright);
@@ -3394,8 +3433,14 @@ body.tab-dragging .tab.active:hover {
 .ddl-modal__copy-btn:hover { background: var(--surface-hover); }
 
 /* 表预览弹窗：DDL + 近期数据 */
-.table-peek { width: 760px; max-width: 92vw; max-height: 82vh; display: flex; flex-direction: column; }
-.table-peek__body { flex: 1; overflow: auto; padding: 12px 16px; min-height: 0; }
+.table-peek {
+  width: min(1120px, calc(100vw - 144px));
+  max-width: 96vw;
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+}
+.table-peek__body { flex: 1; overflow: auto; padding: 18px 24px 20px; min-height: 0; }
 .table-peek__section-head {
   display: flex; align-items: center; justify-content: space-between;
   font-size: 12px; font-weight: 600; color: var(--text-muted);
@@ -3420,17 +3465,63 @@ body.tab-dragging .tab.active:hover {
   border: 1px solid var(--border-subtle);
   border-radius: 8px; padding: 10px 12px;
 }
-.table-peek__data { overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
-.table-peek__table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.table-peek__data {
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  max-height: 360px;
+}
+.table-peek__table {
+  border-collapse: separate;
+  border-spacing: 0;
+  table-layout: fixed;
+  width: max-content;
+  min-width: 100%;
+  font-size: 12px;
+}
+.table-peek__table col { width: 180px; min-width: 180px; }
 .table-peek__table th, .table-peek__table td {
   border-bottom: 1px solid var(--border-subtle);
   border-right: 1px solid var(--border-subtle);
-  padding: 5px 10px; text-align: left; white-space: nowrap;
+  width: 180px;
+  max-width: 180px;
+  padding: 5px 10px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .table-peek__table th {
   position: sticky; top: 0;
   background: var(--surface-2); color: var(--text-bright);
   font-weight: 600; font-family: var(--font-mono);
+  z-index: 2;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.table-peek__table th span {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.table-peek__table th.col-dragging { opacity: 0.45; cursor: grabbing; }
+.table-peek__table th.col-drag-over { border-left: 2px solid var(--accent); }
+body.column-dragging .table-peek__table th:hover { background: var(--surface-2); }
+.table-peek__th-resizer {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 3;
+  background: transparent;
+}
+.table-peek__th-resizer:hover {
+  background: var(--accent);
+  opacity: 0.45;
 }
 .table-peek__table td { color: var(--text); font-family: var(--font-mono); }
 .table-peek__null { color: var(--text-muted); font-style: italic; }
@@ -3463,6 +3554,13 @@ body.tab-dragging .tab.active:hover {
   font-style: normal;
 }
 .is-mac .cm-table-link::after { content: '⌘ + Click 预览'; }
+.cm-sql-cjk-punct {
+  background: rgba(220, 38, 38, 0.26);
+  color: var(--text-bright);
+  border: 1px solid #dc2626;
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px rgba(220, 38, 38, 0.18);
+}
 
 /* ── CodeMirror 自动补全浮窗：统一为应用下拉浮窗样式 ───────────────── */
 .cm-tooltip.cm-tooltip-autocomplete {
@@ -4524,6 +4622,16 @@ body.tab-dragging .tab.active:hover {
   color: var(--text);
   white-space: pre;
 }
+.result-preview-limit {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 11px;
+}
 /* 结果数据区允许选中文本（覆盖全局 user-select:none）；行号栏/表头保持不可选以便拖选行 */
 .result-json-view, .result-json-view pre,
 .result-form-body, .result-form-val, .result-form-key,
@@ -4575,6 +4683,7 @@ body.tab-dragging .tab.active:hover {
 .result-form-val .result-cell-input { width: 100%; box-sizing: border-box; font-family: var(--font-mono); font-size: 12px; border: 1px solid var(--accent); border-radius: 4px; padding: 2px 6px; background: var(--surface); color: var(--text); }
 .result-table {
   border-collapse: collapse;
+  table-layout: fixed;
   font-size: 12px;
   white-space: nowrap;
   width: max-content;
@@ -4599,6 +4708,7 @@ body.tab-dragging .tab.active:hover {
 /* 列拖拽视觉反馈 */
 .result-th.col-dragging { opacity: 0.45; }
 .result-th.col-drag-over { border-left: 2px solid var(--accent); }
+body.column-dragging .result-th:hover { background: var(--surface); }
 /* 列宽拖拽手柄 */
 .result-th-resizer {
   position: absolute; right: 0; top: 0; bottom: 0; width: 5px;
@@ -4617,6 +4727,10 @@ body.tab-dragging .tab.active:hover {
 }
 .result-tr:nth-child(even) { background: transparent; }
 .result-tr:hover { background: var(--surface-hover); }
+.result-virtual-spacer td {
+  padding: 0;
+  border: 0;
+}
 .result-td {
   padding: 4px 10px;
   border-bottom: 1px solid var(--border-subtle);
@@ -7556,7 +7670,7 @@ body.resizing {
 .sb-detail__ddl-cm .cm-scroller { font-size: 11.5px; padding: 4px 10px; }
 /* 弹窗：随内容自适应高度（不强制 100%，否则会塌陷） */
 .table-peek__ddl-cm { border: 1px solid var(--border-subtle); border-radius: 8px; overflow: hidden; }
-.table-peek__ddl-cm .cm-scroller { font-size: 12.5px; padding: 6px 10px; }
+.table-peek__ddl-cm .cm-scroller { font-size: 12.5px; padding: 8px 14px; }
 .ddl-modal__code-cm .cm-scroller { font-size: 12.5px; padding: 6px 12px; }
 .sb-detail__table-wrap { overflow: auto; }
 .sb-detail__tbl {

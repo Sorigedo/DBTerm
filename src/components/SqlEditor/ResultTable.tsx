@@ -39,6 +39,11 @@ const LIMIT_OPTIONS: Array<{ label: string; value: number | null }> = [
   { label: '全部', value: null },
 ]
 
+const GRID_ROW_HEIGHT = 28
+const GRID_OVERSCAN = 12
+const GRID_DEFAULT_COL_WIDTH = 180
+const TEXT_PREVIEW_ROW_LIMIT = 2000
+
 function RowLimitSelector({ limit, onChange }: { limit: number | null; onChange: (v: number | null) => void }) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
@@ -243,6 +248,28 @@ export default function ResultTable({
   // 滚轮驱动横向滚动条：统一规则（见 utils/wheelScroll）
   const tableScrollRef = useRef<HTMLDivElement>(null)
   useWheelScroll(tableScrollRef)
+  const [gridScrollTop, setGridScrollTop] = useState(0)
+  const [gridViewportH, setGridViewportH] = useState(360)
+  const gridScrollRaf = useRef(0)
+  const syncGridViewport = useCallback(() => {
+    const el = tableScrollRef.current
+    if (!el) return
+    setGridViewportH(el.clientHeight || 360)
+    setGridScrollTop(el.scrollTop)
+  }, [])
+  useEffect(() => {
+    const el = tableScrollRef.current
+    if (!el || viewMode !== 'grid') return
+    syncGridViewport()
+    const ro = new ResizeObserver(syncGridViewport)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [viewMode, syncGridViewport])
+  useEffect(() => () => cancelAnimationFrame(gridScrollRaf.current), [])
+  const onGridScroll = useCallback(() => {
+    cancelAnimationFrame(gridScrollRaf.current)
+    gridScrollRaf.current = requestAnimationFrame(syncGridViewport)
+  }, [syncGridViewport])
   const startColResize = (e: React.MouseEvent, ci: number, orderIdx: number) => {
     e.stopPropagation()
     e.preventDefault()
@@ -270,6 +297,7 @@ export default function ResultTable({
   }
   const [draggingCol, setDraggingCol] = useState<number | null>(null)
   const [dragOverCol, setDragOverCol]  = useState<number | null>(null)
+  const [colDragPreview, setColDragPreview] = useState<{ title: string; x: number; y: number } | null>(null)
   const moveCol = (from: number, to: number) => setColOrder(o => {
     const fp = o.indexOf(from), tp = o.indexOf(to)
     if (fp < 0 || tp < 0 || fp === tp) return o
@@ -278,12 +306,21 @@ export default function ResultTable({
   // WKWebView 不可靠支持 HTML5 DnD API in table-th；改用 mouse 事件 + elementFromPoint
   const startColDrag = (e: React.MouseEvent, ci: number) => {
     if (e.button !== 0) return
+    e.preventDefault()
+    window.getSelection()?.removeAllRanges()
     const startX = e.clientX
     let active = false
     let over: number | null = null
+    let bodyMarked = false
     const onMove = (me: MouseEvent) => {
       if (!active && Math.abs(me.clientX - startX) < 5) return
-      if (!active) { active = true; setDraggingCol(ci) }
+      if (!active) {
+        active = true
+        bodyMarked = true
+        document.body.classList.add('column-dragging')
+        setDraggingCol(ci)
+      }
+      setColDragPreview({ title: result?.columns[ci] ?? '', x: me.clientX, y: me.clientY })
       const el = document.elementFromPoint(me.clientX, me.clientY)
       const th = el?.closest('[data-colidx]') as HTMLElement | null
       const idx = th ? parseInt(th.dataset.colidx ?? '') : NaN
@@ -293,6 +330,9 @@ export default function ResultTable({
     const onUp = () => {
       if (active && over != null && over !== ci) moveCol(ci, over)
       setDraggingCol(null); setDragOverCol(null)
+      setColDragPreview(null)
+      if (bodyMarked) document.body.classList.remove('column-dragging')
+      window.getSelection()?.removeAllRanges()
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
     }
@@ -318,7 +358,11 @@ export default function ResultTable({
   useEffect(() => {
     const up = () => { rowDragRef.current = null; cellDragRef.current = false }
     window.addEventListener('mouseup', up)
-    return () => window.removeEventListener('mouseup', up)
+    return () => {
+      window.removeEventListener('mouseup', up)
+      document.body.classList.remove('column-dragging')
+      setColDragPreview(null)
+    }
   }, [])
   useEffect(() => {
     if (!rowMenu) return
@@ -345,9 +389,10 @@ export default function ResultTable({
     e.preventDefault()
     // preventDefault 会保留 SQL 编辑器焦点，导致 Mod+C 被输入框保护逻辑跳过。
     blurEditorOrInput()
+    window.getSelection()?.removeAllRanges()
     cellDragRef.current = true
     setCellSel({ a: { r, v }, f: { r, v } })
-    setFocusedCell(null)
+    setFocusedCell({ absRow: r, col: colOrderRef.current[v] ?? v })
     if (selectedRows.size) setSelectedRows(new Set())   // 选单元格清整行选择（互斥）
   }
   function onCellMouseEnter(r: number, v: number) {
@@ -359,6 +404,7 @@ export default function ResultTable({
     e.preventDefault()
     // preventDefault 会保留原焦点（常为编辑器）→ 让结果区快捷键(复制/Space 等)失效；主动失焦
     blurEditorOrInput()
+    window.getSelection()?.removeAllRanges()
     setFocusedCell(null)   // 选行与选单元格互斥
     setCellSel(null)
     if (e.shiftKey && lastClickedRow.current !== null) {
@@ -440,6 +486,8 @@ export default function ResultTable({
     setSortCol(-1)
     setShowFilter(dbResultFilterDefaultOpen)
     setViewMode(dbResultDefaultView)
+    setGridScrollTop(0)
+    tableScrollRef.current?.scrollTo({ top: 0 })
     lastClickedRow.current = null
   }, [result?.columns, dbResultDefaultView, dbResultFilterDefaultOpen])
 
@@ -719,8 +767,6 @@ export default function ResultTable({
   useEffect(() => {
     const onCopy = (e: ClipboardEvent) => {
       if (isInEditorOrInput()) return
-      // 表格外（DDL / 属性面板等）有真实文本选区 → 交还浏览器原生复制
-      if (textSelectionOutsideGrid()) return
       // 显式选中行优先于浏览器自带文本选区（拖拽选行常残留文本选区，否则会退化成单行原生复制）
       if (selectedRows.size > 0) {
         const t = buildRowsText(viewMode === 'json' ? 'json' : 'tsv')
@@ -731,6 +777,8 @@ export default function ResultTable({
         e.preventDefault(); e.clipboardData?.setData('text/plain', cellSelToTsv(cellSel)); toast.success('已复制选中单元格')
         return
       }
+      // 表格外（DDL / 属性面板等）有真实文本选区 → 交还浏览器原生复制
+      if (textSelectionOutsideGrid()) return
       if (window.getSelection()?.toString()) return
       if (focusedCell && result) {
         e.preventDefault()
@@ -777,14 +825,15 @@ export default function ResultTable({
     // 以免选中文本时也被接管。Mod+Shift+C 仍保留为"显式复制选中行/单元格"。
     tableCopyRow: () => {
       if (copyInputSelection()) return
-      if (copyWindowSelection()) return
       if (isInEditorOrInput()) return
       if (selectedRows.size > 0) { copyRows(viewMode === 'json' ? 'json' : 'tsv'); return }
       if (cellSel) { navigator.clipboard.writeText(cellSelToTsv(cellSel)).then(() => toast.success('已复制选中单元格')).catch(() => {}); return }
       if (focusedCell && result) {
         const row = result.rows[focusedCell.absRow] ?? []
         navigator.clipboard.writeText(row.map(v => v ?? '').join('\t')).then(() => toast.success('已复制整行')).catch(() => {})
+        return
       }
+      if (copyWindowSelection()) return
     },
     tableCopyInsert: () => {
       if (selectedRows.size > 0) { copyRows('sql'); return }
@@ -801,8 +850,23 @@ export default function ResultTable({
   }, active)
 
   const pageRows = filteredRows
-  pageRowsRef.current = pageRows
+  pageRowsRef.current = filteredRows
   colOrderRef.current = colOrder
+  const virtualGrid = useMemo(() => {
+    const rowCount = filteredRows.length
+    if (rowCount === 0) {
+      return { rows: [] as Array<{ row: (string | null)[]; absRow: number }>, start: 0, topPad: 0, bottomPad: 0 }
+    }
+    const visibleCount = Math.ceil(gridViewportH / GRID_ROW_HEIGHT) + GRID_OVERSCAN * 2
+    const start = Math.max(0, Math.floor(gridScrollTop / GRID_ROW_HEIGHT) - GRID_OVERSCAN)
+    const end = Math.min(rowCount, start + visibleCount)
+    return {
+      rows: filteredRows.slice(start, end).map((row, i) => ({ row, absRow: start + i })),
+      start,
+      topPad: start * GRID_ROW_HEIGHT,
+      bottomPad: Math.max(0, (rowCount - end) * GRID_ROW_HEIGHT),
+    }
+  }, [filteredRows, gridScrollTop, gridViewportH])
 
   // Mod+A：全选当前结果区所有单元格（仅激活标签响应；编辑器/输入框内不拦）
   useEffect(() => {
@@ -828,8 +892,6 @@ export default function ResultTable({
     const onKey = (e: KeyboardEvent) => {
       if (!active || !(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'c' || e.shiftKey || e.altKey) return
       if (isInEditorOrInput()) return
-      // 表格外（DDL / 属性面板等）有真实文本选区 → 交还浏览器原生复制，不被残留单元格选区抢走
-      if (textSelectionOutsideGrid()) return
       if (selectedRows.size > 0) {
         const t = buildRowsText(viewMode === 'json' ? 'json' : 'tsv')
         if (t) { e.preventDefault(); navigator.clipboard.writeText(t).then(() => toast.success(`已复制 ${selectedRows.size} 行`)).catch(() => {}) }
@@ -839,6 +901,8 @@ export default function ResultTable({
         e.preventDefault(); navigator.clipboard.writeText(cellSelToTsv(cellSel)).then(() => toast.success('已复制选中单元格')).catch(() => {})
         return
       }
+      // 表格外（DDL / 属性面板等）有真实文本选区 → 交还浏览器原生复制
+      if (textSelectionOutsideGrid()) return
       if (window.getSelection()?.toString()) return
       if (focusedCell && result) {
         e.preventDefault()
@@ -1075,23 +1139,29 @@ export default function ResultTable({
   const hasEditable = !!editCtx
   const selectedCount = selectedRows.size
 
-  // JSON 形态：当前页行转对象数组
-  const jsonText = JSON.stringify(
-    pageRows.map(r => Object.fromEntries(result.columns.map((c, i) => [c, r[i]]))),
-    null, 2,
-  )
-  // 文本形态：等宽对齐表（类 mysql CLI 输出）
-  const textView = (() => {
+  const previewRows = viewMode === 'json' || viewMode === 'text'
+    ? pageRows.slice(0, TEXT_PREVIEW_ROW_LIMIT)
+    : []
+  const previewTruncated = (viewMode === 'json' || viewMode === 'text') && pageRows.length > previewRows.length
+  // JSON / 文本视图只在激活时生成预览，避免表格模式下为大结果集构造巨型字符串。
+  const jsonText = viewMode === 'json'
+    ? JSON.stringify(
+        previewRows.map(r => Object.fromEntries(result.columns.map((c, i) => [c, r[i]]))),
+        null,
+        2,
+      )
+    : ''
+  const textView = viewMode === 'text' ? (() => {
     const cols = result.columns
     const cell = (v: string | null) => (v === null ? 'NULL' : v)
     const widths = cols.map((c, ci) =>
-      Math.max(c.length, 3, ...pageRows.map(r => cell(r[ci]).length)))
+      Math.max(c.length, 3, ...previewRows.map(r => cell(r[ci]).length)))
     const pad = (s: string, w: number) => s + ' '.repeat(Math.max(0, w - s.length))
     const head = cols.map((c, ci) => pad(c, widths[ci])).join('  ')
     const sep = widths.map(w => '-'.repeat(w)).join('  ')
-    const body = pageRows.map(r => cols.map((_, ci) => pad(cell(r[ci]), widths[ci])).join('  ')).join('\n')
+    const body = previewRows.map(r => cols.map((_, ci) => pad(cell(r[ci]), widths[ci])).join('  ')).join('\n')
     return `${head}\n${sep}\n${body}`
-  })()
+  })() : ''
 
   // 行内详情目标行：优先聚焦单元格所在行，否则首个选中行
   const detailRow = focusedCell?.absRow ?? (() => {
@@ -1166,6 +1236,11 @@ export default function ResultTable({
           data-tip="复制">
           <Copy size={12} />复制
         </button>
+        {previewTruncated && (
+          <div className="result-preview-limit">
+            当前预览前 {TEXT_PREVIEW_ROW_LIMIT} 行，共 {pageRows.length} 行；右键可复制全部。
+          </div>
+        )}
         <pre>{viewMode === 'json' ? jsonText : textView}</pre>
       </div>
       ) : viewMode === 'form' ? (
@@ -1205,17 +1280,17 @@ export default function ResultTable({
         </div>
       </div>
       ) : (
-      <div className="result-table-scroll" ref={tableScrollRef}>
+      <div className="result-table-scroll" ref={tableScrollRef} onScroll={onGridScroll}>
         <table className="result-table">
           <colgroup>
             <col style={{ width: 6, minWidth: 6 }} />
             {colOrder.map((ci, orderIdx) => {
-              const w = colWidths.get(ci)
+              const w = colWidths.get(ci) ?? GRID_DEFAULT_COL_WIDTH
               return (
                 <col
                   key={ci}
                   ref={el => { if (el) colElemRefs.current.set(orderIdx, el); else colElemRefs.current.delete(orderIdx) }}
-                  style={w ? { width: w, minWidth: w } : undefined}
+                  style={{ width: w, minWidth: w }}
                 />
               )
             })}
@@ -1225,7 +1300,7 @@ export default function ResultTable({
               <th className="result-th result-th--rownum" />
               {colOrder.map((ci, orderIdx) => {
                 const col = result.columns[ci]
-                const w = colWidths.get(ci)
+                const w = colWidths.get(ci) ?? GRID_DEFAULT_COL_WIDTH
                 return (
                 <th
                   key={ci}
@@ -1233,7 +1308,7 @@ export default function ResultTable({
                   data-colidx={ci}
                   data-tip="点击排序 · 拖拽换列位 · 边缘拉宽"
                   onMouseDown={(e) => startColDrag(e, ci)}
-                  style={{ cursor: draggingCol != null ? 'grabbing' : 'pointer', userSelect: 'none', position: 'relative', ...(w ? { width: w, minWidth: w } : {}) }}
+                  style={{ cursor: draggingCol != null ? 'grabbing' : 'pointer', userSelect: 'none', position: 'relative', width: w, minWidth: w }}
                   onClick={() => {
                     if (sortCol === ci) {
                       if (sortAsc) setSortAsc(false)
@@ -1257,15 +1332,19 @@ export default function ResultTable({
             </tr>
           </thead>
           <tbody>
-            {pageRows.map((row, ri) => {
-              const absRow = ri
+            {virtualGrid.topPad > 0 && (
+              <tr className="result-virtual-spacer" aria-hidden="true">
+                <td colSpan={colOrder.length + 1} style={{ height: virtualGrid.topPad }} />
+              </tr>
+            )}
+            {virtualGrid.rows.map(({ row, absRow }) => {
               const rowKey = String(absRow)
               const isDeleted = deletedAbsRows.has(absRow)
               const isSelected = selectedRows.has(rowKey)
 
               return (
                 <tr
-                  key={ri}
+                  key={absRow}
                   className={`result-tr${isDeleted ? ' result-tr--deleted' : ''}${isSelected ? ' result-tr--selected' : ''}`}
                 >
                   <td
@@ -1283,6 +1362,7 @@ export default function ResultTable({
                     const stagedVal = updateMap.get(`${absRow}-${ci}`)
                     const displayVal = updateMap.has(`${absRow}-${ci}`) ? stagedVal : cell
                     const hasUpdate = updateMap.has(`${absRow}-${ci}`)
+                    const w = colWidths.get(ci) ?? GRID_DEFAULT_COL_WIDTH
                     return (
                       <td
                         key={ci}
@@ -1293,6 +1373,7 @@ export default function ResultTable({
                           hasUpdate ? 'result-td--updated' : '',
                           cellInSel(absRow, vi) ? 'result-td--cellsel' : '',
                         ].filter(Boolean).join(' ')}
+                        style={{ width: w, maxWidth: w }}
                         onMouseDown={(e) => onCellMouseDown(e, absRow, vi)}
                         onMouseEnter={() => onCellMouseEnter(absRow, vi)}
                         onDoubleClick={() => {
@@ -1322,6 +1403,11 @@ export default function ResultTable({
                 </tr>
               )
             })}
+            {virtualGrid.bottomPad > 0 && (
+              <tr className="result-virtual-spacer" aria-hidden="true">
+                <td colSpan={colOrder.length + 1} style={{ height: virtualGrid.bottomPad }} />
+              </tr>
+            )}
 
             {/* 暂存的 insert 行 */}
             {insertRows.map((ins) => {
@@ -1334,12 +1420,14 @@ export default function ResultTable({
                   <td className="result-td result-td--rownum result-td--new" data-tip="未提交的新增行">+</td>
                   {colOrder.map((ci) => {
                     const cell = ins.row[ci]
+                    const w = colWidths.get(ci) ?? GRID_DEFAULT_COL_WIDTH
                     const isEditingInsert =
                       insertEditing?.tempId === ins.tempId && insertEditing.col === ci
                     return (
                       <td
                         key={ci}
                         className={`result-td result-td--editable${cell === null ? ' result-td--null' : ''}`}
+                        style={{ width: w, maxWidth: w }}
                         onDoubleClick={() => {
                           setInsertEditing({ tempId: ins.tempId, col: ci, val: cell ?? '' })
                           setTimeout(() => insertInputRef.current?.select(), 30)
@@ -1566,12 +1654,33 @@ export default function ResultTable({
             复制选中<span className="ctx-item__shortcut">{sc('tableCopyCell')}</span>
           </button>
           <button className="cell-ctx-menu__item" onClick={() => {
-            const all = viewMode === 'json' ? jsonText
-              : viewMode === 'text' ? textView
-              : result.columns.map((c, i) => `${c}: ${filteredRows[formIdx]?.[i] ?? 'NULL'}`).join('\n')
+            const all = viewMode === 'json'
+              ? JSON.stringify(pageRows.map(r => Object.fromEntries(result.columns.map((c, i) => [c, r[i]]))), null, 2)
+              : viewMode === 'text'
+                ? (() => {
+                    const cell = (v: string | null) => (v === null ? 'NULL' : v)
+                    const widths = result.columns.map((c, ci) =>
+                      Math.max(c.length, 3, ...pageRows.map(r => cell(r[ci]).length)))
+                    const pad = (s: string, w: number) => s + ' '.repeat(Math.max(0, w - s.length))
+                    const head = result.columns.map((c, ci) => pad(c, widths[ci])).join('  ')
+                    const sep = widths.map(w => '-'.repeat(w)).join('  ')
+                    const body = pageRows.map(r => result.columns.map((_, ci) => pad(cell(r[ci]), widths[ci])).join('  ')).join('\n')
+                    return `${head}\n${sep}\n${body}`
+                  })()
+                : result.columns.map((c, i) => `${c}: ${filteredRows[formIdx]?.[i] ?? 'NULL'}`).join('\n')
             navigator.clipboard.writeText(all).then(() => toast.success('已复制全部')).catch(() => {})
             setTextMenu(null)
           }}>复制全部</button>
+        </div>,
+        document.body
+      )}
+      {colDragPreview && createPortal(
+        <div
+          className="column-drag-preview"
+          style={{ transform: `translate3d(${colDragPreview.x + 12}px, ${colDragPreview.y + 12}px, 0)` }}
+        >
+          <span className="column-drag-preview__icon">›_</span>
+          <span className="column-drag-preview__label">{colDragPreview.title}</span>
         </div>,
         document.body
       )}

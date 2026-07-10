@@ -43,7 +43,7 @@ const _editorLight = EditorView.theme({
   '.cm-tooltip': { background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: '8px' },
   '.cm-tooltip-autocomplete ul li[aria-selected]': { background: 'var(--surface-hover)' },
 }, { dark: false })
-import { Prec, StateField, StateEffect } from '@codemirror/state'
+import { Prec, StateField, StateEffect, type Range } from '@codemirror/state'
 import { deleteLine, copyLineUp, copyLineDown, toggleLineComment } from '@codemirror/commands'
 import { snippet, nextSnippetField, prevSnippetField, clearSnippet, type CompletionContext, type CompletionResult, type CompletionSource } from '@codemirror/autocomplete'
 import { sqlHighlight } from '../../utils/sqlHighlight'
@@ -164,6 +164,107 @@ function clearTableHover(view: EditorView) {
     view.dispatch({ effects: setTableHover.of(null) })
   }
 }
+
+const cjkPunctMark = Decoration.mark({
+  class: 'cm-sql-cjk-punct',
+  attributes: { title: '疑似中文/全角标点，请替换为英文 SQL 符号' },
+})
+
+function isSqlCjkPunctuation(ch: string): boolean {
+  const cp = ch.codePointAt(0) ?? 0
+  return (cp >= 0x3001 && cp <= 0x303F)
+    || (cp >= 0xFF01 && cp <= 0xFF0F)
+    || (cp >= 0xFF1A && cp <= 0xFF20)
+    || (cp >= 0xFF3B && cp <= 0xFF40)
+    || (cp >= 0xFF5B && cp <= 0xFF65)
+}
+
+function cjkPunctDecorations(doc: string): DecorationSet {
+  const ranges: Range<Decoration>[] = []
+  let quote: "'" | '"' | '`' | '[' | null = null
+  let lineComment = false
+  let blockComment = false
+
+  for (let i = 0; i < doc.length;) {
+    const ch = doc[i]
+    const next = doc[i + 1]
+
+    if (lineComment) {
+      if (ch === '\n') lineComment = false
+      i++
+      continue
+    }
+    if (blockComment) {
+      if (ch === '*' && next === '/') {
+        i += 2
+        blockComment = false
+      } else {
+        i++
+      }
+      continue
+    }
+    if (quote) {
+      if (ch === '\\' && quote !== '[') {
+        i += 2
+        continue
+      }
+      if (quote === '[') {
+        if (ch === ']' && next === ']') {
+          i += 2
+          continue
+        }
+        if (ch === ']') quote = null
+        i++
+        continue
+      }
+      if (ch === quote && next === quote) {
+        i += 2
+        continue
+      }
+      if (ch === quote) quote = null
+      i++
+      continue
+    }
+
+    if (ch === '-' && next === '-') {
+      lineComment = true
+      i += 2
+      continue
+    }
+    if (ch === '#') {
+      lineComment = true
+      i++
+      continue
+    }
+    if (ch === '/' && next === '*') {
+      blockComment = true
+      i += 2
+      continue
+    }
+    if (ch === '\'' || ch === '"' || ch === '`' || ch === '[') {
+      quote = ch
+      i++
+      continue
+    }
+
+    const cp = doc.codePointAt(i)
+    if (cp === undefined) break
+    const char = String.fromCodePoint(cp)
+    const size = char.length
+    if (isSqlCjkPunctuation(char)) ranges.push(cjkPunctMark.range(i, i + size))
+    i += size
+  }
+  return Decoration.set(ranges, true)
+}
+
+const cjkPunctField = StateField.define<DecorationSet>({
+  create(state) { return cjkPunctDecorations(state.doc.toString()) },
+  update(deco, tr) {
+    if (!tr.docChanged) return deco.map(tr.changes)
+    return cjkPunctDecorations(tr.state.doc.toString())
+  },
+  provide: f => EditorView.decorations.from(f),
+})
 
 export interface EditCtx {
   schema: string
@@ -1849,7 +1950,7 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
           <CodeMirror
             value={sqlText}
             height="100%"
-            extensions={[sqlExt, sqlStructureFoldExt, foldExt, sqlKeymap, snippetNavKeymap, modClickExt, tableHoverField, tableHoverExt, sqlHighlight, _editorTooltips, cmSearchPhrases]}
+            extensions={[sqlExt, sqlStructureFoldExt, foldExt, sqlKeymap, snippetNavKeymap, modClickExt, tableHoverField, tableHoverExt, cjkPunctField, sqlHighlight, _editorTooltips, cmSearchPhrases]}
             theme={isDark ? _editorDark : _editorLight}
             onCreateEditor={(view) => { editorViewRef.current = view }}
             onChange={(val) => { setSqlDraft(val); preFormatRef.current = null }}
