@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { createPortal } from 'react-dom'
 import { X, ShieldAlert, Loader2, Download } from 'lucide-react'
 import SearchableSelect from './SearchableSelect'
+import { queueBackgroundExport } from '../../utils/exportTasks'
 
 interface Props {
   connectionId: string
@@ -84,10 +85,18 @@ export default function DuckMaskExportPanel({ connectionId, onClose }: Props) {
         .map(c => ({ column: c.name, rule: rules[c.name] ?? 'none' }))
         .filter(r => r.rule !== 'none')
       const fullTable = (schema.trim() && schema.trim() !== 'main') ? `${schema.trim()}.${table.trim()}` : table.trim()
-      const rows = await invoke<number>('duckdb_export_masked', {
-        id: connectionId, table: fullTable, destPath: dest, format, rules: ruleList,
+      queueBackgroundExport({
+        connectionId,
+        label: `${table.trim()} · DuckDB 脱敏导出`,
+        filePath: dest,
+        run: () => invoke<number>('duckdb_export_masked', {
+          id: connectionId, table: fullTable, destPath: dest, format, rules: ruleList,
+        }),
+        complete: rows => ({ progressRows: rows, message: `导出完成 · ${rows.toLocaleString()} 行` }),
+        successMessage: rows => `DuckDB 脱敏导出完成：${rows.toLocaleString()} 行`,
+        errorPrefix: 'DuckDB 脱敏导出失败',
       })
-      setDone(`已导出 ${rows} 行到 ${dest}`)
+      onClose()
     } catch (e) {
       setError(String(e))
     } finally {

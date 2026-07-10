@@ -2,6 +2,7 @@
 import { useState, useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { X, ShieldCheck, Loader2, Plus, Trash2 } from 'lucide-react'
+import { listenMongoExportProgress, queueBackgroundExport } from '../../utils/exportTasks'
 
 interface Props {
   connectionId: string
@@ -55,13 +56,23 @@ export default function MongoMaskExportPanel({ connectionId, db, coll, onClose }
       })
       if (!path) { setRunning(false); return }
       const { invoke } = await import('@tauri-apps/api/core')
-      const count = await invoke<number>('mongo_export_collection_masked', {
-        id: connectionId, db, coll,
-        filterJson: filterJson.trim(), projectionJson: '', format,
-        outputPath: path,
-        maskingRules: effective.map(r => ({ field: r.field.trim(), rule: r.rule })),
+      queueBackgroundExport({
+        connectionId,
+        label: `${db}.${coll} · 脱敏导出`,
+        filePath: path,
+        prepare: listenMongoExportProgress,
+        run: taskId => invoke<number>('mongo_export_collection_masked', {
+          id: connectionId, db, coll,
+          filterJson: filterJson.trim(), projectionJson: '', format,
+          outputPath: path,
+          maskingRules: effective.map(r => ({ field: r.field.trim(), rule: r.rule })),
+          taskId,
+        }),
+        complete: count => ({ progressRows: count, message: `导出完成 · ${count.toLocaleString()} 个文档` }),
+        successMessage: count => `MongoDB 脱敏导出完成：${count.toLocaleString()} 个文档`,
+        errorPrefix: 'MongoDB 脱敏导出失败',
       })
-      setResult(count)
+      onClose()
     } catch (e) { setError(String(e)) } finally { setRunning(false) }
   }
 

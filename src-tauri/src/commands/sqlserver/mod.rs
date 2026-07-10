@@ -163,7 +163,7 @@ pub fn load_conn(id: &str, storage: &StorageState) -> Result<(ConnConfig, Option
 
 // ── 类型转换：Row → Vec<Option<String>> ─────────────────────────────────────────
 
-fn cell_to_string(row: &tiberius::Row, idx: usize) -> Option<String> {
+pub(crate) fn cell_to_string(row: &tiberius::Row, idx: usize) -> Option<String> {
     use tiberius::ColumnType;
     let col_type = row.columns()[idx].column_type();
     match col_type {

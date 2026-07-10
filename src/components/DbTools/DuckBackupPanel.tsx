@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { Loader2, AlertCircle, CheckCircle2, HardDrive, Upload, Download } from 'lucide-react'
 import { createPortal } from 'react-dom'
+import { queueBackgroundExport } from '../../utils/exportTasks'
 
 interface Props { connectionId: string }
 
@@ -46,13 +47,22 @@ export default function DuckBackupPanel({ connectionId }: Props) {
 
   const doExport = useCallback(async () => {
     setExporting(true); setExportResult(null); setExportError(null)
-    try {
-      const r = await invoke<string>('duckdb_export_database', {
+    queueBackgroundExport({
+      connectionId,
+      label: `DuckDB 整库导出 · ${exportFormat.toUpperCase()}`,
+      filePath: exportDir,
+      run: () => invoke<string>('duckdb_export_database', {
         id: connectionId, outputDir: exportDir, format: exportFormat,
-      })
-      setExportResult(r); setConfirmExport(false)
-    } catch (e) { setExportError(String(e)) }
-    finally { setExporting(false) }
+      }),
+      complete: result => {
+        setExportResult(result)
+        return { message: result }
+      },
+      successMessage: 'DuckDB 整库导出完成',
+      errorPrefix: 'DuckDB 导出失败',
+    })
+    setConfirmExport(false)
+    setExporting(false)
   }, [connectionId, exportDir, exportFormat])
 
   const doImport = useCallback(async () => {
@@ -68,11 +78,19 @@ export default function DuckBackupPanel({ connectionId }: Props) {
 
   const doBackup = useCallback(async () => {
     setBackingUp(true); setBackupResult(null); setBackupError(null)
-    try {
-      const r = await invoke<string>('duckdb_file_backup', { id: connectionId, destPath: backupDest })
-      setBackupResult(r)
-    } catch (e) { setBackupError(String(e)) }
-    finally { setBackingUp(false) }
+    queueBackgroundExport({
+      connectionId,
+      label: 'DuckDB 文件快照',
+      filePath: backupDest,
+      run: () => invoke<string>('duckdb_file_backup', { id: connectionId, destPath: backupDest }),
+      complete: result => {
+        setBackupResult(result)
+        return { message: result }
+      },
+      successMessage: 'DuckDB 文件快照完成',
+      errorPrefix: 'DuckDB 备份失败',
+    })
+    setBackingUp(false)
   }, [connectionId, backupDest])
 
   return (

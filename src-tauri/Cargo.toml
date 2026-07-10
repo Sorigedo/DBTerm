@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.1.19"
+version = "0.1.20"
 description = "DBTerm - SSH 和数据库管理工具"
 authors = ["DBTerm"]
 edition = "2021"
@@ -70,6 +70,7 @@ tokio-util = { version = "0.7", features = ["compat"] }
 notify = "6"   # SQLite 文件外部变更监控（db/-wal mtime → Tauri 事件）
 hex = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+csv = "1"
 sqlparser = { version = "0.53", default-features = false }
 # CH0: ClickHouse 原生 TCP（9000）。启用 compression(LZ4 按块压缩，大结果集更省带宽)，
 # 关闭用不到的 derive/serde 特性（减少依赖）。TLS 暂不启用（明文 TCP）。

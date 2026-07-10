@@ -38,6 +38,8 @@ import { tableRef, supportsShowStatements, supportsMyMaintenance, supportsOptimi
 import { toolsFor } from '../DbTools/dbToolsCatalog'
 import { useDbToolsStore } from '../../stores/dbToolsStore'
 import { clampIntoViewport } from '../../utils/menuClamp'
+import { queueTableExport } from '../../utils/exportTasks'
+import { registerExportCancelHandler, unregisterExportCancelHandler, useExportTaskStore } from '../../stores/exportTaskStore'
 
 interface TableMeta {
   name: string
@@ -543,19 +545,17 @@ export default function SchemaBrowser({ connectionId, connType, schema, category
     const tbl = tableName ?? [...selected][0]
     if (!tbl) return
     setExportMenuOpen(false)
-    const realFmt = structure ? 'sql' : fmt
     const ext = structure ? 'sql' : EXPORT_EXT[fmt]
     try {
       const { save } = await import('@tauri-apps/plugin-dialog')
       const path = await save({ defaultPath: `${tbl}.${ext}`, filters: [{ name: structure ? 'SQL' : EXPORT_LABEL[fmt], extensions: [ext] }] })
       if (!path) return
-      const { invoke } = await import('@tauri-apps/api/core')
-      const n = await invoke<number>('db_export_table', { id: connectionId, schema, table: tbl, format: realFmt, whereClause: null, path, structure: structure ?? null })
-      if (structure === 'only')      toast.exported(path, '已导出表结构')
-      else if (structure === 'with') toast.exported(path, `已导出表结构与 ${n} 行数据`)
-      else                           toast.exported(path, `已导出 ${n} 行到 ${EXPORT_LABEL[fmt]} 文件`)
+      await queueTableExport({
+        connectionId, schema, table: tbl, format: fmt, formatLabel: EXPORT_LABEL[fmt], path, structure,
+      })
+      toast.info('导出已转入后台，可在右下角查看进度')
     } catch (e) {
-      if (String(e)) toast.error(`导出失败：${String(e)}`)
+      if (String(e)) toast.error(`创建导出任务失败：${String(e)}`)
     }
   }
 
@@ -564,23 +564,77 @@ export default function SchemaBrowser({ connectionId, connType, schema, category
     const names = [...selected]
     if (names.length === 0) return
     setExportMenuOpen(false)
+    let createdTaskId: string | null = null
     try {
       const { save } = await import('@tauri-apps/plugin-dialog')
       const path = await save({ defaultPath: `${schema || 'export'}_${names.length}项.sql`, filters: [{ name: 'SQL', extensions: ['sql'] }] })
       if (!path) return
       const { invoke } = await import('@tauri-apps/api/core')
+      const { listen } = await import('@tauri-apps/api/event')
+      const taskId = useExportTaskStore.getState().addTask({
+        connId: connectionId,
+        label: `${schema || '当前库'} · ${names.length} 项`,
+        filePath: path,
+        cancelable: true,
+        message: '正在准备导出…',
+      })
+      createdTaskId = taskId
       const payload: Record<string, unknown> = {
         id: connectionId, schema, tables: [], views: [], funcs: [], procs: [],
-        path, content, taskId: null,
+        path, content, taskId,
       }
       if (category === 'tables')          payload.tables = names
       else if (category === 'views')      payload.views = names
       else if (category === 'functions')  payload.funcs = names
       else if (category === 'procedures') payload.procs = names
-      await invoke('db_logical_backup', payload)
-      toast.exported(path, `已导出选中 ${names.length} 项${content === 'structure' ? '（仅结构）' : content === 'data' ? '（仅数据）' : ''}`)
+      const unlisten = await listen<{
+        currentTable: string
+        totalTables: number
+        doneTables: number
+        currentRows: number
+      }>(`backup_progress_${taskId}`, ev => {
+        const p = ev.payload
+        useExportTaskStore.getState().updateTask(taskId, {
+          progressRows: p.currentRows,
+          progressValue: p.doneTables,
+          progressTotal: p.totalTables || undefined,
+          message: p.currentTable
+            ? `${p.currentTable} · ${p.doneTables} / ${p.totalTables} 表 · 当前表 ${p.currentRows.toLocaleString()} 行`
+            : '正在写入对象定义…',
+        })
+      })
+      registerExportCancelHandler(taskId, async () => {
+        await invoke('db_cancel_export', { taskId }).catch(() => {})
+      })
+      void invoke<{ tablesDone: number; totalRows: number; fileSize: number }>('db_logical_backup', payload).then(res => {
+        const current = useExportTaskStore.getState().tasks.find(task => task.id === taskId)
+        if (current?.status !== 'running') return
+        useExportTaskStore.getState().updateTask(taskId, {
+          status: 'done', progressRows: res.totalRows, fileBytes: res.fileSize,
+          message: `导出完成 · ${names.length} 项 · ${res.totalRows.toLocaleString()} 行`, finishedAt: Date.now(),
+        })
+        toast.success(`已导出选中 ${names.length} 项`)
+      }).catch(e => {
+        const msg = String(e)
+        const cancelled = msg.includes('取消') || useExportTaskStore.getState().tasks.find(task => task.id === taskId)?.status === 'cancelled'
+        useExportTaskStore.getState().updateTask(taskId, {
+          status: cancelled ? 'cancelled' : 'error', message: cancelled ? '已取消' : '导出失败',
+          error: cancelled ? undefined : msg, finishedAt: Date.now(),
+        })
+        if (!cancelled) toast.error(`导出失败：${msg}`)
+      }).finally(() => {
+        unregisterExportCancelHandler(taskId)
+        unlisten()
+      })
+      toast.info('导出已转入后台，可在右下角查看进度')
     } catch (e) {
       const msg = String(e)
+      if (createdTaskId) {
+        useExportTaskStore.getState().updateTask(createdTaskId, {
+          status: 'error', message: '无法创建导出任务', error: msg, finishedAt: Date.now(),
+        })
+        unregisterExportCancelHandler(createdTaskId)
+      }
       if (!msg.includes('已取消')) toast.error(`导出失败：${msg}`)
     }
   }

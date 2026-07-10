@@ -5,9 +5,12 @@ import { useQueryHistoryStore } from '../../stores/queryHistoryStore'
 import { copyText } from '../../utils/clipboard'
 import { addSavedQuery } from '../../utils/savedQueries'
 import { toast } from '../../stores/toastStore'
+import type { ConnType } from '../../types'
+import { affectedRowsDisplay } from './affectedRowsDisplay'
 
 interface Props {
   connectionId: string
+  connType: ConnType
   /** 面板宽度（由外层拖拽控制），覆盖 CSS 默认宽度 */
   width?: number
   onPick: (sql: string) => void
@@ -30,7 +33,7 @@ function fmtMs(ms?: number): string {
 
 type Filter = 'all' | 'ok' | 'fail' | 'pinned'
 
-export default function QueryHistoryPanel({ connectionId, width, onPick, onSaveAsQuery, onClose }: Props) {
+export default function QueryHistoryPanel({ connectionId, connType, width, onPick, onSaveAsQuery, onClose }: Props) {
   const allEntries = useQueryHistoryStore((s) => s.entries)
   const togglePin  = useQueryHistoryStore((s) => s.togglePin)
   const remove     = useQueryHistoryStore((s) => s.remove)
@@ -144,8 +147,11 @@ export default function QueryHistoryPanel({ connectionId, width, onPick, onSaveA
                   </span>
                 )}
                 {e.rowsAffected !== undefined && e.rowsAffected > 0 && (
-                  <span style={{ display: 'flex', alignItems: 'center', gap: 2, color: 'var(--text-muted)', fontSize: 10 }}>
-                    <Rows size={9} />{e.rowsAffected}行
+                  <span
+                    style={{ display: 'flex', alignItems: 'center', gap: 2, color: 'var(--text-muted)', fontSize: 10 }}
+                    title={affectedRowsDisplay(connType, e.sql, e.rowsAffected).detail}
+                  >
+                    <Rows size={9} />{affectedRowsDisplay(connType, e.sql, e.rowsAffected).summary}
                   </span>
                 )}
                 {!e.success && e.error && (

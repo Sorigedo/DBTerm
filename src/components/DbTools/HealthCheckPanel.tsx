@@ -2,6 +2,7 @@
 import { createPortal } from 'react-dom'
 import { X, Stethoscope, CheckCircle, AlertTriangle, XCircle, RefreshCw, Download } from 'lucide-react'
 import { toast } from '../../stores/toastStore'
+import { queueLocalTextExport } from '../../utils/exportTasks'
 
 // Tauri WebView2 不支持浏览器 blob 下载，统一走保存对话框 + 后端写文件
 async function saveTextFile(content: string, defaultName: string, label: string, ext: string) {
@@ -9,9 +10,7 @@ async function saveTextFile(content: string, defaultName: string, label: string,
     const { save } = await import('@tauri-apps/plugin-dialog')
     const path = await save({ defaultPath: defaultName, filters: [{ name: label, extensions: [ext] }] })
     if (!path) return
-    const { invoke } = await import('@tauri-apps/api/core')
-    await invoke('write_local_file', { path, content })
-    toast.exported(path)
+    queueLocalTextExport(path, content, label)
   } catch (e) {
     toast.error(`导出失败：${String(e)}`)
   }

@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { X, HardDrive, AlertCircle, CheckCircle2, Database, FolderOpen } from 'lucide-react'
+import { registerExportCancelHandler, unregisterExportCancelHandler, useExportTaskStore } from '../../stores/exportTaskStore'
+import { toast } from '../../stores/toastStore'
 
 interface Props {
   connectionId: string
@@ -160,7 +162,13 @@ export default function BackupPanel({ connectionId, schema, connType, onClose }:
     // 勾选的类型 → 该类型全量名单
     const pick = (t: ObjType) => selTypes.has(t) ? objects.filter(o => o.type === t).map(o => o.name) : []
 
-    const taskId = `backup_${Date.now()}`
+    const taskId = useExportTaskStore.getState().addTask({
+      connId: connectionId,
+      label: `${schema} · 整库导出`,
+      filePath: outputPath,
+      cancelable: true,
+      message: '正在准备导出…',
+    })
     taskIdRef.current = taskId
 
     setBacking(true)
@@ -173,12 +181,23 @@ export default function BackupPanel({ connectionId, schema, connType, onClose }:
       const { invoke } = await import('@tauri-apps/api/core')
       const { listen } = await import('@tauri-apps/api/event')
 
-      const unlisten = await listen<BackupProgressEvent>('backup_progress', ev => {
-        setProgress(ev.payload)
+      const unlisten = await listen<BackupProgressEvent>(`backup_progress_${taskId}`, ev => {
+        const p = ev.payload
+        useExportTaskStore.getState().updateTask(taskId, {
+          progressRows: p.currentRows,
+          progressValue: p.doneTables,
+          progressTotal: p.totalTables,
+          message: p.currentTable
+            ? `${p.currentTable} · ${p.doneTables} / ${p.totalTables} 表 · 当前表 ${p.currentRows.toLocaleString()} 行`
+            : `已完成 ${p.doneTables} / ${p.totalTables} 表`,
+        })
       })
-      unlistenRef.current = unlisten
+      registerExportCancelHandler(taskId, async () => {
+        await invoke('db_cancel_export', { taskId }).catch(() => {})
+      })
+      onClose()
 
-      const res = await invoke<BackupResult>('db_logical_backup', {
+      void invoke<BackupResult>('db_logical_backup', {
         id: connectionId,
         schema,
         tables: pick('t'),
@@ -189,16 +208,41 @@ export default function BackupPanel({ connectionId, schema, connType, onClose }:
         path: outputPath,
         content,
         taskId,
+      }).then(res => {
+        const current = useExportTaskStore.getState().tasks.find(task => task.id === taskId)
+        if (current?.status !== 'running') return
+        useExportTaskStore.getState().updateTask(taskId, {
+          status: 'done',
+          progressRows: res.totalRows,
+          progressValue: res.tablesDone,
+          progressTotal: res.tablesDone,
+          fileBytes: res.fileSize,
+          message: `导出完成 · ${res.tablesDone} 表 · ${res.totalRows.toLocaleString()} 行`,
+          finishedAt: Date.now(),
+        })
+        toast.success(`整库导出完成：${res.tablesDone} 个表，${res.totalRows.toLocaleString()} 行`)
+      }).catch(e => {
+        const msg = String(e)
+        const cancelled = msg.includes('取消') || useExportTaskStore.getState().tasks.find(task => task.id === taskId)?.status === 'cancelled'
+        useExportTaskStore.getState().updateTask(taskId, {
+          status: cancelled ? 'cancelled' : 'error',
+          message: cancelled ? '已取消，临时文件已清理' : '导出失败',
+          error: cancelled ? undefined : msg,
+          finishedAt: Date.now(),
+        })
+        if (!cancelled) toast.error(`导出失败：${msg}`)
+      }).finally(() => {
+        unregisterExportCancelHandler(taskId)
+        unlisten()
       })
-      setResult(res)
     } catch (e) {
       const msg = String(e)
-      if (!msg.includes('备份已取消')) setError(msg)
-      else setError('备份已取消，临时文件已清理')
-    } finally {
-      if (unlistenRef.current) { unlistenRef.current(); unlistenRef.current = null }
+      useExportTaskStore.getState().updateTask(taskId, {
+        status: 'error', message: '无法创建导出任务', error: msg, finishedAt: Date.now(),
+      })
+      unregisterExportCancelHandler(taskId)
+      setError(msg)
       setBacking(false)
-      setCancelling(false)
     }
   }
 

@@ -621,6 +621,135 @@ impl OciHandles {
         Ok((col_names, rows))
     }
 
+    fn stream_query_rows_impl<F>(&self, sql: &str, buf_size: usize, mut on_item: F) -> Result<u64, String>
+    where
+        F: FnMut(&[String], Option<&[Option<String>]>) -> Result<(), String>,
+    {
+        let sql_bytes = sql.as_bytes();
+        let mut stmthp: OciHp = std::ptr::null_mut();
+
+        let rc = unsafe {
+            (self.oci.stmt_prep2)(self.svchp, &mut stmthp, self.errhp,
+                sql_bytes.as_ptr(), sql_bytes.len() as Ub4,
+                std::ptr::null(), 0, OCI_NTV_SYNTAX, OCI_DEFAULT)
+        };
+        self.oci.ok(rc, self.errhp, "OCIStmtPrepare2")?;
+
+        let exec_rc = unsafe {
+            (self.oci.stmt_exec)(self.svchp, stmthp, self.errhp,
+                0, 0, std::ptr::null_mut(), std::ptr::null_mut(), OCI_DEFAULT)
+        };
+        if let Err(e) = self.oci.ok(exec_rc, self.errhp, "OCIStmtExecute") {
+            unsafe { (self.oci.stmt_rel)(stmthp, self.errhp, std::ptr::null(), 0, OCI_DEFAULT); }
+            return Err(e);
+        }
+
+        let mut col_count: Ub4 = 0;
+        let rc = unsafe {
+            (self.oci.attr_get)(
+                stmthp, OCI_HTYPE_STMT,
+                (&mut col_count as *mut Ub4).cast(),
+                std::ptr::null_mut(), OCI_ATTR_PARAM_COUNT, self.errhp,
+            )
+        };
+        if let Err(e) = self.oci.ok(rc, self.errhp, "OCIAttrGet(param_count)") {
+            unsafe { (self.oci.stmt_rel)(stmthp, self.errhp, std::ptr::null(), 0, OCI_DEFAULT); }
+            return Err(e);
+        }
+        let ncols = col_count as usize;
+        if ncols == 0 {
+            unsafe { (self.oci.stmt_rel)(stmthp, self.errhp, std::ptr::null(), 0, OCI_DEFAULT); }
+            return Ok(0);
+        }
+
+        let mut col_names: Vec<String> = Vec::with_capacity(ncols);
+        let mut buffers: Vec<Vec<u8>> = (0..ncols).map(|_| vec![0u8; buf_size]).collect();
+        let mut indicators: Vec<i16> = vec![0i16; ncols];
+        let mut ret_lens:   Vec<Ub2>  = vec![0u16; ncols];
+        let mut ret_codes:  Vec<Ub2>  = vec![0u16; ncols];
+
+        for i in 0..ncols {
+            let mut col_desc: OciHp = std::ptr::null_mut();
+            let rc = unsafe {
+                (self.oci.param_get)(stmthp, OCI_HTYPE_STMT, self.errhp, &mut col_desc, (i + 1) as Ub4)
+            };
+            if let Err(e) = self.oci.ok(rc, self.errhp, "OCIParamGet") {
+                unsafe { (self.oci.stmt_rel)(stmthp, self.errhp, std::ptr::null(), 0, OCI_DEFAULT); }
+                return Err(e);
+            }
+
+            let mut name_ptr: *mut u8 = std::ptr::null_mut();
+            let mut name_len: Ub4 = 0;
+            unsafe {
+                (self.oci.attr_get)(
+                    col_desc, OCI_DTYPE_PARAM,
+                    (&mut name_ptr as *mut *mut u8).cast(),
+                    &mut name_len, OCI_ATTR_NAME, self.errhp,
+                );
+            }
+            let name = if !name_ptr.is_null() && name_len > 0 {
+                unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(name_ptr, name_len as usize)).to_string() }
+            } else {
+                format!("COL{}", i + 1)
+            };
+            col_names.push(name);
+        }
+        on_item(&col_names, None)?;
+
+        let ind_ptr   = indicators.as_mut_ptr();
+        let rlen_ptr  = ret_lens.as_mut_ptr();
+        let rcode_ptr = ret_codes.as_mut_ptr();
+
+        for i in 0..ncols {
+            let buf_ptr = buffers[i].as_mut_ptr();
+            let mut defhp: OciHp = std::ptr::null_mut();
+            let rc = unsafe {
+                (self.oci.def_by_pos)(
+                    stmthp, &mut defhp, self.errhp,
+                    (i + 1) as Ub4,
+                    buf_ptr.cast(), buf_size as Sb4,
+                    SQLT_CHR,
+                    ind_ptr.add(i),
+                    rlen_ptr.add(i),
+                    rcode_ptr.add(i),
+                    OCI_DEFAULT,
+                )
+            };
+            if let Err(e) = self.oci.ok(rc, self.errhp, "OCIDefineByPos") {
+                unsafe { (self.oci.stmt_rel)(stmthp, self.errhp, std::ptr::null(), 0, OCI_DEFAULT); }
+                return Err(e);
+            }
+        }
+
+        let mut rows = 0u64;
+        loop {
+            let rc = unsafe {
+                (self.oci.fetch2)(stmthp, self.errhp, 1, OCI_FETCH_NEXT, 0, OCI_DEFAULT)
+            };
+            if rc == OCI_NO_DATA { break; }
+            if let Err(e) = self.oci.ok(rc, self.errhp, "OCIStmtFetch2") {
+                unsafe { (self.oci.stmt_rel)(stmthp, self.errhp, std::ptr::null(), 0, OCI_DEFAULT); }
+                return Err(e);
+            }
+            let mut row = Vec::with_capacity(ncols);
+            for i in 0..ncols {
+                let ind = unsafe { *ind_ptr.add(i) };
+                if ind == -1 {
+                    row.push(None);
+                } else {
+                    let len = unsafe { *rlen_ptr.add(i) } as usize;
+                    let s = String::from_utf8_lossy(&buffers[i][..len]).to_string();
+                    row.push(Some(s));
+                }
+            }
+            on_item(&col_names, Some(&row))?;
+            rows += 1;
+        }
+
+        unsafe { (self.oci.stmt_rel)(stmthp, self.errhp, std::ptr::null(), 0, OCI_DEFAULT); }
+        Ok(rows)
+    }
+
     /// 执行 DML（iters=1），提交，返回受影响行数
     fn execute_dml(&self, sql: &str) -> Result<u64, String> {
         self.execute_stmt_internal(sql, true)
@@ -1013,6 +1142,24 @@ pub async fn execute_query_impl(
             })
         }
     }).await.map_err(|e| format!("任务执行失败: {e}"))?
+}
+
+pub async fn stream_query_rows<F>(
+    config: ConnConfig,
+    sql: String,
+    password: Option<String>,
+    registry: &DriverRegistry,
+    on_item: F,
+) -> Result<u64, String>
+where
+    F: FnMut(&[String], Option<&[Option<String>]>) -> Result<(), String>,
+{
+    let oci_path = get_oci_path(registry).await?;
+    let pass = password.unwrap_or_default();
+    tokio::task::block_in_place(move || {
+        let h = connect_with_config(&config, &pass, &oci_path)?;
+        h.stream_query_rows_impl(&sql, QUERY_BUF_SIZE, on_item)
+    })
 }
 
 /// 供 list_routines 路由使用：列出 Oracle schema 下函数/过程

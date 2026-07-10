@@ -859,6 +859,13 @@ pub async fn dispatch_duck_tables(
 }
 
 /// DD1.4 DuckDB 高速 COPY TO（Parquet/CSV）
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuckCopyResult {
+    pub rows: u64,
+    pub file_bytes: u64,
+}
+
 #[tauri::command]
 pub async fn duckdb_copy_to(
     id: String,
@@ -868,7 +875,7 @@ pub async fn duckdb_copy_to(
     storage: State<'_, StorageState>,
     pool: State<'_, DuckPool>,
     registry: State<'_, DriverRegistry>,
-) -> Result<u64, String> {
+) -> Result<DuckCopyResult, String> {
     let fmt_upper = format.to_ascii_uppercase();
     if !matches!(fmt_upper.as_str(), "PARQUET" | "CSV") {
         return Err("format 只允许 parquet 或 csv".to_string());
@@ -879,16 +886,19 @@ pub async fn duckdb_copy_to(
     let conn = get_or_open(&id, &config, &pool, &lib_path).await?;
 
     let path_esc = path.replace('\'', "''");
+    let base_sql = sql.trim().trim_end_matches(';').trim();
     let copy_sql = if fmt_upper == "CSV" {
-        format!("COPY ({}) TO '{}' (FORMAT CSV, HEADER TRUE)", sql.trim(), path_esc)
+        format!("COPY ({base_sql}) TO '{}' (FORMAT CSV, HEADER TRUE)", path_esc)
     } else {
-        format!("COPY ({}) TO '{}' (FORMAT PARQUET)", sql.trim(), path_esc)
+        format!("COPY ({base_sql}) TO '{}' (FORMAT PARQUET)", path_esc)
     };
 
-    tokio::task::spawn_blocking(move || {
+    let rows = tokio::task::spawn_blocking(move || {
         let guard = conn.blocking_lock();
         run_query_sync(&guard, &copy_sql, 0).map(|r| r.rows_affected)
-    }).await.map_err(|e| format!("线程错误: {e}"))?
+    }).await.map_err(|e| format!("线程错误: {e}"))??;
+    let file_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    Ok(DuckCopyResult { rows, file_bytes })
 }
 
 // ── 可选增强 DD8.5: 脱敏导出 ─────────────────────────────────────────────────

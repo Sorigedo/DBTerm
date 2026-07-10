@@ -10,6 +10,7 @@ import {
 import '@xyflow/react/dist/style.css'
 import { Network, X, Maximize2, Minimize2, Image as ImageIcon, KeyRound, Link2, RotateCcw } from 'lucide-react'
 import { toast } from '../../stores/toastStore'
+import { queueBackgroundExport } from '../../utils/exportTasks'
 
 interface ErColumn { name: string; dataType: string; isPk: boolean; isNullable: boolean }
 interface ErTable  { name: string; columns: ErColumn[] }
@@ -274,8 +275,14 @@ export default function ErDiagramPanel({ connId, schema, connName, onClose }: Pr
       if (!path) return
       const bin = atob(url.split(',')[1])
       const bytes = Array.from(bin, ch => ch.charCodeAt(0))
-      await invoke('write_local_bytes', { path, bytes })
-      toast.exported(path)
+      queueBackgroundExport({
+        connectionId: connId,
+        label: `${schema} · ER 图 PNG`,
+        filePath: path,
+        run: () => invoke('write_local_bytes', { path, bytes }),
+        complete: () => ({ fileBytes: bytes.length, message: 'ER 图导出完成' }),
+        successMessage: 'ER 图导出完成',
+      })
     } catch (e) { toast.error(`导出失败：${String(e)}`) }
   }
 

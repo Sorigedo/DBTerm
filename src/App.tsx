@@ -3,7 +3,7 @@ import ActivityBar from './components/ActivityBar'
 import AssetPanel from './components/AssetPanel'
 import Workspace from './components/Workspace'
 import Toaster from './components/Toaster'
-import ExportDoneModal from './components/ExportDoneModal'
+import ExportTaskDock from './components/ExportTaskDock'
 import DbErrorBar from './components/DbErrorBar'
 import GlobalTooltip from './components/GlobalTooltip'
 import ConfirmDialog from './components/ConfirmDialog'
@@ -319,7 +319,7 @@ export default function App() {
         </Suspense>
       )}
       <Toaster />
-      <ExportDoneModal />
+      <ExportTaskDock />
       <ConfirmDialog />
       <QuitGuard />
       <GlobalTooltip />

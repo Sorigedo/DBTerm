@@ -36,10 +36,12 @@ function ProgressBar({ value, total }: { value: number; total?: number }) {
 function TaskCard({ task }: { task: ExportTask }) {
   const { cancelTask, removeTask } = useExportTaskStore()
 
-  const openFile = () => {
+  const openFile = async () => {
     if (task.filePath) {
-      // Show path in alert; actual OS open requires shell plugin
-      alert(`文件路径:\n${task.filePath}`)
+      try {
+        const { invoke } = await import('@tauri-apps/api/core')
+        await invoke('reveal_in_folder', { filePath: task.filePath })
+      } catch { /* ignore */ }
     }
   }
 
@@ -50,7 +52,9 @@ function TaskCard({ task }: { task: ExportTask }) {
     cancelled: <XCircle size={13} color="var(--warning)" />,
   }[task.status]
 
-  const pct = task.totalRows ? Math.min(100, (task.progressRows / task.totalRows) * 100) : null
+  const progressValue = task.progressValue ?? task.progressRows
+  const progressTotal = task.progressTotal ?? task.totalRows
+  const pct = progressTotal ? Math.min(100, (progressValue / progressTotal) * 100) : null
 
   return (
     <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border-subtle)' }}>
@@ -61,14 +65,13 @@ function TaskCard({ task }: { task: ExportTask }) {
             {task.label}
           </div>
           <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
-            {task.progressRows.toLocaleString()} 行
-            {task.totalRows ? ` / ${task.totalRows.toLocaleString()} 行` : ''}
+            {task.message || `${task.progressRows.toLocaleString()} 行${task.totalRows ? ` / ${task.totalRows.toLocaleString()} 行` : ''}`}
             {pct !== null ? ` (${pct.toFixed(0)}%)` : ''}
             {task.speed ? ` · ${fmtSpeed(task.speed)}` : ''}
             {' · '}{fmtDuration(task)}
           </div>
         </div>
-        {task.status === 'running' && (
+        {task.status === 'running' && task.cancelable && (
           <button onClick={() => cancelTask(task.id)} title="取消"
             style={{ padding: '4px 8px', borderRadius: 5, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--warning)', cursor: 'pointer' }}>
             <XCircle size={11} />
@@ -89,7 +92,7 @@ function TaskCard({ task }: { task: ExportTask }) {
       </div>
 
       {task.status === 'running' && (
-        <ProgressBar value={task.progressRows} total={task.totalRows} />
+        <ProgressBar value={progressValue} total={progressTotal} />
       )}
 
       {task.status === 'error' && task.error && (

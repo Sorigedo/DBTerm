@@ -1253,7 +1253,7 @@ fn load_conn(
 
 /// 去掉 SQL 开头的注释（块注释 /* ... */ 与行注释 -- ...）和空白，便于按首关键字判断语句类型。
 /// 关键：前端会注入 `/* dbterm-cancel:token */` 取消标记，若不剥离会导致 SELECT 被误判为写语句。
-fn strip_leading_comments(sql: &str) -> &str {
+pub(crate) fn strip_leading_comments(sql: &str) -> &str {
     let mut s = sql.trim_start();
     loop {
         if let Some(rest) = s.strip_prefix("/*") {
@@ -1510,7 +1510,7 @@ async fn sqlite_open(config: &ConnConfig) -> Result<sqlx::sqlite::SqliteConnecti
 
 /// Commands that MySQL does not support via the prepared-statement protocol.
 /// These must be sent as raw text queries.
-fn needs_text_protocol(sql: &str) -> bool {
+pub(crate) fn needs_text_protocol(sql: &str) -> bool {
     let upper = strip_leading_comments(sql).to_uppercase();
     // 存储程序 DDL（函数/存储过程/触发器/事件，含 BEGIN...END 复合体）在 prepared 协议下报 1295，
     // 必须走文本协议；文本协议对任何 DDL 都安全，故仅按 CREATE/DROP/ALTER 起始 + 对象类型判断。

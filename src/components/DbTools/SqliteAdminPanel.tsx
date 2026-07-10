@@ -10,6 +10,7 @@ import { useCapacityStore } from '../../stores/capacityStore'
 import { useShortcuts } from '../../utils/useShortcuts'
 import { toast } from '../../stores/toastStore'
 import SearchableSelect from './SearchableSelect'
+import { queueBackgroundExport } from '../../utils/exportTasks'
 
 // Tauri WebView2 不支持浏览器 blob 下载，统一走保存对话框 + 后端写文件
 async function saveTextFile(content: string, defaultName: string, label: string, ext: string) {
@@ -17,8 +18,14 @@ async function saveTextFile(content: string, defaultName: string, label: string,
     const { save } = await import('@tauri-apps/plugin-dialog')
     const path = await save({ defaultPath: defaultName, filters: [{ name: label, extensions: [ext] }] })
     if (!path) return
-    await invoke('write_local_file', { path, content })
-    toast.exported(path)
+    queueBackgroundExport({
+      connectionId: 'local-export',
+      label: defaultName,
+      filePath: path,
+      run: () => invoke('write_local_file', { path, content }),
+      complete: () => ({ fileBytes: new Blob([content]).size, message: '导出完成' }),
+      successMessage: `${label}导出完成`,
+    })
   } catch (e) {
     toast.error(`导出失败：${String(e)}`)
   }
@@ -202,12 +209,19 @@ export default function SqliteAdminPanel({ connectionId, onClose }: Props) {
 
   const doBackup = useCallback(async () => {
     setBackupBusy(true); setBackupErr('')
-    try {
-      await invoke<BackupRecord>('sqlite_backup', { id: connectionId, dir: backupDir || null, note: backupNote || null })
-      setBackupNote('')
-      await loadBackupList()
-    } catch (e) { setBackupErr(String(e)) }
-    finally { setBackupBusy(false) }
+    queueBackgroundExport({
+      connectionId,
+      label: 'SQLite 文件备份',
+      run: () => invoke<BackupRecord>('sqlite_backup', { id: connectionId, dir: backupDir || null, note: backupNote || null }),
+      complete: result => {
+        setBackupNote('')
+        void loadBackupList()
+        return { filePath: result.path, fileBytes: result.sizeBytes, message: '备份完成' }
+      },
+      successMessage: 'SQLite 备份完成',
+      errorPrefix: 'SQLite 备份失败',
+    })
+    setBackupBusy(false)
   }, [connectionId, backupDir, backupNote, loadBackupList])
 
   const doRestore = useCallback(async (record: BackupRecord) => {
@@ -222,13 +236,25 @@ export default function SqliteAdminPanel({ connectionId, onClose }: Props) {
   const doDump = useCallback(async () => {
     if (!dumpOutPath.trim()) return
     setBackupBusy(true); setBackupErr(''); setDumpResult(null)
-    try {
-      const r = await invoke<{ path: string; sizeBytes: number; tableCount: number; rowCount: number }>(
+    queueBackgroundExport({
+      connectionId,
+      label: 'SQLite SQL Dump',
+      filePath: dumpOutPath.trim(),
+      run: () => invoke<{ path: string; sizeBytes: number; tableCount: number; rowCount: number }>(
         'sqlite_dump_sql', { id: connectionId, outPath: dumpOutPath.trim(), maskingRules: maskingRules.length > 0 ? maskingRules : null }
-      )
-      setDumpResult(r)
-    } catch (e) { setBackupErr(String(e)) }
-    finally { setBackupBusy(false) }
+      ),
+      complete: result => {
+        setDumpResult(result)
+        return {
+          progressRows: result.rowCount,
+          fileBytes: result.sizeBytes,
+          message: `导出完成 · ${result.tableCount} 表 · ${result.rowCount.toLocaleString()} 行`,
+        }
+      },
+      successMessage: result => `SQLite Dump 完成：${result.rowCount.toLocaleString()} 行`,
+      errorPrefix: 'SQLite Dump 失败',
+    })
+    setBackupBusy(false)
   }, [connectionId, dumpOutPath, maskingRules])
 
   const historyEntries = useQueryHistoryStore(s => s.entries)

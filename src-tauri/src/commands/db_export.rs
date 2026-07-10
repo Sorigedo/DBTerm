@@ -12,13 +12,18 @@ use std::io::{BufWriter, Write};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::time::Instant;
 use futures::TryStreamExt;
+use futures::StreamExt;
 use tauri::{State, Emitter};
 use crate::{models::ConnType, storage::StorageState};
+use crate::commands::sqlserver::SsPool;
+use crate::commands::duckdb::DuckPool;
+use crate::commands::driver::DriverRegistry;
 
 pub type ExportCancelMap = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 
-const PROGRESS_INTERVAL: u64 = 2_000;   // 每 N 行发一次进度事件
+const PROGRESS_INTERVAL: u64 = 10_000;  // 每 N 行发一次进度事件；大导出减少 IPC 干扰
 const CANCEL_CHECK_INTERVAL: u64 = 500; // 每 N 行检查取消标志
+const XLSX_MAX_ROWS: u64 = 1_048_576;
 
 // ── 事件 ──────────────────────────────────────────────────────────────────────
 
@@ -83,14 +88,6 @@ async fn open_conn(id: &str, storage: &State<'_, StorageState>, database: Option
 
 // ── 格式写入 ──────────────────────────────────────────────────────────────────
 
-fn csv_escape(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_string()
-    }
-}
-
 fn sql_escape(s: &str) -> String {
     s.replace('\\', "\\\\")
      .replace('\'', "\\'")
@@ -126,29 +123,42 @@ impl IdentQuote {
 enum RowWriter<'a> {
     Csv { sep: u8 },                     // CSV or TSV
     Jsonl,
+    Json { wrote_any: bool },
+    Md,
     Sql { table: &'a str, quote: IdentQuote },
 }
 
 impl<'a> RowWriter<'a> {
-    fn write_header(&self, w: &mut impl Write, cols: &[String]) -> std::io::Result<()> {
+    fn write_header_to(&mut self, out: &mut String, cols: &[String]) {
         match self {
             Self::Csv { sep } => {
-                let line = cols.iter().map(|c| if *sep == b',' { csv_escape(c) } else { c.replace('\t', " ") })
-                    .collect::<Vec<_>>().join(&(*sep as char).to_string());
-                writeln!(w, "{}", line)
+                push_delimited_line(out, *sep, cols.iter().map(|c| Some(c.as_str())));
             }
-            Self::Sql { .. } | Self::Jsonl => Ok(()),
+            Self::Md => {
+                out.push('|');
+                for col in cols {
+                    out.push(' ');
+                    push_md_cell(out, col);
+                    out.push_str(" |");
+                }
+                out.push('\n');
+                out.push('|');
+                for col in cols {
+                    out.push(' ');
+                    out.push_str(&"-".repeat(col.chars().count().max(3)));
+                    out.push_str(" |");
+                }
+                out.push('\n');
+            }
+            Self::Json { .. } => out.push_str("[\n"),
+            Self::Sql { .. } | Self::Jsonl => {}
         }
     }
 
-    fn write_row(&self, w: &mut impl Write, cols: &[String], vals: &[Option<String>]) -> std::io::Result<()> {
+    fn write_row_to(&mut self, out: &mut String, cols: &[String], vals: &[Option<String>]) {
         match self {
             Self::Csv { sep } => {
-                let line = vals.iter().map(|v| match v {
-                    None    => String::new(),
-                    Some(s) => if *sep == b',' { csv_escape(s) } else { s.replace('\t', " ").replace('\n', " ") },
-                }).collect::<Vec<_>>().join(&(*sep as char).to_string());
-                writeln!(w, "{}", line)
+                push_delimited_line(out, *sep, vals.iter().map(|v| v.as_deref()));
             }
             Self::Jsonl => {
                 let mut obj = serde_json::Map::new();
@@ -160,19 +170,242 @@ impl<'a> RowWriter<'a> {
                 }
                 let mut line = serde_json::to_string(&obj).unwrap_or_default();
                 line.push('\n');
-                w.write_all(line.as_bytes())
+                out.push_str(&line);
+            }
+            Self::Json { wrote_any } => {
+                if *wrote_any {
+                    out.push_str(",\n");
+                }
+                let mut obj = serde_json::Map::new();
+                for (c, v) in cols.iter().zip(vals.iter()) {
+                    obj.insert(c.clone(), match v {
+                        None    => serde_json::Value::Null,
+                        Some(s) => serde_json::Value::String(s.clone()),
+                    });
+                }
+                out.push_str(&serde_json::to_string(&obj).unwrap_or_default());
+                *wrote_any = true;
+            }
+            Self::Md => {
+                out.push('|');
+                for val in vals {
+                    out.push(' ');
+                    push_md_cell(out, val.as_deref().unwrap_or("NULL"));
+                    out.push_str(" |");
+                }
+                out.push('\n');
             }
             Self::Sql { table, quote } => {
                 // 按方言加引号；内部引号翻倍，防止标识符借引号逃逸（导出写入、回放触发注入）
-                let cols_s = cols.iter().map(|c| quote.quote(c)).collect::<Vec<_>>().join(", ");
-                let vals_s = vals.iter().map(|v| match v {
-                    None    => "NULL".to_string(),
-                    Some(s) => format!("'{}'", sql_escape(s)),
-                }).collect::<Vec<_>>().join(", ");
-                writeln!(w, "INSERT INTO {} ({}) VALUES ({});", quote.quote(table), cols_s, vals_s)
+                out.push_str("INSERT INTO ");
+                out.push_str(&quote.quote(table));
+                out.push_str(" (");
+                for (idx, col) in cols.iter().enumerate() {
+                    if idx > 0 { out.push_str(", "); }
+                    out.push_str(&quote.quote(col));
+                }
+                out.push_str(") VALUES (");
+                for (idx, val) in vals.iter().enumerate() {
+                    if idx > 0 { out.push_str(", "); }
+                    match val {
+                        None => out.push_str("NULL"),
+                        Some(s) => {
+                            out.push('\'');
+                            out.push_str(&sql_escape(s));
+                            out.push('\'');
+                        }
+                    }
+                }
+                out.push_str(");\n");
             }
         }
     }
+
+    fn write_finish_to(&mut self, out: &mut String) {
+        if matches!(self, Self::Json { .. }) {
+            out.push_str("\n]\n");
+        }
+    }
+}
+
+fn push_delimited_line<'a>(out: &mut String, sep: u8, cells: impl Iterator<Item = Option<&'a str>>) {
+    let mut first = true;
+    for cell in cells {
+        if !first { out.push(sep as char); }
+        first = false;
+        if let Some(s) = cell {
+            if sep == b',' {
+                push_csv_cell(out, s);
+            } else {
+                push_tsv_cell(out, s);
+            }
+        }
+    }
+    out.push('\n');
+}
+
+fn push_csv_cell(out: &mut String, s: &str) {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        out.push('"');
+        for ch in s.chars() {
+            if ch == '"' {
+                out.push_str("\"\"");
+            } else {
+                out.push(ch);
+            }
+        }
+        out.push('"');
+    } else {
+        out.push_str(s);
+    }
+}
+
+fn push_tsv_cell(out: &mut String, s: &str) {
+    for ch in s.chars() {
+        if matches!(ch, '\t' | '\n' | '\r') {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+}
+
+fn push_md_cell(out: &mut String, s: &str) {
+    for ch in s.chars() {
+        if ch == '|' {
+            out.push_str("\\|");
+        } else if ch == '\n' || ch == '\r' {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+}
+
+// ── XLSX 流式写入 ────────────────────────────────────────────────────────────
+
+struct XlsxWriter {
+    zip: zip::ZipWriter<BufWriter<std::fs::File>>,
+    row: u64,
+}
+
+impl XlsxWriter {
+    fn new(file: std::fs::File) -> Result<Self, String> {
+        use zip::write::SimpleFileOptions;
+        let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let mut zip = zip::ZipWriter::new(BufWriter::with_capacity(1024 * 1024, file));
+
+        zip.start_file("[Content_Types].xml", options).map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+        zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
+</Types>"#).map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+
+        zip.start_file("_rels/.rels", options).map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+        zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
+<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
+</Relationships>"#).map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+
+        zip.start_file("xl/_rels/workbook.xml.rels", options).map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+        zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"#).map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+
+        zip.start_file("xl/workbook.xml", options).map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+        zip.write_all(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="查询结果" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#.as_bytes()).map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+
+        zip.start_file("xl/styles.xml", options).map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+        zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+<fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>
+</styleSheet>"#).map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+
+        zip.start_file("docProps/core.xml", options).map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+        zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:creator>DBterm</dc:creator></cp:coreProperties>"#).map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+
+        zip.start_file("docProps/app.xml", options).map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+        zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>DBterm</Application></Properties>"#).map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+
+        zip.start_file("xl/worksheets/sheet1.xml", options).map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+        zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>"#)
+            .map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+        Ok(Self { zip, row: 0 })
+    }
+
+    fn write_row(&mut self, vals: &[Option<String>]) -> Result<(), String> {
+        self.row += 1;
+        if self.row > XLSX_MAX_ROWS {
+            return Err(format!("Excel 单个工作表最多支持 {XLSX_MAX_ROWS} 行，请改用 CSV / TSV / JSON Lines"));
+        }
+        write!(self.zip, r#"<row r="{}">"#, self.row).map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+        for (idx, val) in vals.iter().enumerate() {
+            if let Some(s) = val {
+                let cell = xlsx_cell_ref(idx, self.row);
+                write!(self.zip, r#"<c r="{cell}" t="inlineStr"><is><t xml:space="preserve">"#)
+                    .map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+                write_xml_text(&mut self.zip, s).map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+                self.zip.write_all(b"</t></is></c>").map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+            }
+        }
+        self.zip.write_all(b"</row>").map_err(|e| format!("写入 XLSX 失败: {e}"))
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        self.zip.write_all(b"</sheetData></worksheet>").map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+        self.zip.finish().map_err(|e| format!("写入 XLSX 失败: {e}"))?;
+        Ok(())
+    }
+}
+
+fn xlsx_cell_ref(mut col: usize, row: u64) -> String {
+    let mut letters = Vec::new();
+    loop {
+        let rem = col % 26;
+        letters.push((b'A' + rem as u8) as char);
+        col /= 26;
+        if col == 0 { break; }
+        col -= 1;
+    }
+    letters.iter().rev().collect::<String>() + &row.to_string()
+}
+
+fn write_xml_text(w: &mut impl Write, s: &str) -> std::io::Result<()> {
+    for ch in s.chars() {
+        match ch {
+            '&' => w.write_all(b"&amp;")?,
+            '<' => w.write_all(b"&lt;")?,
+            '>' => w.write_all(b"&gt;")?,
+            '"' => w.write_all(b"&quot;")?,
+            '\'' => w.write_all(b"&apos;")?,
+            '\u{0}'..='\u{8}' | '\u{B}' | '\u{C}' | '\u{E}'..='\u{1F}' => w.write_all(b" ")?,
+            _ => {
+                let mut buf = [0u8; 4];
+                w.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── 编码写入包装 ───────────────────────────────────────────────────────────────
@@ -197,24 +430,13 @@ impl EncodedWriter {
     fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
 }
 
-// RowWriter 需要一个 impl Write；当编码为 GBK 时不能直接用 BufWriter，
-// 因为 GBK 需要整行转换。用 String buffer 中转。
-struct StringBuf(String);
-impl Write for StringBuf {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.0.push_str(std::str::from_utf8(b).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?);
-        Ok(b.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
-}
-
 // ── 流式导出核心 ──────────────────────────────────────────────────────────────
 
 async fn export_mysql(
     conn: &mut sqlx::mysql::MySqlConnection,
     sql: &str,
     ew: &mut EncodedWriter,
-    fmt: &RowWriter<'_>,
+    fmt: &mut RowWriter<'_>,
     cancel: &Arc<AtomicBool>,
     app: &tauri::AppHandle,
     event: &str,
@@ -224,22 +446,23 @@ async fn export_mysql(
     let mut stream = sqlx::query(sql).fetch(&mut *conn);
     let mut cols: Option<Vec<String>> = None;
     let mut rows = 0u64;
+    let mut buf = String::with_capacity(8 * 1024);
 
     while let Some(row) = stream.try_next().await.map_err(|e| format!("查询失败: {e}"))? {
         if cols.is_none() {
             let names: Vec<String> = row.columns().iter().map(|c| c.name().to_owned()).collect();
-            let mut buf = StringBuf(String::new());
-            fmt.write_header(&mut buf, &names).map_err(|e| format!("写入失败: {e}"))?;
-            ew.write_str(&buf.0).map_err(|e| format!("写入失败: {e}"))?;
+            buf.clear();
+            fmt.write_header_to(&mut buf, &names);
+            ew.write_str(&buf).map_err(|e| format!("写入失败: {e}"))?;
             cols = Some(names);
         }
         let col_names = cols.as_ref().unwrap();
         let vals: Vec<Option<String>> = (0..col_names.len())
             .map(|i| crate::commands::query::mysql_cell(&row, i)).collect();
 
-        let mut buf = StringBuf(String::new());
-        fmt.write_row(&mut buf, col_names, &vals).map_err(|e| format!("写入失败: {e}"))?;
-        ew.write_str(&buf.0).map_err(|e| format!("写入失败: {e}"))?;
+        buf.clear();
+        fmt.write_row_to(&mut buf, col_names, &vals);
+        ew.write_str(&buf).map_err(|e| format!("写入失败: {e}"))?;
         rows += 1;
 
         if rows % CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
@@ -261,7 +484,7 @@ async fn export_pg(
     conn: &mut sqlx::postgres::PgConnection,
     sql: &str,
     ew: &mut EncodedWriter,
-    fmt: &RowWriter<'_>,
+    fmt: &mut RowWriter<'_>,
     cancel: &Arc<AtomicBool>,
     app: &tauri::AppHandle,
     event: &str,
@@ -271,22 +494,23 @@ async fn export_pg(
     let mut stream = sqlx::query(sql).fetch(&mut *conn);
     let mut cols: Option<Vec<String>> = None;
     let mut rows = 0u64;
+    let mut buf = String::with_capacity(8 * 1024);
 
     while let Some(row) = stream.try_next().await.map_err(|e| format!("查询失败: {e}"))? {
         if cols.is_none() {
             let names: Vec<String> = row.columns().iter().map(|c| c.name().to_owned()).collect();
-            let mut buf = StringBuf(String::new());
-            fmt.write_header(&mut buf, &names).map_err(|e| format!("写入失败: {e}"))?;
-            ew.write_str(&buf.0).map_err(|e| format!("写入失败: {e}"))?;
+            buf.clear();
+            fmt.write_header_to(&mut buf, &names);
+            ew.write_str(&buf).map_err(|e| format!("写入失败: {e}"))?;
             cols = Some(names);
         }
         let col_names = cols.as_ref().unwrap();
         let vals: Vec<Option<String>> = (0..col_names.len())
             .map(|i| crate::commands::query::pg_cell(&row, i)).collect();
 
-        let mut buf = StringBuf(String::new());
-        fmt.write_row(&mut buf, col_names, &vals).map_err(|e| format!("写入失败: {e}"))?;
-        ew.write_str(&buf.0).map_err(|e| format!("写入失败: {e}"))?;
+        buf.clear();
+        fmt.write_row_to(&mut buf, col_names, &vals);
+        ew.write_str(&buf).map_err(|e| format!("写入失败: {e}"))?;
         rows += 1;
 
         if rows % CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
@@ -308,7 +532,7 @@ async fn export_sqlite(
     conn: &mut sqlx::sqlite::SqliteConnection,
     sql: &str,
     ew: &mut EncodedWriter,
-    fmt: &RowWriter<'_>,
+    fmt: &mut RowWriter<'_>,
     cancel: &Arc<AtomicBool>,
     app: &tauri::AppHandle,
     event: &str,
@@ -318,22 +542,23 @@ async fn export_sqlite(
     let mut stream = sqlx::query(sql).fetch(&mut *conn);
     let mut cols: Option<Vec<String>> = None;
     let mut rows = 0u64;
+    let mut buf = String::with_capacity(8 * 1024);
 
     while let Some(row) = stream.try_next().await.map_err(|e| format!("查询失败: {e}"))? {
         if cols.is_none() {
             let names: Vec<String> = row.columns().iter().map(|c| c.name().to_owned()).collect();
-            let mut buf = StringBuf(String::new());
-            fmt.write_header(&mut buf, &names).map_err(|e| format!("写入失败: {e}"))?;
-            ew.write_str(&buf.0).map_err(|e| format!("写入失败: {e}"))?;
+            buf.clear();
+            fmt.write_header_to(&mut buf, &names);
+            ew.write_str(&buf).map_err(|e| format!("写入失败: {e}"))?;
             cols = Some(names);
         }
         let col_names = cols.as_ref().unwrap();
         let vals: Vec<Option<String>> = (0..col_names.len())
             .map(|i| crate::commands::query::sqlite_cell(&row, i)).collect();
 
-        let mut buf = StringBuf(String::new());
-        fmt.write_row(&mut buf, col_names, &vals).map_err(|e| format!("写入失败: {e}"))?;
-        ew.write_str(&buf.0).map_err(|e| format!("写入失败: {e}"))?;
+        buf.clear();
+        fmt.write_row_to(&mut buf, col_names, &vals);
+        ew.write_str(&buf).map_err(|e| format!("写入失败: {e}"))?;
         rows += 1;
 
         if rows % CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
@@ -349,6 +574,835 @@ async fn export_sqlite(
         }
     }
     Ok(rows)
+}
+
+async fn export_xlsx_mysql(
+    conn: &mut sqlx::mysql::MySqlConnection,
+    sql: &str,
+    xw: &mut XlsxWriter,
+    cancel: &Arc<AtomicBool>,
+    app: &tauri::AppHandle,
+    event: &str,
+    start: Instant,
+) -> Result<u64, String> {
+    use sqlx::{Row, Column};
+    let mut stream = sqlx::query(sql).fetch(&mut *conn);
+    let mut cols: Option<Vec<String>> = None;
+    let mut rows = 0u64;
+
+    while let Some(row) = stream.try_next().await.map_err(|e| format!("查询失败: {e}"))? {
+        if cols.is_none() {
+            let names: Vec<String> = row.columns().iter().map(|c| c.name().to_owned()).collect();
+            xw.write_row(&names.iter().map(|s| Some(s.clone())).collect::<Vec<_>>())?;
+            cols = Some(names);
+        }
+        let col_names = cols.as_ref().unwrap();
+        let vals: Vec<Option<String>> = (0..col_names.len())
+            .map(|i| crate::commands::query::mysql_cell(&row, i)).collect();
+        xw.write_row(&vals)?;
+        rows += 1;
+
+        if rows % CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
+            return Err("已取消".into());
+        }
+        if rows % PROGRESS_INTERVAL == 0 {
+            let ms = start.elapsed().as_millis() as u64;
+            let _ = app.emit(event, ExportProgressEvt {
+                rows, elapsed_ms: ms,
+                rows_per_sec: if ms > 0 { rows * 1000 / ms } else { 0 },
+                file_bytes: 0, done: false, cancelled: false, error: None,
+            });
+        }
+    }
+    Ok(rows)
+}
+
+async fn export_xlsx_pg(
+    conn: &mut sqlx::postgres::PgConnection,
+    sql: &str,
+    xw: &mut XlsxWriter,
+    cancel: &Arc<AtomicBool>,
+    app: &tauri::AppHandle,
+    event: &str,
+    start: Instant,
+) -> Result<u64, String> {
+    use sqlx::{Row, Column};
+    let mut stream = sqlx::query(sql).fetch(&mut *conn);
+    let mut cols: Option<Vec<String>> = None;
+    let mut rows = 0u64;
+
+    while let Some(row) = stream.try_next().await.map_err(|e| format!("查询失败: {e}"))? {
+        if cols.is_none() {
+            let names: Vec<String> = row.columns().iter().map(|c| c.name().to_owned()).collect();
+            xw.write_row(&names.iter().map(|s| Some(s.clone())).collect::<Vec<_>>())?;
+            cols = Some(names);
+        }
+        let col_names = cols.as_ref().unwrap();
+        let vals: Vec<Option<String>> = (0..col_names.len())
+            .map(|i| crate::commands::query::pg_cell(&row, i)).collect();
+        xw.write_row(&vals)?;
+        rows += 1;
+
+        if rows % CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
+            return Err("已取消".into());
+        }
+        if rows % PROGRESS_INTERVAL == 0 {
+            let ms = start.elapsed().as_millis() as u64;
+            let _ = app.emit(event, ExportProgressEvt {
+                rows, elapsed_ms: ms,
+                rows_per_sec: if ms > 0 { rows * 1000 / ms } else { 0 },
+                file_bytes: 0, done: false, cancelled: false, error: None,
+            });
+        }
+    }
+    Ok(rows)
+}
+
+async fn export_xlsx_sqlite(
+    conn: &mut sqlx::sqlite::SqliteConnection,
+    sql: &str,
+    xw: &mut XlsxWriter,
+    cancel: &Arc<AtomicBool>,
+    app: &tauri::AppHandle,
+    event: &str,
+    start: Instant,
+) -> Result<u64, String> {
+    use sqlx::{Row, Column};
+    let mut stream = sqlx::query(sql).fetch(&mut *conn);
+    let mut cols: Option<Vec<String>> = None;
+    let mut rows = 0u64;
+
+    while let Some(row) = stream.try_next().await.map_err(|e| format!("查询失败: {e}"))? {
+        if cols.is_none() {
+            let names: Vec<String> = row.columns().iter().map(|c| c.name().to_owned()).collect();
+            xw.write_row(&names.iter().map(|s| Some(s.clone())).collect::<Vec<_>>())?;
+            cols = Some(names);
+        }
+        let col_names = cols.as_ref().unwrap();
+        let vals: Vec<Option<String>> = (0..col_names.len())
+            .map(|i| crate::commands::query::sqlite_cell(&row, i)).collect();
+        xw.write_row(&vals)?;
+        rows += 1;
+
+        if rows % CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
+            return Err("已取消".into());
+        }
+        if rows % PROGRESS_INTERVAL == 0 {
+            let ms = start.elapsed().as_millis() as u64;
+            let _ = app.emit(event, ExportProgressEvt {
+                rows, elapsed_ms: ms,
+                rows_per_sec: if ms > 0 { rows * 1000 / ms } else { 0 },
+                file_bytes: 0, done: false, cancelled: false, error: None,
+            });
+        }
+    }
+    Ok(rows)
+}
+
+async fn export_sqlserver(
+    id: &str,
+    config: &crate::models::ConnConfig,
+    sql: &str,
+    ss_pool: &SsPool,
+    ew: &mut EncodedWriter,
+    fmt: &mut RowWriter<'_>,
+    cancel: &Arc<AtomicBool>,
+    app: &tauri::AppHandle,
+    event: &str,
+    start: Instant,
+) -> Result<u64, String> {
+    use tiberius::QueryItem;
+    let entry_arc = crate::commands::sqlserver::get_entry(
+        id,
+        ss_pool,
+        config,
+        crate::keychain::get_password(id)?.as_deref(),
+    ).await?;
+    let mut entry = entry_arc.lock().await;
+    let mut stream = entry.client.simple_query(sql).await
+        .map_err(|e| format!("SQL Server 查询失败: {e}"))?;
+
+    let mut cols: Option<Vec<String>> = None;
+    let mut rows = 0u64;
+    let mut buf = String::with_capacity(8 * 1024);
+
+    while let Some(item) = stream.try_next().await.map_err(|e| format!("SQL Server 读取失败: {e}"))? {
+        match item {
+            QueryItem::Metadata(meta) => {
+                if cols.is_none() {
+                    let names: Vec<String> = meta.columns().iter().map(|c| c.name().to_string()).collect();
+                    buf.clear();
+                    fmt.write_header_to(&mut buf, &names);
+                    ew.write_str(&buf).map_err(|e| format!("写入失败: {e}"))?;
+                    cols = Some(names);
+                }
+            }
+            QueryItem::Row(row) => {
+                if cols.is_none() {
+                    let names: Vec<String> = row.columns().iter().map(|c| c.name().to_string()).collect();
+                    buf.clear();
+                    fmt.write_header_to(&mut buf, &names);
+                    ew.write_str(&buf).map_err(|e| format!("写入失败: {e}"))?;
+                    cols = Some(names);
+                }
+                let col_names = cols.as_ref().unwrap();
+                let vals: Vec<Option<String>> = (0..col_names.len())
+                    .map(|i| crate::commands::sqlserver::cell_to_string(&row, i)).collect();
+                buf.clear();
+                fmt.write_row_to(&mut buf, col_names, &vals);
+                ew.write_str(&buf).map_err(|e| format!("写入失败: {e}"))?;
+                rows += 1;
+
+                if rows % CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
+                    return Err("已取消".into());
+                }
+                if rows % PROGRESS_INTERVAL == 0 {
+                    let ms = start.elapsed().as_millis() as u64;
+                    let _ = app.emit(event, ExportProgressEvt {
+                        rows, elapsed_ms: ms,
+                        rows_per_sec: if ms > 0 { rows * 1000 / ms } else { 0 },
+                        file_bytes: 0, done: false, cancelled: false, error: None,
+                    });
+                }
+            }
+        }
+    }
+    Ok(rows)
+}
+
+async fn export_xlsx_sqlserver(
+    id: &str,
+    config: &crate::models::ConnConfig,
+    sql: &str,
+    ss_pool: &SsPool,
+    xw: &mut XlsxWriter,
+    cancel: &Arc<AtomicBool>,
+    app: &tauri::AppHandle,
+    event: &str,
+    start: Instant,
+) -> Result<u64, String> {
+    use tiberius::QueryItem;
+    let entry_arc = crate::commands::sqlserver::get_entry(
+        id,
+        ss_pool,
+        config,
+        crate::keychain::get_password(id)?.as_deref(),
+    ).await?;
+    let mut entry = entry_arc.lock().await;
+    let mut stream = entry.client.simple_query(sql).await
+        .map_err(|e| format!("SQL Server 查询失败: {e}"))?;
+
+    let mut cols: Option<Vec<String>> = None;
+    let mut rows = 0u64;
+
+    while let Some(item) = stream.try_next().await.map_err(|e| format!("SQL Server 读取失败: {e}"))? {
+        match item {
+            QueryItem::Metadata(meta) => {
+                if cols.is_none() {
+                    let names: Vec<String> = meta.columns().iter().map(|c| c.name().to_string()).collect();
+                    xw.write_row(&names.iter().map(|s| Some(s.clone())).collect::<Vec<_>>())?;
+                    cols = Some(names);
+                }
+            }
+            QueryItem::Row(row) => {
+                if cols.is_none() {
+                    let names: Vec<String> = row.columns().iter().map(|c| c.name().to_string()).collect();
+                    xw.write_row(&names.iter().map(|s| Some(s.clone())).collect::<Vec<_>>())?;
+                    cols = Some(names);
+                }
+                let col_names = cols.as_ref().unwrap();
+                let vals: Vec<Option<String>> = (0..col_names.len())
+                    .map(|i| crate::commands::sqlserver::cell_to_string(&row, i)).collect();
+                xw.write_row(&vals)?;
+                rows += 1;
+
+                if rows % CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
+                    return Err("已取消".into());
+                }
+                if rows % PROGRESS_INTERVAL == 0 {
+                    let ms = start.elapsed().as_millis() as u64;
+                    let _ = app.emit(event, ExportProgressEvt {
+                        rows, elapsed_ms: ms,
+                        rows_per_sec: if ms > 0 { rows * 1000 / ms } else { 0 },
+                        file_bytes: 0, done: false, cancelled: false, error: None,
+                    });
+                }
+            }
+        }
+    }
+    Ok(rows)
+}
+
+async fn export_clickhouse_tcp(
+    config: &crate::models::ConnConfig,
+    sql: &str,
+    ew: &mut EncodedWriter,
+    fmt: &mut RowWriter<'_>,
+    cancel: &Arc<AtomicBool>,
+    app: &tauri::AppHandle,
+    event: &str,
+    start: Instant,
+) -> Result<u64, String> {
+    let client = crate::commands::clickhouse_tcp::connect(config, crate::keychain::get_password(&config.id)?.as_deref()).await?;
+    let mut stream = client.query_raw(sql).await
+        .map_err(|e| format!("ClickHouse 查询失败: {e}"))?;
+    let mut cols: Option<Vec<String>> = None;
+    let mut rows = 0u64;
+    let mut buf = String::with_capacity(16 * 1024);
+
+    while let Some(block) = stream.next().await {
+        let block = block.map_err(|e| format!("ClickHouse 读取数据块失败: {e}"))?;
+        if cols.is_none() && !block.column_types.is_empty() {
+            let names: Vec<String> = block.column_types.keys().cloned().collect();
+            buf.clear();
+            fmt.write_header_to(&mut buf, &names);
+            ew.write_str(&buf).map_err(|e| format!("写入失败: {e}"))?;
+            cols = Some(names);
+        }
+        let Some(col_names) = cols.as_ref() else { continue };
+        for row_idx in 0..block.rows as usize {
+            let vals: Vec<Option<String>> = col_names.iter()
+                .map(|col| block.column_data.get(col)
+                    .and_then(|vals| vals.get(row_idx))
+                    .and_then(crate::commands::clickhouse_tcp::value_to_string))
+                .collect();
+            buf.clear();
+            fmt.write_row_to(&mut buf, col_names, &vals);
+            ew.write_str(&buf).map_err(|e| format!("写入失败: {e}"))?;
+            rows += 1;
+            if rows % CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
+                return Err("已取消".into());
+            }
+            if rows % PROGRESS_INTERVAL == 0 {
+                let ms = start.elapsed().as_millis() as u64;
+                let _ = app.emit(event, ExportProgressEvt {
+                    rows, elapsed_ms: ms,
+                    rows_per_sec: if ms > 0 { rows * 1000 / ms } else { 0 },
+                    file_bytes: 0, done: false, cancelled: false, error: None,
+                });
+            }
+        }
+    }
+    Ok(rows)
+}
+
+async fn export_xlsx_clickhouse_tcp(
+    config: &crate::models::ConnConfig,
+    sql: &str,
+    xw: &mut XlsxWriter,
+    cancel: &Arc<AtomicBool>,
+    app: &tauri::AppHandle,
+    event: &str,
+    start: Instant,
+) -> Result<u64, String> {
+    let client = crate::commands::clickhouse_tcp::connect(config, crate::keychain::get_password(&config.id)?.as_deref()).await?;
+    let mut stream = client.query_raw(sql).await
+        .map_err(|e| format!("ClickHouse 查询失败: {e}"))?;
+    let mut cols: Option<Vec<String>> = None;
+    let mut rows = 0u64;
+
+    while let Some(block) = stream.next().await {
+        let block = block.map_err(|e| format!("ClickHouse 读取数据块失败: {e}"))?;
+        if cols.is_none() && !block.column_types.is_empty() {
+            let names: Vec<String> = block.column_types.keys().cloned().collect();
+            xw.write_row(&names.iter().map(|s| Some(s.clone())).collect::<Vec<_>>())?;
+            cols = Some(names);
+        }
+        let Some(col_names) = cols.as_ref() else { continue };
+        for row_idx in 0..block.rows as usize {
+            let vals: Vec<Option<String>> = col_names.iter()
+                .map(|col| block.column_data.get(col)
+                    .and_then(|vals| vals.get(row_idx))
+                    .and_then(crate::commands::clickhouse_tcp::value_to_string))
+                .collect();
+            xw.write_row(&vals)?;
+            rows += 1;
+            if rows % CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
+                return Err("已取消".into());
+            }
+            if rows % PROGRESS_INTERVAL == 0 {
+                let ms = start.elapsed().as_millis() as u64;
+                let _ = app.emit(event, ExportProgressEvt {
+                    rows, elapsed_ms: ms,
+                    rows_per_sec: if ms > 0 { rows * 1000 / ms } else { 0 },
+                    file_bytes: 0, done: false, cancelled: false, error: None,
+                });
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn json_value_to_string(v: &serde_json::Value) -> Option<String> {
+    if v.is_null() {
+        None
+    } else if let Some(s) = v.as_str() {
+        Some(s.to_string())
+    } else {
+        Some(v.to_string())
+    }
+}
+
+fn clickhouse_http_request(
+    config: &crate::models::ConnConfig,
+    sql: &str,
+) -> Result<reqwest::RequestBuilder, String> {
+    let password = crate::keychain::get_password(&config.id)?;
+    let mut req = crate::commands::clickhouse::client()?
+        .post(crate::commands::clickhouse::base_url(config))
+        .header("X-ClickHouse-User", config.username.as_deref().unwrap_or("default"));
+    if let Some(p) = password.as_deref().filter(|p| !p.is_empty()) {
+        req = req.header("X-ClickHouse-Key", p);
+    }
+    if let Some(db) = config.database.as_deref().filter(|s| !s.is_empty()) {
+        req = req.query(&[("database", db)]);
+    }
+    Ok(req.body(sql.to_string()))
+}
+
+async fn export_clickhouse_http_rows(
+    config: &crate::models::ConnConfig,
+    sql: &str,
+    mut on_item: impl FnMut(&[String], Option<&[Option<String>]>) -> Result<(), String>,
+    cancel: &Arc<AtomicBool>,
+    app: &tauri::AppHandle,
+    event: &str,
+    start: Instant,
+) -> Result<u64, String> {
+    let base = sql.trim().trim_end_matches(';');
+    let stream_sql = format!("SELECT * FROM ({base}) FORMAT JSONCompactEachRowWithNamesAndTypes");
+    let resp = clickhouse_http_request(config, &stream_sql)?
+        .send().await
+        .map_err(|e| format!("ClickHouse 请求失败: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("ClickHouse 错误（HTTP {}）：{}", status.as_u16(), text.trim()));
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut pending = Vec::<u8>::new();
+    let mut line_no = 0u64;
+    let mut rows = 0u64;
+    let mut cols: Vec<String> = Vec::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("ClickHouse 读取响应失败: {e}"))?;
+        pending.extend_from_slice(&chunk);
+        while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
+            let line = pending.drain(..=pos).collect::<Vec<_>>();
+            let line = String::from_utf8_lossy(&line).trim().to_string();
+            if line.is_empty() { continue; }
+            line_no += 1;
+            let arr: Vec<serde_json::Value> = serde_json::from_str(&line)
+                .map_err(|e| format!("解析 ClickHouse 流式行失败: {e}"))?;
+            if line_no == 1 {
+                cols = arr.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect();
+                on_item(&cols, None)?;
+            } else if line_no == 2 {
+                continue;
+            } else {
+                let vals: Vec<Option<String>> = arr.iter().map(json_value_to_string).collect();
+                on_item(&cols, Some(&vals))?;
+                rows += 1;
+                if rows % CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
+                    return Err("已取消".into());
+                }
+                if rows % PROGRESS_INTERVAL == 0 {
+                    let ms = start.elapsed().as_millis() as u64;
+                    let _ = app.emit(event, ExportProgressEvt {
+                        rows, elapsed_ms: ms,
+                        rows_per_sec: if ms > 0 { rows * 1000 / ms } else { 0 },
+                        file_bytes: 0, done: false, cancelled: false, error: None,
+                    });
+                }
+            }
+        }
+    }
+    if !pending.is_empty() {
+        let line = String::from_utf8_lossy(&pending).trim().to_string();
+        if !line.is_empty() {
+            line_no += 1;
+            let arr: Vec<serde_json::Value> = serde_json::from_str(&line)
+                .map_err(|e| format!("解析 ClickHouse 流式行失败: {e}"))?;
+            if line_no == 1 {
+                cols = arr.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect();
+                on_item(&cols, None)?;
+            } else if line_no > 2 {
+                let vals: Vec<Option<String>> = arr.iter().map(json_value_to_string).collect();
+                on_item(&cols, Some(&vals))?;
+                rows += 1;
+            }
+        }
+    }
+    Ok(rows)
+}
+
+async fn export_clickhouse_http(
+    config: &crate::models::ConnConfig,
+    sql: &str,
+    ew: &mut EncodedWriter,
+    fmt: &mut RowWriter<'_>,
+    cancel: &Arc<AtomicBool>,
+    app: &tauri::AppHandle,
+    event: &str,
+    start: Instant,
+) -> Result<u64, String> {
+    let mut buf = String::with_capacity(16 * 1024);
+    export_clickhouse_http_rows(
+        config,
+        sql,
+        |cols, vals| {
+            buf.clear();
+            if let Some(vals) = vals {
+                fmt.write_row_to(&mut buf, cols, vals);
+            } else {
+                fmt.write_header_to(&mut buf, cols);
+            }
+            ew.write_str(&buf).map_err(|e| format!("写入失败: {e}"))
+        },
+        cancel,
+        app,
+        event,
+        start,
+    ).await
+}
+
+async fn export_xlsx_clickhouse_http(
+    config: &crate::models::ConnConfig,
+    sql: &str,
+    xw: &mut XlsxWriter,
+    cancel: &Arc<AtomicBool>,
+    app: &tauri::AppHandle,
+    event: &str,
+    start: Instant,
+) -> Result<u64, String> {
+    export_clickhouse_http_rows(
+        config,
+        sql,
+        |cols, vals| {
+            if let Some(vals) = vals {
+                xw.write_row(vals)
+            } else {
+                xw.write_row(&cols.iter().map(|s| Some(s.clone())).collect::<Vec<_>>())
+            }
+        },
+        cancel,
+        app,
+        event,
+        start,
+    ).await
+}
+
+async fn duckdb_copy_to_path(
+    id: &str,
+    config: &crate::models::ConnConfig,
+    sql: &str,
+    path: &str,
+    pool: &DuckPool,
+    registry: &DriverRegistry,
+) -> Result<u64, String> {
+    let lib_path = crate::commands::duckdb::get_duck_lib_path_pub(registry).await?;
+    let conn = crate::commands::duckdb::get_or_open_pub(id, config, pool, &lib_path).await?;
+    let path_esc = path.replace('\'', "''");
+    let base = sql.trim().trim_end_matches(';');
+    let copy_sql = format!("COPY ({base}) TO '{path_esc}' (FORMAT CSV, HEADER TRUE)");
+    tokio::task::spawn_blocking(move || {
+        let guard = conn.blocking_lock();
+        crate::commands::duckdb::run_query_sync_pub(&guard, &copy_sql, 0).map(|r| r.rows_affected)
+    }).await.map_err(|e| format!("线程错误: {e}"))?
+}
+
+fn duckdb_temp_csv_path(task_id: &str) -> String {
+    let mut p = std::env::temp_dir();
+    p.push(format!("dbterm_export_{task_id}.csv"));
+    p.to_string_lossy().to_string()
+}
+
+async fn export_duckdb_via_temp_csv(
+    id: &str,
+    config: &crate::models::ConnConfig,
+    sql: &str,
+    pool: &DuckPool,
+    registry: &DriverRegistry,
+    task_id: &str,
+    ew: &mut EncodedWriter,
+    fmt: &mut RowWriter<'_>,
+    cancel: &Arc<AtomicBool>,
+    app: &tauri::AppHandle,
+    event: &str,
+    start: Instant,
+) -> Result<u64, String> {
+    let tmp = duckdb_temp_csv_path(task_id);
+    let _ = std::fs::remove_file(&tmp);
+    duckdb_copy_to_path(id, config, sql, &tmp, pool, registry).await?;
+
+    let file = std::fs::File::open(&tmp).map_err(|e| format!("读取 DuckDB 临时导出失败: {e}"))?;
+    let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(file);
+    let headers = rdr.headers().map_err(|e| format!("读取 DuckDB CSV 表头失败: {e}"))?
+        .iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let mut buf = String::with_capacity(16 * 1024);
+    fmt.write_header_to(&mut buf, &headers);
+    ew.write_str(&buf).map_err(|e| format!("写入失败: {e}"))?;
+
+    let mut rows = 0u64;
+    for rec in rdr.records() {
+        let rec = rec.map_err(|e| format!("读取 DuckDB CSV 行失败: {e}"))?;
+        let vals: Vec<Option<String>> = rec.iter().map(|s| {
+            if s.is_empty() { None } else { Some(s.to_string()) }
+        }).collect();
+        buf.clear();
+        fmt.write_row_to(&mut buf, &headers, &vals);
+        ew.write_str(&buf).map_err(|e| format!("写入失败: {e}"))?;
+        rows += 1;
+        if rows % CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err("已取消".into());
+        }
+        if rows % PROGRESS_INTERVAL == 0 {
+            let ms = start.elapsed().as_millis() as u64;
+            let _ = app.emit(event, ExportProgressEvt {
+                rows, elapsed_ms: ms,
+                rows_per_sec: if ms > 0 { rows * 1000 / ms } else { 0 },
+                file_bytes: 0, done: false, cancelled: false, error: None,
+            });
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    Ok(rows)
+}
+
+async fn export_xlsx_duckdb_via_temp_csv(
+    id: &str,
+    config: &crate::models::ConnConfig,
+    sql: &str,
+    pool: &DuckPool,
+    registry: &DriverRegistry,
+    task_id: &str,
+    xw: &mut XlsxWriter,
+    cancel: &Arc<AtomicBool>,
+    app: &tauri::AppHandle,
+    event: &str,
+    start: Instant,
+) -> Result<u64, String> {
+    let tmp = duckdb_temp_csv_path(task_id);
+    let _ = std::fs::remove_file(&tmp);
+    duckdb_copy_to_path(id, config, sql, &tmp, pool, registry).await?;
+
+    let file = std::fs::File::open(&tmp).map_err(|e| format!("读取 DuckDB 临时导出失败: {e}"))?;
+    let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(file);
+    let headers = rdr.headers().map_err(|e| format!("读取 DuckDB CSV 表头失败: {e}"))?
+        .iter().map(|s| Some(s.to_string())).collect::<Vec<_>>();
+    xw.write_row(&headers)?;
+
+    let mut rows = 0u64;
+    for rec in rdr.records() {
+        let rec = rec.map_err(|e| format!("读取 DuckDB CSV 行失败: {e}"))?;
+        let vals: Vec<Option<String>> = rec.iter().map(|s| {
+            if s.is_empty() { None } else { Some(s.to_string()) }
+        }).collect();
+        xw.write_row(&vals)?;
+        rows += 1;
+        if rows % CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err("已取消".into());
+        }
+        if rows % PROGRESS_INTERVAL == 0 {
+            let ms = start.elapsed().as_millis() as u64;
+            let _ = app.emit(event, ExportProgressEvt {
+                rows, elapsed_ms: ms,
+                rows_per_sec: if ms > 0 { rows * 1000 / ms } else { 0 },
+                file_bytes: 0, done: false, cancelled: false, error: None,
+            });
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    Ok(rows)
+}
+
+async fn export_oracle(
+    config: crate::models::ConnConfig,
+    sql: &str,
+    registry: &DriverRegistry,
+    ew: &mut EncodedWriter,
+    fmt: &mut RowWriter<'_>,
+    cancel: &Arc<AtomicBool>,
+    app: &tauri::AppHandle,
+    event: &str,
+    start: Instant,
+) -> Result<u64, String> {
+    let password = crate::keychain::get_password(&config.id)?;
+    let mut buf = String::with_capacity(16 * 1024);
+    let mut rows = 0u64;
+    crate::commands::oracle::stream_query_rows(
+        config,
+        sql.to_string(),
+        password,
+        registry,
+        |cols, vals| {
+            buf.clear();
+            if let Some(vals) = vals {
+                fmt.write_row_to(&mut buf, cols, vals);
+                ew.write_str(&buf).map_err(|e| format!("写入失败: {e}"))?;
+                rows += 1;
+                if rows % CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
+                    return Err("已取消".into());
+                }
+                if rows % PROGRESS_INTERVAL == 0 {
+                    let ms = start.elapsed().as_millis() as u64;
+                    let _ = app.emit(event, ExportProgressEvt {
+                        rows, elapsed_ms: ms,
+                        rows_per_sec: if ms > 0 { rows * 1000 / ms } else { 0 },
+                        file_bytes: 0, done: false, cancelled: false, error: None,
+                    });
+                }
+            } else {
+                fmt.write_header_to(&mut buf, cols);
+                ew.write_str(&buf).map_err(|e| format!("写入失败: {e}"))?;
+            }
+            Ok(())
+        },
+    ).await?;
+    Ok(rows)
+}
+
+async fn export_xlsx_oracle(
+    config: crate::models::ConnConfig,
+    sql: &str,
+    registry: &DriverRegistry,
+    xw: &mut XlsxWriter,
+    cancel: &Arc<AtomicBool>,
+    app: &tauri::AppHandle,
+    event: &str,
+    start: Instant,
+) -> Result<u64, String> {
+    let password = crate::keychain::get_password(&config.id)?;
+    let mut rows = 0u64;
+    crate::commands::oracle::stream_query_rows(
+        config,
+        sql.to_string(),
+        password,
+        registry,
+        |cols, vals| {
+            if let Some(vals) = vals {
+                xw.write_row(vals)?;
+                rows += 1;
+                if rows % CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
+                    return Err("已取消".into());
+                }
+                if rows % PROGRESS_INTERVAL == 0 {
+                    let ms = start.elapsed().as_millis() as u64;
+                    let _ = app.emit(event, ExportProgressEvt {
+                        rows, elapsed_ms: ms,
+                        rows_per_sec: if ms > 0 { rows * 1000 / ms } else { 0 },
+                        file_bytes: 0, done: false, cancelled: false, error: None,
+                    });
+                }
+            } else {
+                xw.write_row(&cols.iter().map(|s| Some(s.clone())).collect::<Vec<_>>())?;
+            }
+            Ok(())
+        },
+    ).await?;
+    Ok(rows)
+}
+
+fn finish_text_export_result(
+    result: Result<u64, String>,
+    ew: &mut EncodedWriter,
+    fmt: &mut RowWriter<'_>,
+    file_path: &str,
+    app: &tauri::AppHandle,
+    event: &str,
+    start: Instant,
+) -> Result<u64, String> {
+    match result {
+        Ok(rows) => {
+            let mut tail = String::new();
+            fmt.write_finish_to(&mut tail);
+            if !tail.is_empty() {
+                let _ = ew.write_str(&tail);
+            }
+            let _ = ew.flush();
+            let file_bytes = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+            let ms = start.elapsed().as_millis() as u64;
+            let _ = app.emit(event, ExportProgressEvt {
+                rows, elapsed_ms: ms,
+                rows_per_sec: if ms > 0 { rows * 1000 / ms } else { 0 },
+                file_bytes, done: true, cancelled: false, error: None,
+            });
+            Ok(rows)
+        }
+        Err(e) if e == "已取消" => {
+            std::fs::remove_file(file_path).ok();
+            let ms = start.elapsed().as_millis() as u64;
+            let _ = app.emit(event, ExportProgressEvt {
+                rows: 0, elapsed_ms: ms, rows_per_sec: 0,
+                file_bytes: 0, done: true, cancelled: true, error: None,
+            });
+            Err(e)
+        }
+        Err(e) => {
+            std::fs::remove_file(file_path).ok();
+            let ms = start.elapsed().as_millis() as u64;
+            let _ = app.emit(event, ExportProgressEvt {
+                rows: 0, elapsed_ms: ms, rows_per_sec: 0,
+                file_bytes: 0, done: true, cancelled: false, error: Some(e.clone()),
+            });
+            Err(e)
+        }
+    }
+}
+
+fn finish_xlsx_export_result(
+    result: Result<u64, String>,
+    xw: XlsxWriter,
+    file_path: &str,
+    app: &tauri::AppHandle,
+    event: &str,
+    start: Instant,
+) -> Result<u64, String> {
+    match result {
+        Ok(rows) => {
+            if let Err(e) = xw.finish() {
+                std::fs::remove_file(file_path).ok();
+                let ms = start.elapsed().as_millis() as u64;
+                let _ = app.emit(event, ExportProgressEvt {
+                    rows: 0, elapsed_ms: ms, rows_per_sec: 0,
+                    file_bytes: 0, done: true, cancelled: false, error: Some(e.clone()),
+                });
+                return Err(e);
+            }
+            let file_bytes = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+            let ms = start.elapsed().as_millis() as u64;
+            let _ = app.emit(event, ExportProgressEvt {
+                rows, elapsed_ms: ms,
+                rows_per_sec: if ms > 0 { rows * 1000 / ms } else { 0 },
+                file_bytes, done: true, cancelled: false, error: None,
+            });
+            Ok(rows)
+        }
+        Err(e) if e == "已取消" => {
+            drop(xw);
+            std::fs::remove_file(file_path).ok();
+            let ms = start.elapsed().as_millis() as u64;
+            let _ = app.emit(event, ExportProgressEvt {
+                rows: 0, elapsed_ms: ms, rows_per_sec: 0,
+                file_bytes: 0, done: true, cancelled: true, error: None,
+            });
+            Err(e)
+        }
+        Err(e) => {
+            drop(xw);
+            std::fs::remove_file(file_path).ok();
+            let ms = start.elapsed().as_millis() as u64;
+            let _ = app.emit(event, ExportProgressEvt {
+                rows: 0, elapsed_ms: ms, rows_per_sec: 0,
+                file_bytes: 0, done: true, cancelled: false, error: Some(e.clone()),
+            });
+            Err(e)
+        }
+    }
 }
 
 // ── Tauri 命令 ────────────────────────────────────────────────────────────────
@@ -371,9 +1425,15 @@ pub async fn db_stream_export(
     task_id: String,
     database: Option<String>,
     storage: State<'_, StorageState>,
+    ss_pool: State<'_, SsPool>,
+    duck_pool: State<'_, DuckPool>,
+    registry: State<'_, DriverRegistry>,
     cancel_map: State<'_, ExportCancelMap>,
     app: tauri::AppHandle,
 ) -> Result<u64, String> {
+    if format == "parquet" {
+        return Err("Parquet 仅支持 DuckDB 原生流式导出".to_string());
+    }
     super::db_extra::validate_path(&file_path)?;
     let path = std::path::Path::new(&file_path);
     if let Some(dir) = path.parent() {
@@ -386,6 +1446,137 @@ pub async fn db_stream_export(
 
     let event = format!("export_progress_{task_id}");
     let start = Instant::now();
+
+    if format == "xlsx" {
+        let file = match std::fs::File::create(&file_path) {
+            Ok(f) => f,
+            Err(e) => {
+                cancel_map.lock().unwrap().remove(&task_id);
+                return Err(format!("无法创建文件: {e}"));
+            }
+        };
+
+        let mut xw = match XlsxWriter::new(file) {
+            Ok(w) => w,
+            Err(e) => {
+                cancel_map.lock().unwrap().remove(&task_id);
+                std::fs::remove_file(&file_path).ok();
+                return Err(e);
+            }
+        };
+
+        let conn_type = storage.lock().unwrap().load().ok()
+            .and_then(|cfgs| cfgs.into_iter().find(|c| c.id == id).map(|c| c.conn_type));
+        if matches!(conn_type, Some(ConnType::SqlServer)) {
+            let mut cfg = storage.lock().unwrap().load()?
+                .into_iter().find(|c| c.id == id)
+                .ok_or_else(|| format!("连接不存在: {id}"))?;
+            if let Some(db) = database.as_deref().filter(|s| !s.is_empty()) {
+                cfg.database = Some(db.to_string());
+            }
+            let result = export_xlsx_sqlserver(&id, &cfg, &sql, &ss_pool, &mut xw, &cancel, &app, &event, start).await;
+            cancel_map.lock().unwrap().remove(&task_id);
+            return finish_xlsx_export_result(result, xw, &file_path, &app, &event, start);
+        }
+        if matches!(conn_type, Some(ConnType::ClickHouse)) {
+            let mut cfg = storage.lock().unwrap().load()?
+                .into_iter().find(|c| c.id == id)
+                .ok_or_else(|| format!("连接不存在: {id}"))?;
+            if let Some(db) = database.as_deref().filter(|s| !s.is_empty()) {
+                cfg.database = Some(db.to_string());
+            }
+            let result = if crate::commands::clickhouse_tcp::use_tcp(&cfg) {
+                export_xlsx_clickhouse_tcp(&cfg, &sql, &mut xw, &cancel, &app, &event, start).await
+            } else {
+                export_xlsx_clickhouse_http(&cfg, &sql, &mut xw, &cancel, &app, &event, start).await
+            };
+            cancel_map.lock().unwrap().remove(&task_id);
+            return finish_xlsx_export_result(result, xw, &file_path, &app, &event, start);
+        }
+        if matches!(conn_type, Some(ConnType::Duckdb)) {
+            let mut cfg = storage.lock().unwrap().load()?
+                .into_iter().find(|c| c.id == id)
+                .ok_or_else(|| format!("连接不存在: {id}"))?;
+            if let Some(db) = database.as_deref().filter(|s| !s.is_empty()) {
+                cfg.database = Some(db.to_string());
+            }
+            let result = export_xlsx_duckdb_via_temp_csv(
+                &id, &cfg, &sql, &duck_pool, &registry, &task_id, &mut xw, &cancel, &app, &event, start
+            ).await;
+            cancel_map.lock().unwrap().remove(&task_id);
+            return finish_xlsx_export_result(result, xw, &file_path, &app, &event, start);
+        }
+        if matches!(conn_type, Some(ConnType::Oracle)) {
+            let mut cfg = storage.lock().unwrap().load()?
+                .into_iter().find(|c| c.id == id)
+                .ok_or_else(|| format!("连接不存在: {id}"))?;
+            if let Some(db) = database.as_deref().filter(|s| !s.is_empty()) {
+                cfg.database = Some(db.to_string());
+            }
+            let result = export_xlsx_oracle(cfg, &sql, &registry, &mut xw, &cancel, &app, &event, start).await;
+            cancel_map.lock().unwrap().remove(&task_id);
+            return finish_xlsx_export_result(result, xw, &file_path, &app, &event, start);
+        }
+
+        let mut conn = match open_conn(&id, &storage, database.as_deref()).await {
+            Ok(c) => c,
+            Err(e) => {
+                cancel_map.lock().unwrap().remove(&task_id);
+                std::fs::remove_file(&file_path).ok();
+                return Err(e);
+            }
+        };
+
+        let result = match &mut conn {
+            DbConn::MySql(c, _t) => export_xlsx_mysql(c, &sql, &mut xw, &cancel, &app, &event, start).await,
+            DbConn::Pg(c, _t)    => export_xlsx_pg(c, &sql, &mut xw, &cancel, &app, &event, start).await,
+            DbConn::Sqlite(c)    => export_xlsx_sqlite(c, &sql, &mut xw, &cancel, &app, &event, start).await,
+        };
+
+        cancel_map.lock().unwrap().remove(&task_id);
+
+        match result {
+            Ok(rows) => {
+                if let Err(e) = xw.finish() {
+                    std::fs::remove_file(&file_path).ok();
+                    let ms = start.elapsed().as_millis() as u64;
+                    let _ = app.emit(&event, ExportProgressEvt {
+                        rows: 0, elapsed_ms: ms, rows_per_sec: 0,
+                        file_bytes: 0, done: true, cancelled: false, error: Some(e.clone()),
+                    });
+                    return Err(e);
+                }
+                let file_bytes = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+                let ms = start.elapsed().as_millis() as u64;
+                let _ = app.emit(&event, ExportProgressEvt {
+                    rows, elapsed_ms: ms,
+                    rows_per_sec: if ms > 0 { rows * 1000 / ms } else { 0 },
+                    file_bytes, done: true, cancelled: false, error: None,
+                });
+                return Ok(rows);
+            }
+            Err(e) if e == "已取消" => {
+                drop(xw);
+                std::fs::remove_file(&file_path).ok();
+                let ms = start.elapsed().as_millis() as u64;
+                let _ = app.emit(&event, ExportProgressEvt {
+                    rows: 0, elapsed_ms: ms, rows_per_sec: 0,
+                    file_bytes: 0, done: true, cancelled: true, error: None,
+                });
+                return Err(e);
+            }
+            Err(e) => {
+                drop(xw);
+                std::fs::remove_file(&file_path).ok();
+                let ms = start.elapsed().as_millis() as u64;
+                let _ = app.emit(&event, ExportProgressEvt {
+                    rows: 0, elapsed_ms: ms, rows_per_sec: 0,
+                    file_bytes: 0, done: true, cancelled: false, error: Some(e.clone()),
+                });
+                return Err(e);
+            }
+        }
+    }
 
     // 建立文件（出错时不留残留）
     let file = match std::fs::File::create(&file_path) {
@@ -400,7 +1591,7 @@ pub async fn db_stream_export(
         "gbk" => Enc::Gbk,
         _     => Enc::Utf8,
     };
-    let mut ew = EncodedWriter { inner: BufWriter::new(file), encoding: enc };
+    let mut ew = EncodedWriter { inner: BufWriter::with_capacity(1024 * 1024, file), encoding: enc };
 
     // UTF-8 BOM（utf8bom 编码模式）
     if encoding == "utf8bom" {
@@ -422,12 +1613,67 @@ pub async fn db_stream_export(
     };
 
     // 选择格式
-    let fmt: RowWriter = match format.as_str() {
+    let mut fmt: RowWriter = match format.as_str() {
         "tsv"  => RowWriter::Csv { sep: b'\t' },
         "jsonl"=> RowWriter::Jsonl,
+        "json" => RowWriter::Json { wrote_any: false },
+        "md"   => RowWriter::Md,
         "sql"  => RowWriter::Sql { table: &insert_table, quote: ident_quote },
         _      => RowWriter::Csv { sep: b',' },  // csv (default)
     };
+
+    let conn_type = storage.lock().unwrap().load().ok()
+        .and_then(|cfgs| cfgs.into_iter().find(|c| c.id == id).map(|c| c.conn_type));
+    if matches!(conn_type, Some(ConnType::SqlServer)) {
+        let mut cfg = storage.lock().unwrap().load()?
+            .into_iter().find(|c| c.id == id)
+            .ok_or_else(|| format!("连接不存在: {id}"))?;
+        if let Some(db) = database.as_deref().filter(|s| !s.is_empty()) {
+            cfg.database = Some(db.to_string());
+        }
+        let result = export_sqlserver(&id, &cfg, &sql, &ss_pool, &mut ew, &mut fmt, &cancel, &app, &event, start).await;
+        cancel_map.lock().unwrap().remove(&task_id);
+        return finish_text_export_result(result, &mut ew, &mut fmt, &file_path, &app, &event, start);
+    }
+    if matches!(conn_type, Some(ConnType::ClickHouse)) {
+        let mut cfg = storage.lock().unwrap().load()?
+            .into_iter().find(|c| c.id == id)
+            .ok_or_else(|| format!("连接不存在: {id}"))?;
+        if let Some(db) = database.as_deref().filter(|s| !s.is_empty()) {
+            cfg.database = Some(db.to_string());
+        }
+        let result = if crate::commands::clickhouse_tcp::use_tcp(&cfg) {
+            export_clickhouse_tcp(&cfg, &sql, &mut ew, &mut fmt, &cancel, &app, &event, start).await
+        } else {
+            export_clickhouse_http(&cfg, &sql, &mut ew, &mut fmt, &cancel, &app, &event, start).await
+        };
+        cancel_map.lock().unwrap().remove(&task_id);
+        return finish_text_export_result(result, &mut ew, &mut fmt, &file_path, &app, &event, start);
+    }
+    if matches!(conn_type, Some(ConnType::Duckdb)) {
+        let mut cfg = storage.lock().unwrap().load()?
+            .into_iter().find(|c| c.id == id)
+            .ok_or_else(|| format!("连接不存在: {id}"))?;
+        if let Some(db) = database.as_deref().filter(|s| !s.is_empty()) {
+            cfg.database = Some(db.to_string());
+        }
+        let result = export_duckdb_via_temp_csv(
+            &id, &cfg, &sql, &duck_pool, &registry, &task_id, &mut ew, &mut fmt, &cancel, &app, &event, start
+        ).await;
+        cancel_map.lock().unwrap().remove(&task_id);
+        return finish_text_export_result(result, &mut ew, &mut fmt, &file_path, &app, &event, start);
+    }
+    if matches!(conn_type, Some(ConnType::Oracle)) {
+        let mut cfg = storage.lock().unwrap().load()?
+            .into_iter().find(|c| c.id == id)
+            .ok_or_else(|| format!("连接不存在: {id}"))?;
+        if let Some(db) = database.as_deref().filter(|s| !s.is_empty()) {
+            cfg.database = Some(db.to_string());
+        }
+        let result = export_oracle(cfg, &sql, &registry, &mut ew, &mut fmt, &cancel, &app, &event, start).await;
+        cancel_map.lock().unwrap().remove(&task_id);
+        return finish_text_export_result(result, &mut ew, &mut fmt, &file_path, &app, &event, start);
+    }
 
     // 建立 DB 连接
     let mut conn = match open_conn(&id, &storage, database.as_deref()).await {
@@ -441,15 +1687,20 @@ pub async fn db_stream_export(
 
     // 流式导出
     let result = match &mut conn {
-        DbConn::MySql(c, _t) => export_mysql(c, &sql, &mut ew, &fmt, &cancel, &app, &event, start).await,
-        DbConn::Pg(c, _t)    => export_pg(c, &sql, &mut ew, &fmt, &cancel, &app, &event, start).await,
-        DbConn::Sqlite(c)    => export_sqlite(c, &sql, &mut ew, &fmt, &cancel, &app, &event, start).await,
+        DbConn::MySql(c, _t) => export_mysql(c, &sql, &mut ew, &mut fmt, &cancel, &app, &event, start).await,
+        DbConn::Pg(c, _t)    => export_pg(c, &sql, &mut ew, &mut fmt, &cancel, &app, &event, start).await,
+        DbConn::Sqlite(c)    => export_sqlite(c, &sql, &mut ew, &mut fmt, &cancel, &app, &event, start).await,
     };
 
     cancel_map.lock().unwrap().remove(&task_id);
 
     match result {
         Ok(rows) => {
+            let mut tail = String::new();
+            fmt.write_finish_to(&mut tail);
+            if !tail.is_empty() {
+                let _ = ew.write_str(&tail);
+            }
             let _ = ew.flush();
             let file_bytes = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
             let ms = start.elapsed().as_millis() as u64;
@@ -511,7 +1762,7 @@ pub async fn read_file_first_line(path: String) -> Result<String, String> {
 pub async fn reveal_in_folder(file_path: String) -> Result<(), String> {
     super::db_extra::validate_path(&file_path)?;
     let path = std::path::Path::new(&file_path);
-    let dir = path.parent().unwrap_or(path);
+    let dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
     #[cfg(target_os = "macos")]
     std::process::Command::new("open").arg(dir).spawn().map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]

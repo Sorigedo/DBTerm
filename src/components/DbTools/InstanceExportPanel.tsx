@@ -3,6 +3,8 @@
 import { useState, useEffect, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { X, HardDrive, AlertCircle, CheckCircle2, XCircle, Database, FolderOpen, FolderInput } from 'lucide-react'
+import { registerExportCancelHandler, unregisterExportCancelHandler, useExportTaskStore } from '../../stores/exportTaskStore'
+import { toast } from '../../stores/toastStore'
 
 interface Props {
   connectionId: string
@@ -148,7 +150,15 @@ export default function InstanceExportPanel({ connectionId, onClose }: Props) {
     if (!outputDir) { setError('请选择导出目录'); return }
 
     const sep = outputDir.includes('\\') ? '\\' : '/'
-    const taskId = `instbackup_${Date.now()}`
+    const taskId = useExportTaskStore.getState().addTask({
+      connId: connectionId,
+      label: `实例导出 · ${picked.length} 个数据库`,
+      filePath: outputDir,
+      cancelable: true,
+      progressValue: 0,
+      progressTotal: picked.length,
+      message: '正在准备导出…',
+    })
     taskIdRef.current = taskId
     cancelledRef.current = false
 
@@ -158,57 +168,116 @@ export default function InstanceExportPanel({ connectionId, onClose }: Props) {
     setResults([])
     setFinished(false)
     setDbIndex(0)
+    setCurrentDb(picked[0] ?? '')
     setTableProg(null)
 
     const acc: DbResult[] = []
     try {
       const { invoke } = await import('@tauri-apps/api/core')
       const { listen } = await import('@tauri-apps/api/event')
+      let currentIndex = 0
+      let currentSchema = ''
+      let completedRows = 0
+      const unlisten = await listen<BackupProgressEvent>(`backup_progress_${taskId}`, ev => {
+        const p = ev.payload
+        const tableFraction = p.totalTables > 0 ? p.doneTables / p.totalTables : 0
+        useExportTaskStore.getState().updateTask(taskId, {
+          progressRows: completedRows + p.currentRows,
+          progressValue: currentIndex + tableFraction,
+          progressTotal: picked.length,
+          message: `${currentSchema} · ${p.currentTable || '准备中'} · ${p.doneTables} / ${p.totalTables} 表`,
+        })
+      })
+      registerExportCancelHandler(taskId, async () => {
+        cancelledRef.current = true
+        await invoke('db_cancel_export', { taskId }).catch(() => {})
+      })
+      onClose()
 
-      const unlisten = await listen<BackupProgressEvent>('backup_progress', ev => setTableProg(ev.payload))
-      unlistenRef.current = unlisten
-
-      for (let i = 0; i < picked.length; i++) {
-        if (cancelledRef.current) break
-        const schema = picked[i]
-        setCurrentDb(schema)
-        setTableProg(null)
-
-        try {
-          const tables = await invoke<TableInfo[]>('list_tables', { id: connectionId, schema })
-          let routines: RoutineInfo[] = []
-          try { routines = await invoke<RoutineInfo[]>('list_routines', { id: connectionId, schema }) } catch { /* 部分类型不支持 */ }
-
-          const path = `${outputDir}${sep}${schema}.sql`
-          const res = await invoke<BackupResult>('db_logical_backup', {
-            id: connectionId,
-            schema,
-            tables: incTypes.has('t') ? tables.filter(t => !t.isView).map(t => t.name) : [],
-            views:  incTypes.has('v') ? tables.filter(t => t.isView).map(t => t.name) : [],
-            funcs:  incTypes.has('f') ? routines.filter(r => r.routineType === 'FUNCTION').map(r => r.name) : [],
-            procs:  incTypes.has('p') ? routines.filter(r => r.routineType === 'PROCEDURE').map(r => r.name) : [],
-            path,
-            content,
-            createDb: true,
-            taskId,
+      void (async () => {
+        for (let i = 0; i < picked.length; i++) {
+          if (cancelledRef.current) break
+          const schema = picked[i]
+          currentIndex = i
+          currentSchema = schema
+          useExportTaskStore.getState().updateTask(taskId, {
+            progressValue: i,
+            message: `${schema} · 正在读取对象列表…`,
           })
-          acc.push({ schema, ok: true, rows: res.totalRows, tables: res.tablesDone, bytes: res.fileSize })
-        } catch (e) {
-          const msg = String(e)
-          if (msg.includes('取消')) { cancelledRef.current = true; acc.push({ schema, ok: false, error: '已取消' }); break }
-          acc.push({ schema, ok: false, error: msg })
+
+          try {
+            const tables = await invoke<TableInfo[]>('list_tables', { id: connectionId, schema })
+            let routines: RoutineInfo[] = []
+            try { routines = await invoke<RoutineInfo[]>('list_routines', { id: connectionId, schema }) } catch { /* 部分类型不支持 */ }
+
+            const path = `${outputDir}${sep}${schema}.sql`
+            const res = await invoke<BackupResult>('db_logical_backup', {
+              id: connectionId,
+              schema,
+              tables: incTypes.has('t') ? tables.filter(t => !t.isView).map(t => t.name) : [],
+              views:  incTypes.has('v') ? tables.filter(t => t.isView).map(t => t.name) : [],
+              funcs:  incTypes.has('f') ? routines.filter(r => r.routineType === 'FUNCTION').map(r => r.name) : [],
+              procs:  incTypes.has('p') ? routines.filter(r => r.routineType === 'PROCEDURE').map(r => r.name) : [],
+              path,
+              content,
+              createDb: true,
+              taskId,
+            })
+            completedRows += res.totalRows
+            acc.push({ schema, ok: true, rows: res.totalRows, tables: res.tablesDone, bytes: res.fileSize })
+          } catch (e) {
+            const msg = String(e)
+            if (msg.includes('取消')) {
+              cancelledRef.current = true
+              acc.push({ schema, ok: false, error: '已取消' })
+              break
+            }
+            acc.push({ schema, ok: false, error: msg })
+          }
+          useExportTaskStore.getState().updateTask(taskId, {
+            progressRows: completedRows,
+            progressValue: i + 1,
+            message: `已完成 ${i + 1} / ${picked.length} 个数据库`,
+          })
         }
-        setResults([...acc])
-        setDbIndex(i + 1)
-      }
+
+        const failed = acc.filter(result => !result.ok && result.error !== '已取消')
+        const current = useExportTaskStore.getState().tasks.find(task => task.id === taskId)
+        if (cancelledRef.current || current?.status === 'cancelled') {
+          useExportTaskStore.getState().updateTask(taskId, {
+            status: 'cancelled', message: `已取消 · 完成 ${acc.filter(result => result.ok).length} / ${picked.length} 个数据库`, finishedAt: Date.now(),
+          })
+        } else if (failed.length > 0) {
+          const detail = failed.map(result => `${result.schema}: ${result.error}`).join('\n')
+          useExportTaskStore.getState().updateTask(taskId, {
+            status: 'error', progressRows: completedRows, message: `完成 ${acc.length - failed.length} 个，失败 ${failed.length} 个`, error: detail, finishedAt: Date.now(),
+          })
+          toast.error(`实例导出完成，但有 ${failed.length} 个数据库失败`)
+        } else {
+          useExportTaskStore.getState().updateTask(taskId, {
+            status: 'done', progressRows: completedRows, progressValue: picked.length,
+            message: `导出完成 · ${picked.length} 个数据库 · ${completedRows.toLocaleString()} 行`, finishedAt: Date.now(),
+          })
+          toast.success(`实例导出完成：${picked.length} 个数据库`)
+        }
+      })().catch(e => {
+        const msg = String(e)
+        useExportTaskStore.getState().updateTask(taskId, {
+          status: 'error', message: '实例导出失败', error: msg, finishedAt: Date.now(),
+        })
+        toast.error(`实例导出失败：${msg}`)
+      }).finally(() => {
+        unregisterExportCancelHandler(taskId)
+        unlisten()
+      })
     } catch (e) {
-      setError(String(e))
-    } finally {
-      if (unlistenRef.current) { unlistenRef.current(); unlistenRef.current = null }
-      setResults([...acc])
+      const msg = String(e)
+      useExportTaskStore.getState().updateTask(taskId, {
+        status: 'error', message: '无法创建导出任务', error: msg, finishedAt: Date.now(),
+      })
+      unregisterExportCancelHandler(taskId)
+      setError(msg)
       setExporting(false)
-      setCancelling(false)
-      setFinished(true)
     }
   }
 

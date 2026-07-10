@@ -3941,7 +3941,7 @@ body.column-dragging .table-peek__table th:hover { background: var(--surface-2);
 }
 .sql-var-dialog__row {
   display: grid;
-  grid-template-columns: 150px minmax(0, 1fr) auto;
+  grid-template-columns: 150px minmax(0, 1fr) 96px;
   align-items: center;
   gap: 10px;
   color: var(--text);
@@ -3954,18 +3954,18 @@ body.column-dragging .table-peek__table th:hover { background: var(--surface-2);
   font-family: var(--font-mono);
   color: var(--text-muted);
 }
-.sql-var-dialog__mode {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--text-muted);
-  white-space: nowrap;
-  user-select: none;
+.sql-var-dialog__mode-select {
+  height: 32px;
+  min-width: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
 }
-.sql-var-dialog__mode input {
-  width: 14px;
-  height: 14px;
-  accent-color: var(--accent);
+.sql-var-dialog__mode-select:focus {
+  border-color: var(--accent);
 }
 .sql-var-dialog__preview-head {
   margin-bottom: -6px;
@@ -8709,4 +8709,128 @@ html[data-color-scheme="dark"] {
   --sql-number: #b07848;
   --sql-func: #5e88c4;
   --sql-type: #3898a8;
+}
+/* ── 全局导出任务浮层：不遮挡工作区，可收起 ─────────────────────────────── */
+.export-dock {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 9500;
+  width: min(380px, calc(100vw - 24px));
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px color-mix(in srgb, var(--text) 24%, transparent);
+  overflow: hidden;
+  animation: slideUp 0.18s ease-out;
+}
+.export-dock__head {
+  width: 100%;
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  color: var(--text-bright);
+  background: var(--surface);
+  border: 0;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+}
+.export-dock__head:hover { background: var(--surface-hover); }
+.export-dock__head-spacer { flex: 1; }
+.export-dock__running {
+  min-width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 6px;
+  border-radius: 10px;
+  color: var(--bg);
+  background: var(--accent);
+  font-size: 10px;
+}
+.export-dock__body { border-top: 1px solid var(--border-subtle); }
+.export-dock__list { max-height: min(360px, 52vh); overflow-y: auto; }
+.export-dock__task { padding: 10px 12px; border-bottom: 1px solid var(--border-subtle); }
+.export-dock__task-main { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.export-dock__task-text { flex: 1; min-width: 0; }
+.export-dock__task-label {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.export-dock__task-meta {
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.export-dock__status-running { color: var(--accent); flex-shrink: 0; }
+.export-dock__status-done { color: var(--success); flex-shrink: 0; }
+.export-dock__status-error { color: var(--error); flex-shrink: 0; }
+.export-dock__status-cancelled { color: var(--text-muted); flex-shrink: 0; }
+.export-dock__icon-btn {
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--text-muted);
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+}
+.export-dock__icon-btn:hover { color: var(--text); background: var(--surface-hover); }
+.export-dock__progress {
+  height: 4px;
+  margin-top: 8px;
+  overflow: hidden;
+  background: var(--surface-2);
+  border-radius: 2px;
+}
+.export-dock__progress-fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.25s ease;
+}
+.export-dock__progress.is-indeterminate .export-dock__progress-fill {
+  width: 32%;
+  animation: exportDockProgress 1.25s ease-in-out infinite;
+}
+.export-dock__error {
+  margin-top: 6px;
+  overflow: hidden;
+  color: var(--error);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.export-dock__clear {
+  width: 100%;
+  padding: 7px 12px;
+  color: var(--text-muted);
+  background: var(--surface-2);
+  border: 0;
+  font-size: 11px;
+}
+.export-dock__clear:hover { color: var(--text); background: var(--surface-hover); }
+@keyframes exportDockProgress {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(330%); }
+}
+@media (max-width: 600px) {
+  .export-dock { right: 12px; bottom: 12px; }
+  .export-dock__list { max-height: 42vh; }
 }

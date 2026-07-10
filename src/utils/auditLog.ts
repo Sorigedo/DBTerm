@@ -1,3 +1,5 @@
+import type { ConnType } from '../types'
+
 const STORAGE_KEY = 'dbterm_audit_log'
 const MAX_ENTRIES = 2000
 
@@ -6,6 +8,7 @@ export interface AuditEntry {
   ts: number
   connId: string
   connName: string
+  connType?: ConnType
   sql: string
   rowsAffected: number
   success: boolean

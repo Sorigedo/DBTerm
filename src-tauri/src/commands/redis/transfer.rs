@@ -26,6 +26,7 @@ pub async fn redis_export_keys(
     pattern: String,
     db: Option<u8>,
     path: String,
+    task_id: Option<String>,
     app: tauri::AppHandle,
     pool: State<'_, RedisPool>,
     storage: State<'_, StorageState>,
@@ -61,7 +62,12 @@ pub async fn redis_export_keys(
             count += 1;
         }
         cursor = next;
-        let _ = app.emit("redis_export_progress", serde_json::json!({ "count": count }));
+        let payload = serde_json::json!({ "count": count });
+        let _ = app.emit("redis_export_progress", payload.clone());
+        if let Some(ref task_id) = task_id {
+            let event = format!("redis_export_progress_{task_id}");
+            let _ = app.emit(&event, payload);
+        }
         if cursor == 0 { break; }
     }
 

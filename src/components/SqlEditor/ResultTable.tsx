@@ -14,10 +14,10 @@ import type { DbResultDefaultView } from '../../stores/settingsStore'
 import { useWheelScroll } from '../../utils/wheelScroll'
 import { displayShortcutStr, SHORTCUT_DEFS } from '../../utils/shortcuts'
 import { toast } from '../../stores/toastStore'
-import { notifyExportStart, notifyExported, notifyExportError } from '../../stores/exportDoneStore'
 import { useAppStore } from '../../stores/appStore'
 import { requireProdConfirm } from '../../stores/confirmStore'
 import { formatDuration } from '../../utils/formatDuration'
+import { queueBackgroundExport } from '../../utils/exportTasks'
 
 interface QueryResult {
   columns: string[]
@@ -945,71 +945,64 @@ export default function ResultTable({
   const exportResult = useCallback(async (format: 'csv' | 'json' | 'sql' | 'md' | 'xlsx') => {
     if (!result || result.rows.length === 0) return
     const rows = getExportRows()
-
-    if (format === 'xlsx') {
-      let path: string | null = null
-      try {
-        const { save } = await import('@tauri-apps/plugin-dialog')
-        path = await save({ defaultPath: '查询结果.xlsx', filters: [{ name: 'XLSX', extensions: ['xlsx'] }] })
-        if (!path) return
-        notifyExportStart()
-        const xlsx = await import('xlsx')
-        const wsData = [result.columns, ...rows.map((r) => r.map((v) => v ?? ''))]
-        const ws = xlsx.utils.aoa_to_sheet(wsData)
-        const wb = xlsx.utils.book_new()
-        xlsx.utils.book_append_sheet(wb, ws, '查询结果')
-        // xlsx.write(type:'array') 返回 ArrayBuffer，须包成 Uint8Array（否则 Array.from 得空数组 → 文件空）
-        const buf = new Uint8Array(xlsx.write(wb, { type: 'array', bookType: 'xlsx' }) as ArrayBuffer)
-        const { invoke } = await import('@tauri-apps/api/core')
-        await invoke('write_local_bytes', { path, bytes: Array.from(buf) })
-        notifyExported(path, `已导出 ${rows.length} 行`)
-      } catch (e) {
-        notifyExportError('导出失败：' + String(e))
-      }
-      return
-    }
-
-    let content = ''
-    if (format === 'csv') {
-      const head = result.columns.map((c) => csvEscape(c)).join(',')
-      const body = rows.map((r) => r.map(csvEscape).join(',')).join('\n')
-      content = `${head}\n${body}\n`
-    } else if (format === 'json') {
-      const objs = rows.map((r) =>
-        Object.fromEntries(result.columns.map((c, i) => [c, r[i]]))
-      )
-      content = JSON.stringify(objs, null, 2)
-    } else if (format === 'sql') {
-      const cols = result.columns.join(', ')
-      const lines = rows.map(
-        (r) => `INSERT INTO your_table (${cols}) VALUES (${r.map(sqlLiteral).join(', ')});`
-      )
-      content = `-- 共 ${rows.length} 行，请将 your_table 替换为实际表名\n${lines.join('\n')}\n`
-    } else if (format === 'md') {
-      const header = `| ${result.columns.join(' | ')} |`
-      const divider = `| ${result.columns.map((c) => '-'.repeat(Math.max(c.length, 3))).join(' | ')} |`
-      const body = rows.map(
-        (r) => `| ${r.map((v) => (v ?? 'NULL').replace(/\|/g, '\\|')).join(' | ')} |`
-      )
-      content = [header, divider, ...body].join('\n') + '\n'
-    }
-
     try {
       const { save } = await import('@tauri-apps/plugin-dialog')
-      const ext = format
       const path = await save({
-        defaultPath: `查询结果.${ext}`,
-        filters: [{ name: format.toUpperCase(), extensions: [ext] }],
+        defaultPath: `查询结果.${format}`,
+        filters: [{ name: format.toUpperCase(), extensions: [format] }],
       })
       if (!path) return
-      notifyExportStart()
-      const { invoke } = await import('@tauri-apps/api/core')
-      await invoke('write_local_file', { path, content })
-      notifyExported(path, `已导出 ${rows.length} 行`)
+      queueBackgroundExport({
+        connectionId: connectionId ?? 'query-result',
+        label: `当前查询结果 · ${format.toUpperCase()}`,
+        filePath: path,
+        totalRows: rows.length,
+        message: format === 'xlsx' ? '正在生成 Excel 文件…' : '正在生成导出文件…',
+        run: async () => {
+          const { invoke } = await import('@tauri-apps/api/core')
+          if (format === 'xlsx') {
+            const xlsx = await import('xlsx')
+            const wsData = [result.columns, ...rows.map(row => row.map(value => value ?? ''))]
+            const ws = xlsx.utils.aoa_to_sheet(wsData)
+            const wb = xlsx.utils.book_new()
+            xlsx.utils.book_append_sheet(wb, ws, '查询结果')
+            const buf = new Uint8Array(xlsx.write(wb, { type: 'array', bookType: 'xlsx' }) as ArrayBuffer)
+            await invoke('write_local_bytes', { path, bytes: Array.from(buf) })
+            return { fileBytes: buf.byteLength }
+          }
+
+          let content = ''
+          if (format === 'csv') {
+            const head = result.columns.map(column => csvEscape(column)).join(',')
+            const body = rows.map(row => row.map(csvEscape).join(',')).join('\n')
+            content = `${head}\n${body}\n`
+          } else if (format === 'json') {
+            const objs = rows.map(row => Object.fromEntries(result.columns.map((column, i) => [column, row[i]])))
+            content = JSON.stringify(objs, null, 2)
+          } else if (format === 'sql') {
+            const cols = result.columns.join(', ')
+            const lines = rows.map(row => `INSERT INTO your_table (${cols}) VALUES (${row.map(sqlLiteral).join(', ')});`)
+            content = `-- 共 ${rows.length} 行，请将 your_table 替换为实际表名\n${lines.join('\n')}\n`
+          } else {
+            const header = `| ${result.columns.join(' | ')} |`
+            const divider = `| ${result.columns.map(column => '-'.repeat(Math.max(column.length, 3))).join(' | ')} |`
+            const body = rows.map(row => `| ${row.map(value => (value ?? 'NULL').replace(/\|/g, '\\|')).join(' | ')} |`)
+            content = [header, divider, ...body].join('\n') + '\n'
+          }
+          await invoke('write_local_file', { path, content })
+          return { fileBytes: new Blob([content]).size }
+        },
+        complete: info => ({
+          progressRows: rows.length,
+          fileBytes: info.fileBytes,
+          message: `导出完成 · ${rows.length.toLocaleString()} 行`,
+        }),
+        successMessage: `查询结果导出完成：${rows.length.toLocaleString()} 行`,
+      })
     } catch (e) {
-      notifyExportError('导出失败：' + String(e))
+      toast.error('创建导出任务失败：' + String(e))
     }
-  }, [result, getExportRows])
+  }, [result, getExportRows, connectionId])
 
   // ──────────────────────────────────────────────
   // 右键菜单处理

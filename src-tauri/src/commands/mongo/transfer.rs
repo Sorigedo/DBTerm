@@ -4,7 +4,7 @@ use bson::{doc, Bson, Document};
 use futures::TryStreamExt;
 use serde::Deserialize;
 use std::io::Write;
-use tauri::State;
+use tauri::{Emitter, State};
 
 use super::{MongoPool, load_conn, get_client};
 use crate::storage::StorageState;
@@ -46,6 +46,8 @@ pub async fn mongo_export_collection(
     projection_json: String,
     format: String,
     output_path: String,
+    task_id: Option<String>,
+    app: tauri::AppHandle,
     storage: State<'_, StorageState>,
     pool: State<'_, MongoPool>,
 ) -> Result<i64, String> {
@@ -79,6 +81,14 @@ pub async fn mongo_export_collection(
     let mut rows: Vec<Document> = Vec::new();
     while let Some(doc) = cursor.try_next().await.map_err(|e| format!("读取文档失败: {e}"))? {
         rows.push(doc);
+        if rows.len() == 1 || rows.len() % 500 == 0 {
+            if let Some(ref task_id) = task_id {
+                let event = format!("mongo_export_progress_{task_id}");
+                let _ = app.emit(&event, serde_json::json!({
+                    "rows": rows.len(), "current": &coll, "done": 0, "total": 1
+                }));
+            }
+        }
         if rows.len() as i64 >= MAX_ROWS { break; }
     }
 
@@ -153,6 +163,12 @@ pub async fn mongo_export_collection(
         }
     }
 
+    if let Some(ref task_id) = task_id {
+        let event = format!("mongo_export_progress_{task_id}");
+        let _ = app.emit(&event, serde_json::json!({
+            "rows": count, "current": &coll, "done": 1, "total": 1
+        }));
+    }
     Ok(count)
 }
 
@@ -385,6 +401,8 @@ pub async fn mongo_logical_backup(
     db: String,
     colls: Vec<String>,
     output_dir: String,
+    task_id: Option<String>,
+    app: tauri::AppHandle,
     storage: State<'_, StorageState>,
     pool: State<'_, MongoPool>,
 ) -> Result<MongoBackupResult, String> {
@@ -401,7 +419,7 @@ pub async fn mongo_logical_backup(
     let dir = output_dir.trim_end_matches(['/', '\\']);
     let mut total = 0i64;
     let mut files = Vec::new();
-    for cn in &coll_names {
+    for (index, cn) in coll_names.iter().enumerate() {
         let collection = database.collection::<Document>(cn);
         let mut cursor = collection.find(doc! {}).await.map_err(|e| format!("查询 {cn} 失败: {e}"))?;
         // 集合名可含 / 或 \（MongoDB 允许），直接拼路径会穿越目录；替换分隔符生成安全文件名
@@ -413,9 +431,23 @@ pub async fn mongo_logical_backup(
         while let Some(d) = cursor.try_next().await.map_err(|e| format!("读取 {cn} 失败: {e}"))? {
             d.to_writer(&mut file).map_err(|e| format!("写入 BSON 失败: {e}"))?;
             n += 1;
+            if n == 1 || n % 500 == 0 {
+                if let Some(ref task_id) = task_id {
+                    let event = format!("mongo_export_progress_{task_id}");
+                    let _ = app.emit(&event, serde_json::json!({
+                        "rows": total + n, "current": cn, "done": index, "total": coll_names.len()
+                    }));
+                }
+            }
         }
         total += n;
         files.push(format!("{cn}.bson（{n} 文档）"));
+        if let Some(ref task_id) = task_id {
+            let event = format!("mongo_export_progress_{task_id}");
+            let _ = app.emit(&event, serde_json::json!({
+                "rows": total, "current": cn, "done": index + 1, "total": coll_names.len()
+            }));
+        }
     }
 
     Ok(MongoBackupResult { collections: coll_names.len(), total_docs: total, output_dir: dir.to_string(), files })
@@ -519,6 +551,8 @@ pub async fn mongo_export_collection_masked(
     format: String,
     output_path: String,
     masking_rules: Vec<MongoMaskRule>,
+    task_id: Option<String>,
+    app: tauri::AppHandle,
     storage: State<'_, StorageState>,
     pool: State<'_, MongoPool>,
 ) -> Result<i64, String> {
@@ -551,6 +585,14 @@ pub async fn mongo_export_collection_masked(
     while let Some(mut doc) = cursor.try_next().await.map_err(|e| format!("读取文档失败: {e}"))? {
         apply_mask_doc(&mut doc, &masking_rules);
         rows.push(doc);
+        if rows.len() == 1 || rows.len() % 500 == 0 {
+            if let Some(ref task_id) = task_id {
+                let event = format!("mongo_export_progress_{task_id}");
+                let _ = app.emit(&event, serde_json::json!({
+                    "rows": rows.len(), "current": &coll, "done": 0, "total": 1
+                }));
+            }
+        }
         if rows.len() as i64 >= MAX_ROWS { break; }
     }
     let count = rows.len() as i64;
@@ -578,6 +620,12 @@ pub async fn mongo_export_collection_masked(
         write!(file, "\n]\n").map_err(|e| format!("写文件失败: {e}"))?;
     }
 
+    if let Some(ref task_id) = task_id {
+        let event = format!("mongo_export_progress_{task_id}");
+        let _ = app.emit(&event, serde_json::json!({
+            "rows": count, "current": &coll, "done": 1, "total": 1
+        }));
+    }
     Ok(count)
 }
 

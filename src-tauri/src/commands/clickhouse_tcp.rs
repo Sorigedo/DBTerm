@@ -68,7 +68,7 @@ async fn do_connect(config: &ConnConfig, password: Option<&str>) -> Result<Clien
 }
 
 /// 带自动重连：第一次失败时驱逐旧连接再重试一次
-async fn connect(config: &ConnConfig, password: Option<&str>) -> Result<Client, String> {
+pub(crate) async fn connect(config: &ConnConfig, password: Option<&str>) -> Result<Client, String> {
     match get_or_connect(config, password).await {
         Ok(c) => Ok(c),
         Err(e) => {
@@ -97,7 +97,7 @@ fn validate_ident(s: &str, label: &str) -> Result<(), String> {
 }
 
 /// 把 ClickHouse 原生 Value 转为表格展示用的纯文本（NULL → None）
-fn value_to_string(v: &Value) -> Option<String> {
+pub(crate) fn value_to_string(v: &Value) -> Option<String> {
     Some(match v {
         Value::Null => return None,
         Value::Int8(x)   => x.to_string(),

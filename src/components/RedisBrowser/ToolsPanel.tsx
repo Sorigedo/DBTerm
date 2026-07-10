@@ -7,6 +7,8 @@ import { Download, Upload, Copy, Trash2, Clock, ShieldAlert, Eye } from 'lucide-
 import ConfirmDialog from '../shared/ConfirmDialog'
 import ConfigComparePanel from '../DbTools/ConfigComparePanel'
 import type { ConnType } from '../../types'
+import { queueBackgroundExport } from '../../utils/exportTasks'
+import { useExportTaskStore } from '../../stores/exportTaskStore'
 
 interface Props {
   connectionId: string
@@ -118,19 +120,31 @@ export default function ToolsPanel({
     setExporting(true)
     setExportCount(null)
     setError('')
-    let unlisten: (() => void) | undefined
-    try {
-      unlisten = await listen<{ count: number }>('redis_export_progress', ev => {
-        setExportCount(ev.payload.count)
-      })
-      const n = await invoke<number>('redis_export_keys', {
-        id: connectionId, pattern: exportPat, db, path,
-      })
-      setExportCount(n)
-      recordRedisAudit(connectionId, 'EXPORT', `pattern=${exportPat} path=${path} count=${n}`)
-      refreshAudit()
-    } catch (e) { setError(String(e)) }
-    finally { unlisten?.(); setExporting(false) }  // 异常路径也注销监听，避免泄漏
+    queueBackgroundExport({
+      connectionId,
+      label: `Redis DB${db} · Key 导出`,
+      filePath: path,
+      prepare: taskId => listen<{ count: number }>(`redis_export_progress_${taskId}`, ev => {
+        const count = ev.payload.count
+        setExportCount(count)
+        useExportTaskStore.getState().updateTask(taskId, {
+          progressRows: count,
+          message: `已导出 ${count.toLocaleString()} 个 Key`,
+        })
+      }),
+      run: taskId => invoke<number>('redis_export_keys', {
+        id: connectionId, pattern: exportPat, db, path, taskId,
+      }),
+      complete: count => {
+        setExportCount(count)
+        recordRedisAudit(connectionId, 'EXPORT', `pattern=${exportPat} path=${path} count=${count}`)
+        refreshAudit()
+        return { progressRows: count, message: `导出完成 · ${count.toLocaleString()} 个 Key` }
+      },
+      successMessage: count => `Redis 导出完成：${count.toLocaleString()} 个 Key`,
+      errorPrefix: 'Redis 导出失败',
+    })
+    setExporting(false)
   }
 
   const doImport = async () => {

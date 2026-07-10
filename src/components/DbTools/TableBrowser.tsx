@@ -20,6 +20,7 @@ import { displayShortcutStr, SHORTCUT_DEFS } from '../../utils/shortcuts'
 import { useShortcuts } from '../../utils/useShortcuts'
 import { useWheelScroll } from '../../utils/wheelScroll'
 import { isMysqlFamily, supportsMyMaintenance, supportsOptimizeTable, checkTableSql, isSqlite, qid, tableRef as dialectTableRef, buildIndexSql } from '../../utils/sqlDialect'
+import { queueTableExport } from '../../utils/exportTasks'
 
 interface Props {
   connectionId: string
@@ -509,15 +510,18 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
         filters: [{ name: structure ? 'SQL' : format.toUpperCase(), extensions: [ext] }],
       })
       if (!path) return
-      const { invoke } = await import('@tauri-apps/api/core')
-      const n = await invoke<number>('db_export_table', {
-        id: connectionId, schema, table, format: structure ? 'sql' : format, whereClause: null, path, structure: structure ?? null,
+      await queueTableExport({
+        connectionId,
+        schema,
+        table,
+        format,
+        formatLabel: format.toUpperCase(),
+        path,
+        structure,
       })
-      if (structure === 'only')      toast.exported(path, '已导出表结构')
-      else if (structure === 'with') toast.exported(path, `已导出表结构与 ${n} 行数据`)
-      else                           toast.exported(path, `已导出 ${n} 行到 ${format.toUpperCase()} 文件`)
+      toast.info('导出已转入后台，可在右下角查看进度')
     } catch (e) {
-      if (String(e)) toast.error(`导出失败：${String(e)}`)
+      if (String(e)) toast.error(`创建导出任务失败：${String(e)}`)
     }
   }
 

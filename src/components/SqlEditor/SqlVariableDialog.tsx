@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Braces, X } from 'lucide-react'
-import { applySqlVariables, type SqlVariableMode } from './sqlVariables'
+import type { ConnType } from '../../types'
+import { applySqlVariables, inferSqlVariableMode, type SqlVariableMode } from './sqlVariables'
 
 export interface SqlVariable {
   name: string
@@ -12,17 +13,20 @@ export interface SqlVariable {
 interface Props {
   sql: string
   variables: SqlVariable[]
+  connType: ConnType
   onCancel: () => void
   onRun: (values: Record<string, string>, modes?: Record<string, SqlVariableMode>) => void
 }
 
-export default function SqlVariableDialog({ sql, variables, onCancel, onRun }: Props) {
+export default function SqlVariableDialog({ sql, variables, connType, onCancel, onRun }: Props) {
   const names = useMemo(() => Array.from(new Set(variables.map(v => v.name))), [variables])
   const [values, setValues] = useState<Record<string, string>>(() => Object.fromEntries(names.map(n => [n, ''])))
-  const [modes, setModes] = useState<Record<string, SqlVariableMode>>({})
+  const [modes, setModes] = useState<Record<string, SqlVariableMode>>(
+    () => Object.fromEntries(names.map(n => [n, inferSqlVariableMode(n)])),
+  )
   const previewSql = useMemo(
-    () => applySqlVariables(sql, variables, values, modes),
-    [sql, variables, values, modes],
+    () => applySqlVariables(sql, variables, values, modes, connType),
+    [sql, variables, values, modes, connType],
   )
 
   const submit = () => onRun(values, modes)
@@ -37,7 +41,9 @@ export default function SqlVariableDialog({ sql, variables, onCancel, onRun }: P
           <button className="modal-close" onClick={onCancel}><X size={15} /></button>
         </div>
         <div className="modal-body sql-var-dialog__body">
-          <div className="sql-var-dialog__hint">这是 DBTerm 执行前替换，SQL 类数据库都可用，最终语法由当前数据库解释。在 SQL 中使用 <code>:name</code> 作为变量占位；默认按文本安全替换，输入 <code>null</code> 或 <code>NULL</code> 会作为 SQL NULL。需要数字、函数或完整 SQL 表达式时，打开「表达式」。</div>
+          <div className="sql-var-dialog__hint">
+            执行前替换变量，支持 <code>:name</code>、<code>#&#123;name&#125;</code>、<code>$&#123;name&#125;</code>、<code>@&#123;name&#125;</code>、<code>&#123;&#123;name&#125;&#125;</code>、<code>?&#123;name&#125;</code>。默认按文本加引号；日期选「日期」；数字、函数或完整 SQL 选「表达式」。
+          </div>
           <div className="sql-var-dialog__list">
             {names.map((name, i) => (
               <div className="sql-var-dialog__row" key={name}>
@@ -53,14 +59,16 @@ export default function SqlVariableDialog({ sql, variables, onCancel, onRun }: P
                     if (e.key === 'Escape') onCancel()
                   }}
                 />
-                <label className="sql-var-dialog__mode" title="开启后该值不加引号，按 SQL 表达式原样替换">
-                  <input
-                    type="checkbox"
-                    checked={(modes[name] ?? 'literal') === 'raw'}
-                    onChange={e => setModes(v => ({ ...v, [name]: e.target.checked ? 'raw' : 'literal' }))}
-                  />
-                  表达式
-                </label>
+                <select
+                  className="sql-var-dialog__mode-select"
+                  value={modes[name] ?? 'literal'}
+                  title="选择变量替换方式"
+                  onChange={e => setModes(v => ({ ...v, [name]: e.target.value as SqlVariableMode }))}
+                >
+                  <option value="literal">文本</option>
+                  <option value="date">日期</option>
+                  <option value="raw">表达式</option>
+                </select>
               </div>
             ))}
           </div>

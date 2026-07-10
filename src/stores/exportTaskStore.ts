@@ -10,7 +10,12 @@ export interface ExportTask {
   status: ExportTaskStatus
   progressRows: number
   totalRows?: number
+  progressValue?: number
+  progressTotal?: number
   speed?: number         // rows/s
+  fileBytes?: number
+  message?: string
+  cancelable?: boolean
   startedAt: number
   finishedAt?: number
   filePath?: string
@@ -18,15 +23,19 @@ export interface ExportTask {
   // AbortController 不放在 state 里（不可序列化），单独 Map 管理
 }
 
-// AbortController 存在 store 外部，避免 Zustand 状态含不可序列化对象
-const abortControllers = new Map<string, AbortController>()
+// 取消函数存在 store 外部，避免 Zustand 状态含不可序列化对象。
+const cancelHandlers = new Map<string, () => void | Promise<void>>()
 
-export function registerAbortController(id: string, ctrl: AbortController) {
-  abortControllers.set(id, ctrl)
+export function registerExportCancelHandler(id: string, handler: () => void | Promise<void>) {
+  cancelHandlers.set(id, handler)
 }
 
-export function getAbortController(id: string): AbortController | undefined {
-  return abortControllers.get(id)
+export function unregisterExportCancelHandler(id: string) {
+  cancelHandlers.delete(id)
+}
+
+export function getExportCancelHandler(id: string) {
+  return cancelHandlers.get(id)
 }
 
 interface ExportTaskState {
@@ -36,15 +45,18 @@ interface ExportTaskState {
   cancelTask: (id: string) => void
   removeTask: (id: string) => void
   clearDone: () => void
+  expanded: boolean
+  setExpanded: (expanded: boolean) => void
 }
 
 export const useExportTaskStore = create<ExportTaskState>((set) => ({
   tasks: [],
+  expanded: true,
 
   addTask: (t) => {
     const id = `exp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
     const task: ExportTask = { ...t, id, startedAt: Date.now(), progressRows: 0, status: 'running' }
-    set(s => ({ tasks: [task, ...s.tasks] }))
+    set(s => ({ tasks: [task, ...s.tasks], expanded: true }))
     return id
   },
 
@@ -53,8 +65,10 @@ export const useExportTaskStore = create<ExportTaskState>((set) => ({
   },
 
   cancelTask: (id) => {
-    abortControllers.get(id)?.abort()
-    abortControllers.delete(id)
+    const handler = cancelHandlers.get(id)
+    if (!handler) return
+    void handler()
+    cancelHandlers.delete(id)
     set(s => ({
       tasks: s.tasks.map(t => t.id === id
         ? { ...t, status: 'cancelled' as ExportTaskStatus, finishedAt: Date.now() }
@@ -63,14 +77,16 @@ export const useExportTaskStore = create<ExportTaskState>((set) => ({
   },
 
   removeTask: (id) => {
-    abortControllers.delete(id)
+    cancelHandlers.delete(id)
     set(s => ({ tasks: s.tasks.filter(t => t.id !== id) }))
   },
 
   clearDone: () => {
     set(s => {
-      s.tasks.filter(t => t.status !== 'running').forEach(t => abortControllers.delete(t.id))
+      s.tasks.filter(t => t.status !== 'running').forEach(t => cancelHandlers.delete(t.id))
       return { tasks: s.tasks.filter(t => t.status === 'running') }
     })
   },
+
+  setExpanded: (expanded) => set({ expanded }),
 }))

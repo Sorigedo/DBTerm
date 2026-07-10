@@ -2,6 +2,7 @@
 import { useState, useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { X, Database, Loader2, FolderOpen } from 'lucide-react'
+import { listenMongoExportProgress, queueBackgroundExport } from '../../utils/exportTasks'
 
 interface Props {
   connectionId: string
@@ -48,12 +49,26 @@ export default function MongoBackupPanel({ connectionId, db, onClose }: Props) {
     setRunning(true); setError(''); setResult(null)
     try {
       const { invoke } = await import('@tauri-apps/api/core')
-      const res = await invoke<BackupResult>('mongo_logical_backup', {
-        id: connectionId, db,
-        colls: selected.size ? [...selected] : [],
-        outputDir,
+      queueBackgroundExport({
+        connectionId,
+        label: `${db} · MongoDB 逻辑备份`,
+        filePath: outputDir,
+        prepare: listenMongoExportProgress,
+        run: taskId => invoke<BackupResult>('mongo_logical_backup', {
+          id: connectionId, db,
+          colls: selected.size ? [...selected] : [],
+          outputDir, taskId,
+        }),
+        complete: res => ({
+          progressRows: res.totalDocs,
+          progressValue: res.collections,
+          progressTotal: res.collections,
+          message: `备份完成 · ${res.collections} 个集合 · ${res.totalDocs.toLocaleString()} 个文档`,
+        }),
+        successMessage: res => `MongoDB 备份完成：${res.collections} 个集合`,
+        errorPrefix: 'MongoDB 备份失败',
       })
-      setResult(res)
+      onClose()
     } catch (e) { setError(String(e)) } finally { setRunning(false) }
   }
 

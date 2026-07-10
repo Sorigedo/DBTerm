@@ -2,7 +2,9 @@
 import { createPortal } from 'react-dom'
 import { X, Download, FolderOpen, CheckCircle, XCircle, Loader, AlertTriangle } from 'lucide-react'
 import SearchableSelect from '../DbTools/SearchableSelect'
-import { qid } from '../../utils/sqlDialect'
+import { formatDuration } from '../../utils/formatDuration'
+import { unregisterExportCancelHandler, useExportTaskStore } from '../../stores/exportTaskStore'
+import { registerStreamExportCancellation, updateExportTaskFromProgress } from '../../utils/exportTasks'
 
 interface Props {
   connectionId: string
@@ -17,10 +19,7 @@ type Format   = 'csv' | 'tsv' | 'jsonl' | 'sql' | 'json' | 'md' | 'xlsx' | 'parq
 type Encoding = 'utf8' | 'utf8bom' | 'gbk'
 type Phase    = 'config' | 'running' | 'done' | 'error' | 'cancelled'
 
-// 前端导出（执行整段查询后在前端编码写文件）：与结果区「下载」一致，支持 JSON 数组 / Markdown / Excel
-const FRONTEND_FORMATS: Format[] = ['json', 'md', 'xlsx']
-// 后端流式导出仅支持这些类型；其余类型（DuckDB/ClickHouse/SQLServer 等）所有格式都走前端 execute_query 路径
-const STREAMING_TYPES = ['mysql', 'mariadb', 'tidb', 'oceanBase', 'postgres', 'kingBase', 'openGauss', 'sqlite']
+const CANCELABLE_TYPES = new Set(['mysql', 'mariadb', 'tidb', 'oceanBase', 'postgres', 'kingBase', 'openGauss', 'sqlite', 'duckdb'])
 
 interface ProgressEvt {
   rows: number
@@ -30,6 +29,11 @@ interface ProgressEvt {
   done: boolean
   cancelled: boolean
   error: string | null
+}
+
+interface DuckCopyResult {
+  rows: number
+  fileBytes: number
 }
 
 const FORMAT_OPTS: { value: Format; label: string; ext: string; duckOnly?: boolean }[] = [
@@ -55,12 +59,6 @@ function fmtBytes(b: number): string {
   return `${(b / 1024 / 1024).toFixed(2)} MB`
 }
 
-function fmtTime(ms: number): string {
-  const s = Math.floor(ms / 1000)
-  const m = Math.floor(s / 60)
-  return `${m.toString().padStart(2, '0')}:${(s % 60).toString().padStart(2, '0')}`
-}
-
 // 从 SQL 中提取主表名（尽力而为）
 function guessTableName(sql: string): string {
   const m = /\bfrom\s+[`"']?(\w+)[`"']?/i.exec(sql)
@@ -74,7 +72,6 @@ function todayStr(): string {
 
 export default function ExportDialog({ connectionId, sqlText, schema, onClose, connType }: Props) {
   const isDuck = connType === 'duckdb'
-  const taskId = useRef(`exp_${Date.now()}`).current
 
   const [format,      setFormat]      = useState<Format>('csv')
   const [encoding,    setEncoding]    = useState<Encoding>('utf8')
@@ -86,6 +83,21 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
   const [finalRows,   setFinalRows]   = useState(0)
   const [errorMsg,    setErrorMsg]    = useState('')
   const [baseDir,     setBaseDir]     = useState('')   // 默认导出目录（下载目录），保证默认路径为绝对路径
+  const [elapsedMs,   setElapsedMs]   = useState(0)
+  const [cancelling,  setCancelling]  = useState(false)
+  const exportStartRef = useRef(0)
+  const exportTokenRef = useRef<string | null>(null)
+  const activeTaskIdRef = useRef<string | null>(null)
+  const cancelRequestedRef = useRef(false)
+
+  // 运行期间本地刷新耗时；后端流式进度没回来前也能看到已运行时间
+  useEffect(() => {
+    if (phase !== 'running') { setElapsedMs(0); return }
+    exportStartRef.current = Date.now()
+    setElapsedMs(0)
+    const timer = window.setInterval(() => setElapsedMs(Date.now() - exportStartRef.current), 100)
+    return () => window.clearInterval(timer)
+  }, [phase])
 
   // 取系统下载目录作为默认导出目录（绝对路径，避免后端「文件路径必须是绝对路径」）
   useEffect(() => {
@@ -137,116 +149,99 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
     if (!filePath.trim()) return
     setPhase('running')
     setProgress(null)
+    setErrorMsg('')
+    setCancelling(false)
+    cancelRequestedRef.current = false
+    const token = CANCELABLE_TYPES.has(connType ?? '') ? `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}` : null
+    exportTokenRef.current = token
+    const markedSql = token ? `/* dbterm-cancel:${token} */ ${sqlText.trim()}` : sqlText.trim()
+    const taskId = useExportTaskStore.getState().addTask({
+      connId: connectionId,
+      label: `${guessTableName(sqlText)} · ${FORMAT_OPTS.find(item => item.value === format)?.label ?? format}`,
+      filePath: filePath.trim(),
+      cancelable: true,
+      message: '正在执行查询…',
+    })
+    activeTaskIdRef.current = taskId
+    registerStreamExportCancellation(taskId, connectionId, () => exportTokenRef.current, () => {
+      cancelRequestedRef.current = true
+    })
+    onClose()
 
-    // 前端编码导出：JSON/MD/Excel 始终走前端；非流式支持的连接类型（DuckDB/ClickHouse/SQLServer 等）
-    // 所有格式都走前端（execute_query 支持全部类型），避免后端流式导出「暂不支持此连接类型」
-    const useFrontend = FRONTEND_FORMATS.includes(format) || !STREAMING_TYPES.includes(connType ?? '')
-    if (useFrontend) {
+    // DuckDB 高速通道（COPY TO，无需把结果拉回前端）。CSV 仅 UTF-8 时走原生 COPY，避免忽略用户选择的 GBK/BOM。
+    if (isDuck && (format === 'parquet' || (format === 'csv' && encoding === 'utf8'))) {
       const t0 = Date.now()
       try {
         const { invoke } = await import('@tauri-apps/api/core')
-        const res = await invoke<{ columns: string[]; rows: (string | null)[][] }>('execute_query', {
-          id: connectionId, sql: sqlText.trim(), database: schema || undefined,
+        const res = await invoke<DuckCopyResult>('duckdb_copy_to', {
+          id: connectionId,
+          sql: markedSql,
+          path: filePath.trim(),
+          format,
         })
-        let fileBytes = 0
-        if (format === 'xlsx') {
-          const xlsx = await import('xlsx')
-          const wsData = [res.columns, ...res.rows.map((r) => r.map((v) => v ?? ''))]
-          const ws = xlsx.utils.aoa_to_sheet(wsData)
-          const wb = xlsx.utils.book_new()
-          xlsx.utils.book_append_sheet(wb, ws, '查询结果')
-          // xlsx.write(type:'array') 返回 ArrayBuffer，须包成 Uint8Array 才能转字节数组（否则 Array.from 得空数组 → 文件空）
-          const buf = new Uint8Array(xlsx.write(wb, { type: 'array', bookType: 'xlsx' }) as ArrayBuffer)
-          await invoke('write_local_bytes', { path: filePath.trim(), bytes: Array.from(buf) })
-          fileBytes = buf.length
-        } else {
-          let content = ''
-          const toObj = (r: (string | null)[]) => Object.fromEntries(res.columns.map((c, i) => [c, r[i]]))
-          if (format === 'json') {
-            content = JSON.stringify(res.rows.map(toObj), null, 2)
-          } else if (format === 'jsonl') {
-            content = res.rows.map((r) => JSON.stringify(toObj(r))).join('\n') + '\n'
-          } else if (format === 'csv' || format === 'tsv') {
-            const sep = format === 'tsv' ? '\t' : ','
-            const cell = (v: string | null) => {
-              const s = v ?? ''
-              if (format === 'tsv') return s.replace(/[\t\r\n]/g, ' ')
-              return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
-            }
-            const line = (arr: (string | null)[]) => arr.map(cell).join(sep)
-            content = [line(res.columns), ...res.rows.map(line)].join('\n') + '\n'
-          } else if (format === 'sql') {
-            const q = (s: string) => qid(connType ?? '', s)
-            const tbl = q(insertTable || guessTableName(sqlText))
-            const cols = res.columns.map(q).join(', ')
-            content = res.rows.map((r) =>
-              `INSERT INTO ${tbl} (${cols}) VALUES (${r.map((v) => v === null ? 'NULL' : `'${v.replace(/'/g, "''")}'`).join(', ')});`
-            ).join('\n') + '\n'
-          } else { // md
-            const header = `| ${res.columns.join(' | ')} |`
-            const divider = `| ${res.columns.map((c) => '-'.repeat(Math.max(c.length, 3))).join(' | ')} |`
-            const body = res.rows.map((r) => `| ${r.map((v) => (v ?? 'NULL').replace(/\|/g, '\\|')).join(' | ')} |`)
-            content = [header, divider, ...body].join('\n') + '\n'
-          }
-          await invoke('write_local_file', { path: filePath.trim(), content })
-          fileBytes = new Blob([content]).size
+        if (cancelRequestedRef.current) {
+          setPhase('cancelled')
+          return
         }
         const elapsed = Date.now() - t0
-        setFinalRows(res.rows.length)
+        setFinalRows(res.rows)
         setProgress({
-          rows: res.rows.length, elapsed_ms: elapsed,
-          rows_per_sec: elapsed > 0 ? Math.round(res.rows.length / (elapsed / 1000)) : res.rows.length,
-          file_bytes: fileBytes, done: true, cancelled: false, error: null,
+          rows: res.rows, elapsed_ms: elapsed,
+          rows_per_sec: elapsed > 0 ? Math.round(res.rows / (elapsed / 1000)) : res.rows,
+          file_bytes: res.fileBytes, done: true, cancelled: false, error: null,
+        })
+        useExportTaskStore.getState().updateTask(taskId, {
+          status: 'done', progressRows: res.rows, speed: elapsed > 0 ? Math.round(res.rows / (elapsed / 1000)) : res.rows,
+          fileBytes: res.fileBytes, message: `已导出 ${res.rows.toLocaleString()} 行`, filePath: filePath.trim(), finishedAt: Date.now(),
         })
         setPhase('done')
       } catch (e) {
-        setErrorMsg(String(e))
-        setPhase('error')
-      }
-      return
-    }
-
-    // DuckDB Parquet 高速通道（COPY TO，无需流式传输）
-    if (format === 'parquet') {
-      try {
-        const { invoke } = await import('@tauri-apps/api/core')
-        const rows = await invoke<number>('duckdb_copy_to', {
-          id: connectionId,
-          sql: sqlText.trim(),
-          path: filePath.trim(),
-          format: 'parquet',
-        })
-        setFinalRows(rows)
-        setPhase('done')
-      } catch (e) {
-        setErrorMsg(String(e))
-        setPhase('error')
-      }
-      return
-    }
-
-    const { listen } = await import('@tauri-apps/api/event')
-    const unlisten = await listen<ProgressEvt>(`export_progress_${taskId}`, e => {
-      const evt = e.payload
-      setProgress(evt)
-      if (evt.done) {
-        if (evt.cancelled) {
+        if (cancelRequestedRef.current) {
+          useExportTaskStore.getState().updateTask(taskId, { status: 'cancelled', message: '已取消', finishedAt: Date.now() })
           setPhase('cancelled')
-        } else if (evt.error) {
-          setErrorMsg(evt.error)
-          setPhase('error')
         } else {
-          setFinalRows(evt.rows)
-          setPhase('done')
+          useExportTaskStore.getState().updateTask(taskId, { status: 'error', error: String(e), message: '导出失败', finishedAt: Date.now() })
+          setErrorMsg(String(e))
+          setPhase('error')
         }
+      } finally {
+        unregisterExportCancelHandler(taskId)
+        exportTokenRef.current = null
+        cancelRequestedRef.current = false
+        setCancelling(false)
       }
-    })
+      return
+    }
 
+    let unlisten: (() => void) | null = null
     try {
+      const { listen } = await import('@tauri-apps/api/event')
+      unlisten = await listen<ProgressEvt>(`export_progress_${taskId}`, e => {
+        const evt = e.payload
+        setProgress(evt)
+        updateExportTaskFromProgress(taskId, evt)
+        if (evt.done) {
+          if (evt.cancelled) {
+            useExportTaskStore.getState().updateTask(taskId, { status: 'cancelled', message: '已取消', finishedAt: Date.now() })
+            setPhase('cancelled')
+          } else if (evt.error) {
+            useExportTaskStore.getState().updateTask(taskId, { status: 'error', error: evt.error, message: '导出失败', finishedAt: Date.now() })
+            setErrorMsg(evt.error)
+            setPhase('error')
+          } else {
+            useExportTaskStore.getState().updateTask(taskId, {
+              status: 'done', progressRows: evt.rows, speed: evt.rows_per_sec, fileBytes: evt.file_bytes,
+              message: `已导出 ${evt.rows.toLocaleString()} 行`, filePath: filePath.trim(), finishedAt: Date.now(),
+            })
+            setFinalRows(evt.rows)
+            setPhase('done')
+          }
+        }
+      })
       const { invoke } = await import('@tauri-apps/api/core')
       await invoke('db_stream_export', {
         id: connectionId,
-        sql: sqlText.trim(),
+        sql: markedSql,
         filePath: filePath.trim(),
         format,
         encoding,
@@ -256,20 +251,36 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
       })
     } catch (e) {
       const msg = String(e)
-      if (!msg.includes('已取消')) {
+      if (cancelRequestedRef.current || msg.includes('已取消') || msg.includes('查询已取消')) {
+        useExportTaskStore.getState().updateTask(taskId, { status: 'cancelled', message: '已取消', finishedAt: Date.now() })
+        setPhase('cancelled')
+      } else {
+        useExportTaskStore.getState().updateTask(taskId, { status: 'error', error: msg, message: '导出失败', finishedAt: Date.now() })
         setErrorMsg(msg)
         setPhase('error')
       }
     } finally {
-      unlisten()
+      unregisterExportCancelHandler(taskId)
+      exportTokenRef.current = null
+      cancelRequestedRef.current = false
+      setCancelling(false)
+      unlisten?.()
     }
-  }, [connectionId, sqlText, filePath, format, encoding, insertTable, taskId])
+  }, [connectionId, sqlText, filePath, format, encoding, insertTable, connType, schema, isDuck, onClose])
 
   const cancelExport = async () => {
     window.getSelection()?.removeAllRanges()
+    if (cancelling) return
+    cancelRequestedRef.current = true
+    setCancelling(true)
     try {
       const { invoke } = await import('@tauri-apps/api/core')
-      await invoke('db_cancel_export', { taskId })
+      const taskId = activeTaskIdRef.current
+      if (taskId) await invoke('db_cancel_export', { taskId })
+      const token = exportTokenRef.current
+      if (token) {
+        try { await invoke('db_cancel_query', { id: connectionId, token }) } catch { /* ignore */ }
+      }
     } catch { /* ignore */ }
   }
 
@@ -279,6 +290,8 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
       await invoke('reveal_in_folder', { filePath: filePath.trim() })
     } catch { /* ignore */ }
   }
+
+  const runningElapsedMs = Math.max(elapsedMs, progress?.elapsed_ms ?? 0)
 
   return createPortal(
     <div className="cdlg-overlay" onMouseDown={phase !== 'running' ? onClose : undefined}>
@@ -323,7 +336,7 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
 
               {/* 格式 + 编码（Parquet / JSON / Markdown / Excel 固定 UTF-8，不显示编码选择）*/}
               {(() => {
-                const noEncoding = format === 'parquet' || FRONTEND_FORMATS.includes(format)
+                const noEncoding = format === 'parquet' || format === 'json' || format === 'md' || format === 'xlsx'
                 return (
                   <div style={{ display: 'grid', gridTemplateColumns: noEncoding ? '1fr' : '1fr 1fr', gap: 12, marginBottom: 14 }}>
                     <div>
@@ -341,7 +354,7 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
                       )}
                       {format === 'xlsx' && (
                         <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>
-                          执行整段查询后生成 Excel 文件（适合常规结果集，超大数据建议用 CSV）
+                          后端流式写入 Excel；Excel 单个工作表最多支持 1,048,576 行，超大数据建议用 CSV / TSV / JSON Lines
                         </div>
                       )}
                     </div>
@@ -409,10 +422,15 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
           {/* ─── 进行中 ──────────────────────────────────── */}
           {phase === 'running' && (
             <>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
-                <Loader size={16} className="spin" color="var(--accent)" />
-                <span style={{ fontSize: 13, color: 'var(--text)' }}>
-                  {progress ? `已导出 ${progress.rows.toLocaleString()} 行` : '正在执行查询…'}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 16 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+                  <Loader size={16} className="spin" color="var(--accent)" />
+                  <span style={{ fontSize: 13, color: 'var(--text)' }}>
+                    {progress ? `已导出 ${progress.rows.toLocaleString()} 行` : '正在执行查询…'}
+                  </span>
+                </div>
+                <span style={{ fontSize: 11, color: 'var(--text-muted)', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums' }}>
+                  耗时 <b style={{ color: 'var(--text)', fontFamily: 'var(--font-mono)', fontWeight: 500 }}>{(runningElapsedMs / 1000).toFixed(1)}s</b>
                 </span>
               </div>
 
@@ -428,7 +446,7 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
               {progress && (
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginBottom: 16 }}>
                   <StatCard label="导出速度" value={`${progress.rows_per_sec.toLocaleString()} 行/秒`} />
-                  <StatCard label="已用时间" value={fmtTime(progress.elapsed_ms)} />
+                  <StatCard label="已用时间" value={formatDuration(progress.elapsed_ms)} />
                   <StatCard label="行数" value={progress.rows.toLocaleString()} />
                 </div>
               )}
@@ -438,8 +456,8 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
               </div>
 
               <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                <button onClick={cancelExport} style={{ ...btnCancel, color: 'var(--error)', borderColor: '#dc2626' }}>
-                  取消导出
+                <button onClick={cancelExport} disabled={cancelling} style={{ ...btnCancel, color: 'var(--error)', borderColor: '#dc2626', opacity: cancelling ? 0.65 : 1 }}>
+                  {cancelling ? '取消中…' : '取消导出'}
                 </button>
               </div>
             </>
@@ -456,7 +474,7 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginBottom: 14 }}>
                 <StatCard label="文件大小" value={fmtBytes(progress.file_bytes)} />
-                <StatCard label="用时"     value={fmtTime(progress.elapsed_ms)} />
+                <StatCard label="用时"     value={formatDuration(progress.elapsed_ms)} />
                 <StatCard label="平均速度" value={`${progress.rows_per_sec.toLocaleString()} 行/秒`} />
               </div>
               <div style={{

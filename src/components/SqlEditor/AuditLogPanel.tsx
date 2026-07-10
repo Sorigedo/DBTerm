@@ -4,6 +4,8 @@ import { X, ClipboardList, Search, Download, Trash2 } from 'lucide-react'
 import { toast } from '../../stores/toastStore'
 import SearchableSelect from '../DbTools/SearchableSelect'
 import { clearAuditLog, loadAuditLog, MAX_ENTRIES, type AuditEntry } from '../../utils/auditLog'
+import { affectedRowsDisplay } from './affectedRowsDisplay'
+import { queueLocalTextExport } from '../../utils/exportTasks'
 
 // Tauri WebView2 不支持浏览器 blob 下载，统一走保存对话框 + 后端写文件
 async function saveTextFile(content: string, defaultName: string, label: string, ext: string) {
@@ -11,9 +13,7 @@ async function saveTextFile(content: string, defaultName: string, label: string,
     const { save } = await import('@tauri-apps/plugin-dialog')
     const path = await save({ defaultPath: defaultName, filters: [{ name: label, extensions: [ext] }] })
     if (!path) return
-    const { invoke } = await import('@tauri-apps/api/core')
-    await invoke('write_local_file', { path, content })
-    toast.exported(path)
+    queueLocalTextExport(path, content, label)
   } catch (e) {
     toast.error(`导出失败：${String(e)}`)
   }
@@ -134,7 +134,7 @@ export default function AuditLogPanel({ onClose, connectionId }: Props) {
                   <th style={{ padding: '7px 10px', textAlign: 'left', fontWeight: 600, color: 'var(--text-muted)', borderBottom: '1px solid var(--border)', fontSize: 11, whiteSpace: 'nowrap' }}>时间</th>
                   <th style={{ padding: '7px 10px', textAlign: 'left', fontWeight: 600, color: 'var(--text-muted)', borderBottom: '1px solid var(--border)', fontSize: 11 }}>连接</th>
                   <th style={{ padding: '7px 10px', textAlign: 'left', fontWeight: 600, color: 'var(--text-muted)', borderBottom: '1px solid var(--border)', fontSize: 11 }}>SQL</th>
-                  <th style={{ padding: '7px 10px', textAlign: 'right', fontWeight: 600, color: 'var(--text-muted)', borderBottom: '1px solid var(--border)', fontSize: 11, whiteSpace: 'nowrap' }}>影响行</th>
+                  <th style={{ padding: '7px 10px', textAlign: 'right', fontWeight: 600, color: 'var(--text-muted)', borderBottom: '1px solid var(--border)', fontSize: 11, whiteSpace: 'nowrap' }}>执行结果</th>
                   <th style={{ padding: '7px 10px', textAlign: 'center', fontWeight: 600, color: 'var(--text-muted)', borderBottom: '1px solid var(--border)', fontSize: 11 }}>状态</th>
                 </tr>
               </thead>
@@ -152,8 +152,13 @@ export default function AuditLogPanel({ onClose, connectionId }: Props) {
                       {e.sql}
                       {e.error && <span style={{ color: 'var(--error)', marginLeft: 4, fontSize: 10 }}>({e.error.slice(0, 40)}…)</span>}
                     </td>
-                    <td style={{ padding: '7px 10px', textAlign: 'right', fontFamily: 'var(--font-mono)', color: 'var(--text)' }}>
-                      {e.success ? e.rowsAffected : '—'}
+                    <td
+                      style={{ padding: '7px 10px', textAlign: 'right', fontFamily: 'var(--font-mono)', color: 'var(--text)', whiteSpace: 'nowrap' }}
+                      title={e.success && e.connType ? affectedRowsDisplay(e.connType, e.sql, e.rowsAffected).detail : undefined}
+                    >
+                      {e.success
+                        ? (e.connType ? affectedRowsDisplay(e.connType, e.sql, e.rowsAffected).summary : `数据库计数 ${e.rowsAffected}`)
+                        : '—'}
                     </td>
                     <td style={{ padding: '7px 10px', textAlign: 'center' }}>
                       <span style={{ fontSize: 11, color: e.success ? '#16a34a' : '#dc2626', fontWeight: 600 }}>

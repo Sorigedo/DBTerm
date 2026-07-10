@@ -4,6 +4,8 @@ import {
   Eye, Columns, Scissors, Trash2, Pencil, Copy, Download,
   ChevronRight,
 } from 'lucide-react'
+import { queueTableExport } from '../../utils/exportTasks'
+import { toast } from '../../stores/toastStore'
 
 interface Props {
   connectionId: string
@@ -161,17 +163,19 @@ export default function TableOpsMenu({
         filters: [{ name: fmt.label, extensions: [fmt.ext] }],
       })
       if (!path) return
-      const { invoke } = await import('@tauri-apps/api/core')
-      await invoke('db_export_table', {
-        id: connectionId,
+      await queueTableExport({
+        connectionId,
         schema,
         table,
         format: exportFormat,
-        whereClause: null,
+        formatLabel: fmt.label,
         path,
       })
+      toast.info('导出已转入后台，可在右下角查看进度')
       onClose()
-    } catch { /* user cancelled */ }
+    } catch (e) {
+      if (String(e)) toast.error(`创建导出任务失败：${String(e)}`)
+    }
   }
 
   // ── Menu items ──────────────────────────────────────────────────────────────

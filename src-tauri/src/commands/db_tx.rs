@@ -189,8 +189,24 @@ async fn run_on_mysql(
     let tagged = tag(sql);
     let t0 = Instant::now();
 
-    // 关键：MySQL 下 DML 经 fetch_all 已执行一次（返回 Ok+空集），绝不能在 is_empty 分支再 execute 一次，
-    // 否则事务内 INSERT/UPDATE/DELETE 会被执行两遍。判据与 PG/SQLite 一致：fetch_all 出 Err 才当 DML 走 execute。
+    if !crate::commands::query::is_query_stmt(sql) {
+        let affected = if crate::commands::query::needs_text_protocol(sql) {
+            use sqlx::Executor;
+            conn.execute(sqlx::raw_sql(&tagged)).await
+                .map(|r| r.rows_affected())
+                .map_err(|e| format!("{e}"))?
+        } else {
+            sqlx::query(&tagged).execute(&mut *conn).await
+                .map(|r| r.rows_affected())
+                .map_err(|e| format!("{e}"))?
+        };
+        return Ok(QueryResult {
+            columns: vec![], rows: vec![],
+            rows_affected: affected, execution_time_ms: t0.elapsed().as_millis() as u64,
+            truncated: false, is_select: false,
+        });
+    }
+
     match sqlx::query(&tagged).fetch_all(&mut *conn).await {
         Ok(rows) => {
             let elapsed = t0.elapsed().as_millis() as u64;
@@ -218,17 +234,7 @@ async fn run_on_mysql(
                 rows_affected: row_count, execution_time_ms: elapsed, truncated: false, is_select: true,
             })
         }
-        Err(_) => {
-            let affected = sqlx::query(&tagged)
-                .execute(&mut *conn).await
-                .map(|r| r.rows_affected())
-                .map_err(|e| format!("{e}"))?;
-            let elapsed = t0.elapsed().as_millis() as u64;
-            Ok(QueryResult {
-                columns: vec![], rows: vec![],
-                rows_affected: affected, execution_time_ms: elapsed, truncated: false, is_select: false,
-            })
-        }
+        Err(e) => Err(format!("{e}")),
     }
 }
 
@@ -246,12 +252,22 @@ async fn run_on_pg(
     use sqlx::{Row, Column, TypeInfo};
     let tagged = tag(sql);
     let t0 = Instant::now();
-    let elapsed;
 
-    // 先尝试 SELECT
+    if !crate::commands::query::is_query_stmt(sql) {
+        let affected = sqlx::query(&tagged)
+            .execute(&mut *conn).await
+            .map(|r| r.rows_affected())
+            .map_err(|e| format!("{e}"))?;
+        return Ok(QueryResult {
+            columns: vec![], rows: vec![],
+            rows_affected: affected, execution_time_ms: t0.elapsed().as_millis() as u64,
+            truncated: false, is_select: false,
+        });
+    }
+
     match sqlx::query(&tagged).fetch_all(&mut *conn).await {
         Ok(rows) => {
-            elapsed = t0.elapsed().as_millis() as u64;
+            let elapsed = t0.elapsed().as_millis() as u64;
             if rows.is_empty() {
                 return Ok(QueryResult {
                     columns: vec![], rows: vec![],
@@ -269,18 +285,7 @@ async fn run_on_pg(
             }).collect();
             Ok(QueryResult { columns, rows: result_rows, rows_affected: 0, execution_time_ms: elapsed, truncated: false, is_select: true })
         }
-        Err(_) => {
-            // 可能是 DML，尝试 execute
-            let affected = sqlx::query(&tagged)
-                .execute(&mut *conn).await
-                .map(|r| r.rows_affected())
-                .map_err(|e| format!("{e}"))?;
-            elapsed = t0.elapsed().as_millis() as u64;
-            Ok(QueryResult {
-                columns: vec![], rows: vec![],
-                rows_affected: affected, execution_time_ms: elapsed, truncated: false, is_select: false,
-            })
-        }
+        Err(e) => Err(format!("{e}")),
     }
 }
 
@@ -303,6 +308,18 @@ async fn run_on_sqlite(
     use sqlx::{Row, Column};
     let t0 = Instant::now();
 
+    if !crate::commands::query::is_query_stmt(sql) {
+        let affected = sqlx::query(sql)
+            .execute(&mut *conn).await
+            .map(|r| r.rows_affected())
+            .map_err(|e| format!("{e}"))?;
+        return Ok(QueryResult {
+            columns: vec![], rows: vec![], rows_affected: affected,
+            execution_time_ms: t0.elapsed().as_millis() as u64,
+            truncated: false, is_select: false,
+        });
+    }
+
     match sqlx::query(sql).fetch_all(&mut *conn).await {
         Ok(rows) => {
             let elapsed = t0.elapsed().as_millis() as u64;
@@ -320,14 +337,7 @@ async fn run_on_sqlite(
             }).collect();
             Ok(QueryResult { columns, rows: result_rows, rows_affected: 0, execution_time_ms: elapsed, truncated: false, is_select: true })
         }
-        Err(_) => {
-            let affected = sqlx::query(sql)
-                .execute(&mut *conn).await
-                .map(|r| r.rows_affected())
-                .map_err(|e| format!("{e}"))?;
-            let elapsed = t0.elapsed().as_millis() as u64;
-            Ok(QueryResult { columns: vec![], rows: vec![], rows_affected: affected, execution_time_ms: elapsed, truncated: false, is_select: false })
-        }
+        Err(e) => Err(format!("{e}")),
     }
 }
 
@@ -338,6 +348,7 @@ async fn run_on_sqlite(
 pub async fn db_begin_tx(
     id: String,
     database: Option<String>,
+    preamble: Option<Vec<String>>,
     storage: State<'_, StorageState>,
     tx_state: State<'_, TxState>,
     duck_pool: State<'_, DuckPool>,
@@ -355,6 +366,7 @@ pub async fn db_begin_tx(
 
     let (mut config, password) = load_conn(&id, &storage).await?;
     let pwd = password.as_deref();
+    let preamble = preamble.unwrap_or_default();
     // 只读连接：事务整体以 READ ONLY 起，写操作由引擎直接拒绝（最强保证）
     let read_only = config.read_only == Some(true);
 
@@ -368,12 +380,21 @@ pub async fn db_begin_tx(
                 mysql_exec_text(&mut c, &format!("USE `{}`", db.replace('`', "``"))).await
                     .map_err(|e| format!("切换数据库失败: {e}"))?;
             }
+            for stmt in &preamble {
+                let upper = super::query::strip_leading_comments(stmt).trim().to_uppercase();
+                if !upper.starts_with("SET ") && !upper.starts_with("USE ") {
+                    return Err("事务前置语句仅支持 SET / USE".to_string());
+                }
+                mysql_exec_text(&mut c, stmt).await
+                    .map_err(|e| format!("事务前置语句失败: {e}"))?;
+            }
             let begin = if read_only { "START TRANSACTION READ ONLY" } else { "BEGIN" };
             mysql_exec_text(&mut c, begin).await
                 .map_err(|e| format!("BEGIN 失败: {e}"))?;
             TxConn::MySql(c)
         }
         ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
+            if !preamble.is_empty() { return Err("当前数据库不支持事务前置语句".to_string()); }
             let mut c = open_pg(&config, pwd).await?;
             if let Some(schema) = database.as_deref().filter(|s| !s.is_empty()) {
                 let safe_schema = schema.replace('"', "\"\"");
@@ -386,6 +407,7 @@ pub async fn db_begin_tx(
             TxConn::Pg(c)
         }
         ConnType::Sqlite => {
+            if !preamble.is_empty() { return Err("当前数据库不支持事务前置语句".to_string()); }
             let mut c = open_sqlite(&config).await?;
             if read_only {
                 // 只读：query_only 阻止任何写；用 DEFERRED BEGIN（不抢写锁）
@@ -401,16 +423,19 @@ pub async fn db_begin_tx(
             TxConn::Sqlite(c)
         }
         ConnType::Duckdb => {
+            if !preamble.is_empty() { return Err("当前数据库不支持事务前置语句".to_string()); }
             dispatch_duck_query(&id, &config, "BEGIN", &duck_pool, &registry).await
                 .map_err(|e| format!("BEGIN 失败: {e}"))?;
             TxConn::Duckdb(id.clone())
         }
         ConnType::SqlServer => {
+            if !preamble.is_empty() { return Err("当前数据库不支持事务前置语句".to_string()); }
             dispatch_ss_query(&id, &config, "BEGIN TRANSACTION", &ss_pool).await
                 .map_err(|e| format!("BEGIN TRANSACTION 失败: {e}"))?;
             TxConn::SqlServer(id.clone())
         }
         ConnType::Oracle => {
+            if !preamble.is_empty() { return Err("当前数据库不支持事务前置语句".to_string()); }
             oracle_begin_tx(id.clone(), config, password, &*registry, &oracle_tx_pool).await?;
             TxConn::Oracle(id.clone())
         }

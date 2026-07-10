@@ -39,6 +39,7 @@ import { displayShortcutStr, SHORTCUT_DEFS, isModEvent, modLabel } from '../../u
 import { useSchemaVisibilityStore } from '../../stores/schemaVisibilityStore'
 import { useDbCapsStore } from '../../stores/dbCapsStore'
 import { useRedisStore } from '../../stores/redisStore'
+import { queueLocalTextExport } from '../../utils/exportTasks'
 
 interface TableInfo   { name: string; isView: boolean }
 interface RoutineInfo { name: string; routineType: string }
@@ -417,9 +418,7 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
       const { save } = await import('@tauri-apps/plugin-dialog')
       const path = await save({ defaultPath: `${safeName}.sql`, filters: [{ name: 'SQL', extensions: ['sql'] }] })
       if (!path) return
-      const { invoke } = await import('@tauri-apps/api/core')
-      await invoke('write_local_file', { path, content: header + q.sql + '\n' })
-      toast.exported(path)
+      queueLocalTextExport(path, header + q.sql + '\n', '保存的查询导出', q.connId || connectionId)
     } catch (e) {
       toast.error(`导出失败：${String(e)}`)
     }
@@ -452,9 +451,12 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
       const { save } = await import('@tauri-apps/plugin-dialog')
       const path = await save({ defaultPath: `${safeName}-保存的查询.sql`, filters: [{ name: 'SQL', extensions: ['sql'] }] })
       if (!path) return
-      const { invoke } = await import('@tauri-apps/api/core')
-      await invoke('write_local_file', { path, content: fileHeader + blocks.join('\n') + '\n' })
-      toast.exported(path, `已导出 ${savedQueries.length} 条：${path}`)
+      queueLocalTextExport(
+        path,
+        fileHeader + blocks.join('\n') + '\n',
+        `${savedQueries.length} 条保存的查询导出`,
+        connectionId,
+      )
     } catch (e) {
       toast.error(`导出失败：${String(e)}`)
     }

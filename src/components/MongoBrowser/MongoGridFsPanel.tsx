@@ -3,6 +3,7 @@ import { useState, useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { X, FileBox, RefreshCw, Upload, Download, Trash2 } from 'lucide-react'
 import ConfirmDialog from '../shared/ConfirmDialog'
+import { queueBackgroundExport } from '../../utils/exportTasks'
 
 interface Props {
   connectionId: string
@@ -60,9 +61,22 @@ export default function MongoGridFsPanel({ connectionId, db, onClose }: Props) {
       const { save } = await import('@tauri-apps/plugin-dialog')
       const dest = await save({ title: '下载到', defaultPath: f.filename })
       if (!dest) return
-      setBusy('下载中…')
       const { invoke } = await import('@tauri-apps/api/core')
-      await invoke('mongo_gridfs_download', { id: connectionId, db, fileId: f.id, destPath: dest })
+      queueBackgroundExport({
+        connectionId,
+        label: `${f.filename} · GridFS 下载`,
+        filePath: dest,
+        run: () => invoke('mongo_gridfs_download', { id: connectionId, db, fileId: f.id, destPath: dest }),
+        complete: () => ({
+          fileBytes: f.length,
+          progressValue: f.length,
+          progressTotal: f.length,
+          message: `下载完成 · ${fmtBytes(f.length)}`,
+        }),
+        successMessage: `GridFS 文件下载完成：${f.filename}`,
+        errorPrefix: 'GridFS 下载失败',
+      })
+      onClose()
     } catch (e) { setError(String(e)) } finally { setBusy('') }
   }
 

@@ -14,18 +14,20 @@ on:
 
           ### 1. 新增功能
 
-          - SQL 变量弹窗新增实时预览，填写变量后直接展示最终将执行的 SQL。
-          - SQL 变量新增「表达式」模式，支持数字、函数、日期字面量等内容原样替换。
+          - 新增全局可收缩导出任务栏，导出期间可继续切换标签和操作数据库或终端。
+          - 数据表、查询结果、整库备份、SQLite、DuckDB、MongoDB、Redis 与 GridFS 导出统一显示后台进度。
 
           ### 2. 修改功能
 
-          - SQL 变量替换说明调整为 DBTerm 执行前模板替换，SQL 类数据库均可使用，最终语法按当前数据库方言解释。
-          - 新建连接弹窗中方言专属字段改为中文主标签，并保留原始参数名提示。
+          - 显式事务脚本复用固定数据库会话，支持 MySQL 临时表和会话变量连续执行。
+          - 批量 SQL 遇到首个错误后立即停止；显式事务自动回滚，后续语句明确标记为跳过。
+          - MySQL UPSERT / REPLACE 等特殊语句的影响行数增加无歧义说明。
 
           ### 3. 改进优化
 
-          - 优化新建数据库连接弹窗的字段列宽与窄屏布局，减少长字段名导致的挤压变形。
-          - 增加 SQL 变量识别测试，覆盖 `>=:name`、`func(:name,...)` 等紧邻操作符和函数标点的写法。
+          - 完善多数据库方言的流式导出、Excel / JSON / Markdown 等格式处理与取消逻辑。
+          - 导出成功记录自动清理，失败记录保留以便排查。
+          - 完善 SQL 变量日期、表达式模式及执行预览。
 
 permissions:
   contents: write
@@ -215,18 +217,20 @@ jobs:
 
           ### 1. 新增功能
 
-          - SQL 变量弹窗新增实时预览，填写变量后直接展示最终将执行的 SQL。
-          - SQL 变量新增「表达式」模式，支持数字、函数、日期字面量等内容原样替换。
+          - 新增全局可收缩导出任务栏，导出期间可继续切换标签和操作数据库或终端。
+          - 数据表、查询结果、整库备份、SQLite、DuckDB、MongoDB、Redis 与 GridFS 导出统一显示后台进度。
 
           ### 2. 修改功能
 
-          - SQL 变量替换说明调整为 DBTerm 执行前模板替换，SQL 类数据库均可使用，最终语法按当前数据库方言解释。
-          - 新建连接弹窗中方言专属字段改为中文主标签，并保留原始参数名提示。
+          - 显式事务脚本复用固定数据库会话，支持 MySQL 临时表和会话变量连续执行。
+          - 批量 SQL 遇到首个错误后立即停止；显式事务自动回滚，后续语句明确标记为跳过。
+          - MySQL UPSERT / REPLACE 等特殊语句的影响行数增加无歧义说明。
 
           ### 3. 改进优化
 
-          - 优化新建数据库连接弹窗的字段列宽与窄屏布局，减少长字段名导致的挤压变形。
-          - 增加 SQL 变量识别测试，覆盖 `>=:name`、`func(:name,...)` 等紧邻操作符和函数标点的写法。
+          - 完善多数据库方言的流式导出、Excel / JSON / Markdown 等格式处理与取消逻辑。
+          - 导出成功记录自动清理，失败记录保留以便排查。
+          - 完善 SQL 变量日期、表达式模式及执行预览。
           EOF
           fi
 
@@ -246,7 +250,7 @@ jobs:
           - 发布前请下载对应平台安装包完成启动、连接、SSH、SQL 编辑器和设置页基础回归。
           EOF
 
-      - name: Create or update draft release
+      - name: Create or update release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -300,13 +304,14 @@ jobs:
             retry gh release edit "$tag" \
               --title "$title" \
               --notes-file release-notes.md \
-              --draft=true \
-              --prerelease=false
+              --draft=false \
+              --prerelease=false \
+              --latest
           elif [ "$release_state" = "missing" ]; then
             retry gh release create "$tag" \
               --title "$title" \
               --notes-file release-notes.md \
-              --draft
+              --latest
           else
             echo "Unexpected release state: ${release_state}" >&2
             exit 1

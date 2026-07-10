@@ -1291,10 +1291,12 @@ pub async fn db_export_table(
     path: String,
     // 结构导出（仅 format="sql" 生效）："only"=仅结构 / "with"=结构+数据 / None=仅数据
     structure: Option<String>,
+    task_id: Option<String>,
     storage: State<'_, StorageState>,
     duck_pool: State<'_, super::duckdb::DuckPool>,
     ss_pool: State<'_, super::sqlserver::SsPool>,
     registry: State<'_, super::driver::DriverRegistry>,
+    app_handle: tauri::AppHandle,
 ) -> Result<u64, String> {
     validate_ident(&table)?;
     if !schema.is_empty() { validate_ident(&schema)?; }
@@ -1302,6 +1304,23 @@ pub async fn db_export_table(
     validate_path(&path)?;
 
     let (config, password) = load_conn(&id, &storage).await?;
+    let export_started = Instant::now();
+    let progress_event = task_id.as_ref().map(|tid| format!("export_progress_{tid}"));
+    let emit_progress = |rows: u64, done: bool, file_bytes: u64| {
+        if let Some(ref event) = progress_event {
+            let elapsed_ms = export_started.elapsed().as_millis() as u64;
+            let _ = app_handle.emit(event, crate::commands::db_export::ExportProgressEvt {
+                rows,
+                elapsed_ms,
+                rows_per_sec: if elapsed_ms > 0 { rows * 1000 / elapsed_ms } else { 0 },
+                file_bytes,
+                done,
+                cancelled: false,
+                error: None,
+            });
+        }
+    };
+    emit_progress(0, false, 0);
     // 提前留存连接类型：Oracle 分支会 move config，后续写文件头/行/尾仍需按方言判断
     let conn_type = config.conn_type.clone();
 
@@ -1553,6 +1572,9 @@ pub async fn db_export_table(
                 _ => {}
             }
             row_count += 1;
+            if row_count == 1 || row_count % 1_000 == 0 {
+                emit_progress(row_count, false, 0);
+            }
         }};
     }
 
@@ -1682,6 +1704,8 @@ pub async fn db_export_table(
     }
 
     if let Err(e) = w.flush() { return Err(format!("刷新文件失败: {e}")); }
+    let file_bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    emit_progress(row_count, true, file_bytes);
     Ok(row_count)
 }
 
@@ -4577,12 +4601,17 @@ pub async fn db_logical_backup(
     let emit = |current_table: &str, done: u64, current_rows: u64| {
         #[derive(serde::Serialize, Clone)]
         struct P { current_table: String, total_tables: u64, done_tables: u64, current_rows: u64 }
-        let _ = app_handle.emit("backup_progress", P {
+        let payload = P {
             current_table: current_table.to_string(),
             total_tables,
             done_tables: done,
             current_rows,
-        });
+        };
+        let _ = app_handle.emit("backup_progress", payload.clone());
+        if let Some(ref tid) = task_id {
+            let event = format!("backup_progress_{tid}");
+            let _ = app_handle.emit(&event, payload);
+        }
     };
 
     let mut tables_done: u64 = 0;
@@ -4736,6 +4765,7 @@ pub async fn db_logical_backup(
             let _ = conn.execute(sqlx::raw_sql(&tag_sql(&format!("USE {}", q_mysql(&schema))))).await;
         }
         for v in &views {
+            check_cancel!();
             if let Ok(row) = sqlx::query(&tag_sql(&format!("SHOW CREATE VIEW {}", q_mysql(v))))
                 .fetch_one(&mut conn).await {
                 let ddl = row.try_get::<String, _>(1).unwrap_or_default();
@@ -4746,6 +4776,7 @@ pub async fn db_logical_backup(
         }
         for (names, kw) in [(&funcs, "FUNCTION"), (&procs, "PROCEDURE")] {
             for n in names {
+                check_cancel!();
                 if let Ok(row) = sqlx::query(&tag_sql(&format!("SHOW CREATE {kw} {}", q_mysql(n))))
                     .fetch_one(&mut conn).await {
                     let ddl = row.try_get::<String, _>(2).unwrap_or_default();
@@ -4769,6 +4800,7 @@ pub async fn db_logical_backup(
             let _ = conn.execute(sqlx::raw_sql(&tag_sql(&format!("USE {}", q_mysql(&schema))))).await;
         }
         for seq in &seqs {
+            check_cancel!();
             let sref = q_mysql(seq);
             if let Ok(row) = sqlx::query(&tag_sql(&format!("SHOW CREATE SEQUENCE {sref}")))
                 .fetch_one(&mut conn).await {

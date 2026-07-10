@@ -75,10 +75,12 @@ import { toast } from '../../stores/toastStore'
 import { isPgFamily } from '../../utils/sqlDialect'
 import { formatDuration } from '../../utils/formatDuration'
 import { appendAuditLog } from '../../utils/auditLog'
-import { markBatchCancelledFrom } from './queryBatchCancel'
+import { markBatchCancelledFrom, markBatchSkippedFrom } from './queryBatchCancel'
 import { hasMysqlDelimiterDirective, hasMysqlUserPreparedStmt, hasMysqlUserVariable, splitSqlStatements, stripSqlComments } from './sqlSplit'
 import { applySqlVariables, findSqlVariables, type SqlVariable } from './sqlVariables'
 import { memberColumnsForAlias, selectAliasColumnsBefore, stripQuoteIdent } from './sqlCompletion'
+import { affectedRowsDisplay } from './affectedRowsDisplay'
+import { isMysqlTransactionPreamble, shouldBlockMixedAutoTransaction, transactionControlStatement } from './transactionControl'
 
 const QueryHistoryPanel = lazy(() => import('./QueryHistoryPanel'))
 const ExportDialog = lazy(() => import('./ExportDialog'))
@@ -119,6 +121,7 @@ interface MultiResult {
   result: QueryResult | null
   error: string
   cancelled?: boolean
+  skipped?: boolean
 }
 
 // 切库下拉的默认值：跳过系统库，选第一个业务库
@@ -946,7 +949,7 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
       throw new Error('当前数据库不支持传统手动事务')
     }
     const { invoke } = await import('@tauri-apps/api/core')
-    await invoke('db_begin_tx', { id: connectionId, database: currentSchemaRef.current || undefined })
+    await invoke('db_begin_tx', { id: connectionId, database: currentSchemaRef.current || undefined, preamble: [] })
     setTxMode(true)
     setTxActive(true)
   }, [connectionId, connType])
@@ -1147,12 +1150,15 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
 
     // 过滤掉“仅注释/空白”的语句，避免把纯注释当命令发给数据库（MySQL 1295）
     const isMysqlFamilyConn = ['mysql', 'mariadb', 'tidb', 'oceanBase'].includes(connType)
+    const splitStmts = splitSqlStatements(trimmed, connType).filter(s => stripSqlComments(s) !== '')
+    const splitHasTxControl = splitStmts.some(s => transactionControlStatement(s, connType))
     const keepMysqlSessionScript = isMysqlFamilyConn
       && (hasMysqlUserPreparedStmt(trimmed) || hasMysqlUserVariable(trimmed))
       && !hasMysqlDelimiterDirective(trimmed)
+      && !splitHasTxControl
     const stmts = keepMysqlSessionScript
       ? [trimmed]
-      : splitSqlStatements(trimmed, connType).filter(s => stripSqlComments(s) !== '')
+      : splitStmts
     if (stmts.length === 0) return // 仅注释/空白：静默不执行
     // 单条执行：用拆分后的语句（剥离尾部分号/多余注释），避免把分号后内容一起发送
     if (stmts.length === 1) trimmed = stmts[0]
@@ -1160,13 +1166,25 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
     // 写操作守卫（覆盖单/多语句）—— 逐条做 SQL 级校验
     const writeStmts = stmts.filter(isWriteSql)
     const txDmlStmts = stmts.filter(isTransactionalDml)
+    const txControls = stmts.map(s => transactionControlStatement(s, connType))
+    const hasScriptTxControl = txControls.some(Boolean)
+    const hasExplicitBegin = txControls.includes('begin')
+    const firstExplicitBegin = txControls.indexOf('begin')
+    const deferredPreambleCount = isMysqlFamilyConn && hasMysqlUserVariable(trimmed) && firstExplicitBegin > 0
+      ? firstExplicitBegin
+      : 0
+    if (deferredPreambleCount > 0 && !stmts.slice(0, deferredPreambleCount).every(isMysqlTransactionPreamble)) {
+      setMultiResults([]); setResult(null)
+      setError('MySQL 事务开始前包含非 SET / USE 语句，无法保证 @变量与事务使用同一连接；请将这些语句移到事务之后或拆分执行')
+      return
+    }
     // 只读模式：拦截一切写操作（DML/DDL/权限），不可绕过
     if ((activeConn?.readonly ?? activeConn?.readOnly) && writeStmts.length > 0) {
       setMultiResults([]); setResult(null)
       setError('此连接为只读模式，已拦截写操作（INSERT / UPDATE / DELETE / DDL 等）')
       return
     }
-    if (txMode && !txActive && txDmlStmts.length > 0 && writeStmts.length > txDmlStmts.length) {
+    if (shouldBlockMixedAutoTransaction(txMode, txActive, hasScriptTxControl, txDmlStmts.length, writeStmts.length)) {
       setMultiResults([]); setResult(null)
       setError('批量 SQL 同时包含 DML 和 DDL / 权限 / 存储过程等语句，无法安全自动 BEGIN；请拆分执行或手动控制事务')
       toast.warning('请拆分批量 SQL 后再执行')
@@ -1182,8 +1200,8 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
     let executeInTx = txActive
 
     // K5 — 多语句检测：有多条语句时走 multi-result 流程
-    if (stmts.length > 1) {
-      if (txMode && !executeInTx && txDmlStmts.length > 0) {
+    if (stmts.length > 1 || hasScriptTxControl) {
+      if (txMode && !executeInTx && txDmlStmts.length > 0 && !hasExplicitBegin) {
         try {
           await beginTx()
           executeInTx = true
@@ -1200,27 +1218,82 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
       const { invoke: inv } = await import('@tauri-apps/api/core')
       cancelRequestedRef.current = false
       setRunning(true)
+      let scriptOpenedTx = false
+      const rollbackScriptTx = async () => {
+        if (!scriptOpenedTx || !executeInTx) return
+        try { await inv('db_rollback_tx', { id: connectionId }) } catch { /* 连接可能已由失败的 COMMIT 移除 */ }
+        executeInTx = false
+        scriptOpenedTx = false
+        setTxActive(false)
+      }
       for (let si = 0; si < stmts.length; si++) {
         const s = stmts[si]
         if (cancelRequestedRef.current) {
+          await rollbackScriptTx()
           flushSync(() => {
             setMultiResults(prev => markBatchCancelledFrom(prev, si))
           })
           break
         }
+        // MySQL @变量必须在事务连接上初始化；由后面的 BEGIN 一次性执行这些前置 SET/USE。
+        if (si < deferredPreambleCount) continue
         const token = (!executeInTx && CANCELABLE_TYPES.has(connType)) ? newCancelToken() : null
         runTokenRef.current = token
         setRunToken(token)
         try {
-          const res = await inv<QueryResult>(executeInTx ? 'db_exec_in_tx' : 'execute_query', executeInTx
-            ? { id: connectionId, sql: markSql(s, token) }
-            : {
-                id: connectionId,
-                sql: markSql(s, token),
-                database: currentSchemaRef.current || undefined,
-                rowLimit: effectiveLimit ?? undefined,
+          const control = txControls[si]
+          const startedAt = Date.now()
+          let res: QueryResult
+          if (control === 'begin') {
+            if (executeInTx) throw new Error('此连接已有活跃事务，请先提交或回滚')
+            const preamble = si === firstExplicitBegin ? stmts.slice(0, deferredPreambleCount) : []
+            await inv('db_begin_tx', { id: connectionId, database: currentSchemaRef.current || undefined, preamble })
+            executeInTx = true
+            scriptOpenedTx = true
+            setTxActive(true)
+            res = { columns: [], rows: [], rowsAffected: 0, executionTimeMs: Date.now() - startedAt, isSelect: false }
+            if (preamble.length > 0) {
+              const preambleResult: QueryResult = { columns: [], rows: [], rowsAffected: 0, executionTimeMs: 0, isSelect: false }
+              flushSync(() => {
+                setMultiResults(prev => prev.map((r, i) => i < deferredPreambleCount ? { ...r, result: preambleResult } : r))
               })
+              for (let i = 0; i < deferredPreambleCount; i++) {
+                addHistory(connectionId, stmts[i], true, { executionTimeMs: 0, rowsAffected: 0 })
+              }
+            }
+          } else if (control === 'commit') {
+            if (!executeInTx) throw new Error('没有活跃事务，请先执行 BEGIN / START TRANSACTION')
+            await inv('db_commit_tx', { id: connectionId })
+            executeInTx = false
+            scriptOpenedTx = false
+            setTxActive(false)
+            res = { columns: [], rows: [], rowsAffected: 0, executionTimeMs: Date.now() - startedAt, isSelect: false }
+          } else if (control === 'rollback') {
+            if (!executeInTx) throw new Error('没有活跃事务，请先执行 BEGIN / START TRANSACTION')
+            await inv('db_rollback_tx', { id: connectionId })
+            executeInTx = false
+            scriptOpenedTx = false
+            setTxActive(false)
+            res = { columns: [], rows: [], rowsAffected: 0, executionTimeMs: Date.now() - startedAt, isSelect: false }
+          } else {
+            // Oracle 没有独立 BEGIN TRANSACTION；脚本中的首条 DML 隐式开启固定连接事务。
+            if (connType === 'oracle' && hasScriptTxControl && !executeInTx && isTransactionalDml(s)) {
+              await inv('db_begin_tx', { id: connectionId, database: currentSchemaRef.current || undefined, preamble: [] })
+              executeInTx = true
+              scriptOpenedTx = true
+              setTxActive(true)
+            }
+            res = await inv<QueryResult>(executeInTx ? 'db_exec_in_tx' : 'execute_query', executeInTx
+              ? { id: connectionId, sql: markSql(s, token) }
+              : {
+                  id: connectionId,
+                  sql: markSql(s, token),
+                  database: currentSchemaRef.current || undefined,
+                  rowLimit: effectiveLimit ?? undefined,
+                })
+          }
           if (cancelRequestedRef.current) {
+            await rollbackScriptTx()
             flushSync(() => {
               setMultiResults(prev => markBatchCancelledFrom(prev, si))
             })
@@ -1249,11 +1322,27 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
               : prev.map((r, i) => i === si ? { ...r, error: errStr } : r))
           })
           addHistory(connectionId, s, false, { error: (cancelled ? '查询已取消' : errStr).slice(0, 200) })
-          if (executeInTx && errStr.includes('没有活跃事务')) {
-            await syncTxStatus()
+          const control = txControls[si]
+          if (scriptOpenedTx || control) {
+            const rolledBack = scriptOpenedTx && executeInTx
+            await rollbackScriptTx()
+            if (rolledBack) toast.warning('事务执行失败，已自动回滚')
+            flushSync(() => {
+              setMultiResults(prev => {
+                const start = control === 'begin' && deferredPreambleCount > 0 ? 0 : si + 1
+                return markBatchSkippedFrom(prev, start, rolledBack ? '事务已回滚，后续语句未执行' : '事务初始化失败，相关语句未执行')
+              })
+            })
             break
           }
+          if (executeInTx && errStr.includes('没有活跃事务')) {
+            await syncTxStatus()
+          }
           if (cancelled) break
+          flushSync(() => {
+            setMultiResults(prev => markBatchSkippedFrom(prev, si + 1))
+          })
+          break
         } finally {
           runTokenRef.current = null
           setRunToken(null)
@@ -1265,6 +1354,7 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
       setRunToken(null)
       cancelRequestedRef.current = false
       setQueryLimit(dbQueryLimit)
+      if (hasScriptTxControl && !txMode) setTxMode(executeInTx)
       return
     }
 
@@ -1326,6 +1416,7 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
         appendAuditLog({
           ts: Date.now(), connId: connectionId,
           connName: activeConn?.name ?? connectionId,
+          connType,
           sql: trimmed, rowsAffected: res.rowsAffected, success: true,
         })
       }
@@ -1340,6 +1431,7 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
         appendAuditLog({
           ts: Date.now(), connId: connectionId,
           connName: activeConn?.name ?? connectionId,
+          connType,
           sql: trimmed, rowsAffected: 0, success: false,
           error: errStr.slice(0, 200),
         })
@@ -1977,11 +2069,11 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
         {!resultClosed && (running || result !== null || !!error || multiResults.length > 0) && (() => {
           // 执行消息日志（dataResults/dataIdx/activeData 用组件级 hoisted 版本）
           // 当前正在执行的语句下标（首个既无结果也无错误者）
-          const curIdx = multiResults.findIndex(m => !m.result && !m.error && !m.cancelled)
-          type MsgStatus = 'ok' | 'err' | 'cancelled' | 'running' | 'pending'
+          const curIdx = multiResults.findIndex(m => !m.result && !m.error && !m.cancelled && !m.skipped)
+          type MsgStatus = 'ok' | 'err' | 'cancelled' | 'skipped' | 'running' | 'pending'
           const msgs: Array<{ sql: string; status: MsgStatus; ok: boolean; error: string; hasCols: boolean; rows: number; affected: number; ms: number }> = multiResults.length > 0
             ? multiResults.map((m, i) => {
-                const status: MsgStatus = m.cancelled ? 'cancelled' : m.error ? 'err' : m.result ? 'ok' : (running && i === curIdx ? 'running' : 'pending')
+                const status: MsgStatus = m.cancelled ? 'cancelled' : m.skipped ? 'skipped' : m.error ? 'err' : m.result ? 'ok' : (running && i === curIdx ? 'running' : 'pending')
                 return { sql: m.sql, status, ok: status === 'ok', error: m.error, hasCols: !!(m.result && (m.result.columns.length > 0 || m.result.isSelect)), rows: m.result?.rows.length ?? 0, affected: m.result?.rowsAffected ?? 0, ms: m.result?.executionTimeMs ?? 0 }
               })
             : error ? [{ sql: lastRunSql, status: 'err', ok: false, error, hasCols: false, rows: 0, affected: 0, ms: lastElapsedRef.current }]
@@ -1991,7 +2083,8 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
           const okCount = msgs.filter(m => m.status === 'ok').length
           const errCount = msgs.filter(m => m.status === 'err').length
           const cancelledCount = msgs.filter(m => m.status === 'cancelled').length
-          const doneCount = okCount + errCount + cancelledCount
+          const skippedCount = msgs.filter(m => m.status === 'skipped').length
+          const doneCount = okCount + errCount + cancelledCount + skippedCount
           const totalMs = msgs.reduce((s, m) => s + m.ms, 0)
           // DataGrip 风格消息日志：[起始时间] schema> SQL ；[结束时间] 结果 + 耗时(总/执行/拉取)
           const startTs = runStartRef.current || Date.now()
@@ -2005,7 +2098,8 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
           const schemaPrompt = currentSchema || activeConn?.database || ''
           // 单条查询能算出总/执行/拉取拆分；多条按各自执行时长展示
           const resultText = (m: typeof msgs[number]) => {
-            if (m.status === 'cancelled') return '查询已取消'
+            if (m.status === 'cancelled') return m.error || '查询已取消'
+            if (m.status === 'skipped') return m.error || '前序语句执行失败，未执行'
             if (!m.ok) return m.error
             if (m.hasCols) {
               if (!hasMulti) {
@@ -2015,7 +2109,8 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
               }
               return `返回 ${m.rows} 行，耗时 ${formatDuration(m.ms)}`
             }
-            return `执行成功，影响 ${m.affected} 行，耗时 ${formatDuration(hasMulti ? m.ms : runTotal)}`
+            const affected = affectedRowsDisplay(connType, m.sql, m.affected)
+            return `执行成功，${affected.detail}，耗时 ${formatDuration(hasMulti ? m.ms : runTotal)}`
           }
           return (
         <div className={`sql-result-pane${resultCollapsed ? ' collapsed' : ''}`} style={resultCollapsed ? undefined : { height: resultH }}>
@@ -2133,9 +2228,10 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
                     </thead>
                     <tbody>
                       {msgs.map((m, i) => {
-                        const msgText = m.status === 'ok' ? (m.hasCols ? `查询 ${m.rows} 行` : `影响 ${m.affected} 行`)
+                        const msgText = m.status === 'ok' ? (m.hasCols ? `查询 ${m.rows} 行` : affectedRowsDisplay(connType, m.sql, m.affected).summary)
                           : m.status === 'err' ? (m.error ?? '')
-                          : m.status === 'cancelled' ? '查询已取消'
+                          : m.status === 'cancelled' ? (m.error || '查询已取消')
+                          : m.status === 'skipped' ? (m.error || '前序语句执行失败，未执行')
                           : m.status === 'running' ? '执行中…' : '等待中'
                         const openCtx = (e: React.MouseEvent) => {
                           e.stopPropagation()
@@ -2158,6 +2254,8 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
                                 <span className="sql-summary__badge sql-summary__badge--err">错误</span>
                               ) : m.status === 'cancelled' ? (
                                 <span className="sql-summary__badge" style={{ color: 'var(--text-muted)', background: 'transparent' }}>取消</span>
+                              ) : m.status === 'skipped' ? (
+                                <span className="sql-summary__badge" style={{ color: 'var(--text-muted)', background: 'transparent' }}>跳过</span>
                               ) : m.status === 'running' ? (
                                 <span className="sql-summary__badge" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color: 'var(--accent)', background: 'transparent' }}>
                                   <Loader2 size={11} className="spin" /> 执行中
@@ -2237,6 +2335,7 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
           <Suspense fallback={null}>
             <QueryHistoryPanel
               connectionId={connectionId}
+              connType={connType}
               width={historyWidth}
               onPick={insertSqlAtCursor}
               onSaveAsQuery={(sql) => { setSaveSqlOverride(sql); setHistoryOpen(false); setSavedOpen(true) }}
@@ -2366,11 +2465,12 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
           <SqlVariableDialog
             sql={variablePending.sql}
             variables={variablePending.variables}
+            connType={connType}
             onCancel={() => setVariablePending(null)}
             onRun={(values, modes) => {
               const pending = variablePending
               setVariablePending(null)
-              runQuery(applySqlVariables(pending.sql, pending.variables, values, modes))
+              runQuery(applySqlVariables(pending.sql, pending.variables, values, modes, connType))
             }}
           />
         </Suspense>

@@ -30,6 +30,7 @@ import MongoMaskExportPanel from './MongoMaskExportPanel'
 import MongoBalancerPanel from './MongoBalancerPanel'
 import MongoRecoveryPanel from './MongoRecoveryPanel'
 import MongoSmartShellPanel from './MongoSmartShellPanel'
+import { listenMongoExportProgress, queueBackgroundExport } from '../../utils/exportTasks'
 
 interface Props { connectionId: string }
 
@@ -985,15 +986,24 @@ export default function MongoBrowser({ connectionId }: Props) {
   async function doExport(outputPath: string) {
     if (!activeDb || !activeColl) return
     setExportLoading(true); setExportResult(null); setExportError(null)
-    try {
-      const count = await invoke<number>('mongo_export_collection', {
-        id: connectionId, db: activeDb, coll: activeColl,
+    const db = activeDb
+    const coll = activeColl
+    queueBackgroundExport({
+      connectionId,
+      label: `${db}.${coll} · 集合导出`,
+      filePath: outputPath,
+      prepare: listenMongoExportProgress,
+      run: taskId => invoke<number>('mongo_export_collection', {
+        id: connectionId, db, coll,
         filterJson: filterJson ?? '', projectionJson: '', format: exportFormat,
-        outputPath,
-      })
-      setExportResult(`导出成功：${count} 条文档已写入 ${outputPath}`)
-    } catch (e) { setExportError(String(e)) }
-    finally { setExportLoading(false) }
+        outputPath, taskId,
+      }),
+      complete: count => ({ progressRows: count, message: `导出完成 · ${count.toLocaleString()} 个文档` }),
+      successMessage: count => `MongoDB 集合导出完成：${count.toLocaleString()} 个文档`,
+      errorPrefix: 'MongoDB 集合导出失败',
+    })
+    setShowExport(false)
+    setExportLoading(false)
   }
 
   // MO8.2 导入集合

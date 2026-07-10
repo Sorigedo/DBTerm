@@ -10,14 +10,14 @@ use tauri::State;
 use crate::models::{ColumnInfo, ConnConfig, ConnType, QueryResult, TableInfo};
 use crate::storage::StorageState;
 
-fn base_url(config: &ConnConfig) -> String {
+pub(crate) fn base_url(config: &ConnConfig) -> String {
     let host = config.host.as_deref().unwrap_or("127.0.0.1");
     let port = config.port.unwrap_or(8123);
     let scheme = if config.use_ssl { "https" } else { "http" };
     format!("{scheme}://{host}:{port}/")
 }
 
-fn client() -> Result<reqwest::Client, String> {
+pub(crate) fn client() -> Result<reqwest::Client, String> {
     // 复用单个 reqwest::Client（内部按 host 维护 keep-alive 连接池），避免每次查询重建 → 每查询一次 TCP/TLS 握手。
     // Client::clone 很廉价（内部 Arc）；不同 ClickHouse 主机共享同一 Client 也安全（按 host 分池）。
     use std::sync::OnceLock;
