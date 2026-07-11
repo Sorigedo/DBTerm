@@ -131,10 +131,22 @@ function sqlLiteral(v: string | null): string {
   return sqlStr(v)
 }
 
-// 当前焦点是否在编辑器 / 输入框（用于无文本选区时避免误复制结果单元格）
-function isInEditorOrInput(): boolean {
-  const el = document.activeElement as HTMLElement | null
-  return !!(el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable || el.classList.contains('cm-content')))
+// 当前焦点、事件或文本选区是否在编辑器 / 输入框。
+// CodeMirror 只读视图在 WebKit 中不保证 activeElement 始终是 .cm-content，
+// 因此也检查 .cm-editor 祖先和选区锚点，避免结果表抢占 DDL 的全选/复制。
+function isInEditorOrInput(target?: EventTarget | null): boolean {
+  const isEditingElement = (node: EventTarget | Node | null): boolean => {
+    const el = node instanceof HTMLElement ? node : node instanceof Node ? node.parentElement : null
+    return !!(el && (
+      el.tagName === 'INPUT'
+      || el.tagName === 'TEXTAREA'
+      || el.isContentEditable
+      || el.closest('.cm-editor')
+    ))
+  }
+  if (isEditingElement(target ?? null) || isEditingElement(document.activeElement)) return true
+  const selection = window.getSelection()
+  return !!(selection?.rangeCount && isEditingElement(selection.anchorNode))
 }
 // 复制聚焦输入框/文本域内选中文本；输入框聚焦时一律拦截（避免落到结果单元格）
 function copyInputSelection(): boolean {
@@ -766,7 +778,7 @@ export default function ResultTable({
   // 仅当"选了行 / 聚焦单元格但无文本选区"时由我们接管，避免"选中即复制 + 到处弹提示"。
   useEffect(() => {
     const onCopy = (e: ClipboardEvent) => {
-      if (isInEditorOrInput()) return
+      if (isInEditorOrInput(e.target)) return
       // 显式选中行优先于浏览器自带文本选区（拖拽选行常残留文本选区，否则会退化成单行原生复制）
       if (selectedRows.size > 0) {
         const t = buildRowsText(viewMode === 'json' ? 'json' : 'tsv')
@@ -872,8 +884,7 @@ export default function ResultTable({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!active || !(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'a' || e.shiftKey || e.altKey) return
-      const ae = document.activeElement as HTMLElement | null
-      if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable || ae.classList.contains('cm-content'))) return
+      if (isInEditorOrInput(e.target)) return
       if (pageRows.length === 0 || colOrder.length === 0) return
       e.preventDefault()
       setSelectedRows(new Set())
@@ -891,7 +902,7 @@ export default function ResultTable({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!active || !(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'c' || e.shiftKey || e.altKey) return
-      if (isInEditorOrInput()) return
+      if (isInEditorOrInput(e.target)) return
       if (selectedRows.size > 0) {
         const t = buildRowsText(viewMode === 'json' ? 'json' : 'tsv')
         if (t) { e.preventDefault(); navigator.clipboard.writeText(t).then(() => toast.success(`已复制 ${selectedRows.size} 行`)).catch(() => {}) }

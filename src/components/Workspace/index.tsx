@@ -20,8 +20,40 @@ const SchemaBrowser = lazy(() => import('../SchemaBrowser'))
 const TableBrowser = lazy(() => import('../DbTools/TableBrowser'))
 const DbToolPanels = lazy(() => import('../DbTools/DbToolPanels'))
 
+const QUERY_SLEEP_DELAY_MS = 60_000
+
 function LazyPaneFallback({ label = '加载中...' }: { label?: string }) {
   return <div className="workspace-lazy-fallback">{label}</div>
+}
+
+function SleepingSqlEditor({ tabId, connectionId, connType, active }: {
+  tabId: string
+  connectionId: string
+  connType: ConnConfig['type']
+  active: boolean
+}) {
+  const [awake, setAwake] = useState(active)
+  const [running, setRunning] = useState(false)
+
+  useEffect(() => {
+    if (active) {
+      setAwake(true)
+      return
+    }
+    if (!awake || running) return
+    const timer = window.setTimeout(() => setAwake(false), QUERY_SLEEP_DELAY_MS)
+    return () => window.clearTimeout(timer)
+  }, [active, awake, running])
+
+  if (!active && !awake) return null
+  return (
+    <SqlEditor
+      tabId={tabId}
+      connectionId={connectionId}
+      connType={connType}
+      onRunningChange={setRunning}
+    />
+  )
 }
 
 function tabPreviewIcon(tab?: WorkspaceTab) {
@@ -361,10 +393,11 @@ export default function Workspace() {
                         ? <RedisBrowser connectionId={t.connectionId} active={isTabVisible(t.id)} />
                         : conn?.type === 'mongodb'
                         ? <MongoBrowser connectionId={t.connectionId} />
-                        : <SqlEditor
+                        : <SleepingSqlEditor
                             tabId={t.id}
                             connectionId={t.connectionId}
                             connType={conn?.type ?? 'mysql'}
+                            active={isTabVisible(t.id)}
                           />
                       }
                     </Suspense>

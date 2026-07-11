@@ -134,6 +134,7 @@ interface Props {
   tabId: string
   connectionId: string
   connType: ConnType
+  onRunningChange?: (running: boolean) => void
 }
 
 const DEFAULT_SQL = ''
@@ -406,7 +407,7 @@ function sqlParenFoldRange(doc: string, lineStart: number, lineEnd: number): { f
   return null
 }
 
-export default function SqlEditor({ tabId, connectionId, connType }: Props) {
+export default function SqlEditor({ tabId, connectionId, connType, onRunningChange }: Props) {
   // SQL 草稿按顶层 tabId 存储（已扁平化，每个查询标签即一个独立编辑器，无内层子标签）
   const savedSql = useQueryStore((s) => s.sqls[tabId])
   const { setSql } = useQueryStore()
@@ -421,6 +422,7 @@ export default function SqlEditor({ tabId, connectionId, connType }: Props) {
   const lastElapsedRef = useRef(0)   // 上一次执行的实际耗时（出错/取消时用，避免显示 0ms）
   const runTokenRef = useRef<string | null>(null)
   const cancelRequestedRef = useRef(false)
+  useEffect(() => { onRunningChange?.(running) }, [onRunningChange, running])
   // 运行期间每 100ms 刷新一次耗时显示
   useEffect(() => {
     if (!running) { setElapsedMs(0); return }
