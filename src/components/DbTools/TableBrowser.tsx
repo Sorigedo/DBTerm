@@ -434,7 +434,13 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
   const visible = () => !!tableWrapRef.current?.offsetParent
   useShortcuts('result-table', {
     tableRefresh:  () => { if (visible()) { setPage(0); fetchCount(); fetchData() } },
-    tableFilter:   () => { if (visible()) setSearchOpen(true) },
+    tableFilter:   () => {
+      if (!visible()) return
+      setSearchOpen(open => {
+        if (open) { setSearchText(''); setMatchIdx(0) }
+        return !open
+      })
+    },
     tableAddRow:   () => { if (visible() && columns.length) addDraftRow() },
     tableDelRow:   () => { if (visible() && selectedRows.size) askDeleteRows([...selectedRows]) },
     tableExport:   () => { if (visible()) { setExportOpen(true); setCopyOpen(false); setTblMenuOpen(false) } },

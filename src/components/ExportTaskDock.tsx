@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { CheckCircle2, ChevronDown, ChevronUp, Download, FolderOpen, Loader2, Trash2, XCircle } from 'lucide-react'
+import { AlertCircle, CheckCircle2, ChevronDown, ChevronUp, ClipboardCopy, Download, FolderOpen, Loader2, Trash2, X, XCircle } from 'lucide-react'
 import { useExportTaskStore, type ExportTask } from '../stores/exportTaskStore'
+import { copyText } from '../utils/clipboard'
 
 const DONE_VISIBLE_MS = 8_000
 const CANCELLED_VISIBLE_MS = 5_000
@@ -18,7 +19,7 @@ function fmtDuration(task: ExportTask, now: number) {
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`
 }
 
-function TaskRow({ task, now }: { task: ExportTask; now: number }) {
+function TaskRow({ task, now, onShowError }: { task: ExportTask; now: number; onShowError: (task: ExportTask) => void }) {
   const cancelTask = useExportTaskStore(s => s.cancelTask)
   const removeTask = useExportTaskStore(s => s.removeTask)
   const running = task.status === 'running'
@@ -36,9 +37,14 @@ function TaskRow({ task, now }: { task: ExportTask; now: number }) {
     } catch { /* ignore */ }
   }
 
+  const restoreDialog = () => {
+    window.dispatchEvent(new CustomEvent('dbterm:restore-export-dialog', { detail: { taskId: task.id } }))
+  }
+
   return (
     <div className="export-dock__task">
-      <div className="export-dock__task-main">
+      <div className="export-dock__task-main" onClick={restoreDialog}
+        style={{ cursor: 'pointer' }} title="点击恢复导出进度弹窗">
         {running ? <Loader2 size={14} className="spin export-dock__status-running" />
           : task.status === 'done' ? <CheckCircle2 size={14} className="export-dock__status-done" />
           : task.status === 'cancelled' ? <XCircle size={14} className="export-dock__status-cancelled" />
@@ -53,17 +59,17 @@ function TaskRow({ task, now }: { task: ExportTask; now: number }) {
           </div>
         </div>
         {running && task.cancelable && (
-          <button className="export-dock__icon-btn" onClick={() => cancelTask(task.id)} data-tip="取消导出">
+          <button className="export-dock__icon-btn" onClick={e => { e.stopPropagation(); cancelTask(task.id) }} data-tip="取消导出">
             <XCircle size={13} />
           </button>
         )}
         {!running && task.filePath && (
-          <button className="export-dock__icon-btn" onClick={reveal} data-tip="在文件管理器中显示">
+          <button className="export-dock__icon-btn" onClick={e => { e.stopPropagation(); void reveal() }} data-tip="在文件管理器中显示">
             <FolderOpen size={13} />
           </button>
         )}
         {!running && (
-          <button className="export-dock__icon-btn" onClick={() => removeTask(task.id)} data-tip="移除记录">
+          <button className="export-dock__icon-btn" onClick={e => { e.stopPropagation(); removeTask(task.id) }} data-tip="移除记录">
             <Trash2 size={13} />
           </button>
         )}
@@ -73,7 +79,10 @@ function TaskRow({ task, now }: { task: ExportTask; now: number }) {
           <div className="export-dock__progress-fill" style={pct === null ? undefined : { width: `${pct}%` }} />
         </div>
       )}
-      {task.status === 'error' && task.error && <div className="export-dock__error">{task.error}</div>}
+      {task.status === 'error' && task.error && (
+        <button className="export-dock__error" onClick={() => onShowError(task)} title="查看完整错误"
+          style={{ width: '100%', textAlign: 'left', cursor: 'pointer' }}>{task.error}</button>
+      )}
     </div>
   )
 }
@@ -85,6 +94,7 @@ export default function ExportTaskDock() {
   const clearDone = useExportTaskStore(s => s.clearDone)
   const removeTask = useExportTaskStore(s => s.removeTask)
   const [now, setNow] = useState(Date.now())
+  const [errorTask, setErrorTask] = useState<ExportTask | null>(null)
   const running = tasks.filter(t => t.status === 'running').length
   const hasAutoExpiringTask = tasks.some(t => t.status === 'done' || t.status === 'cancelled')
 
@@ -115,7 +125,7 @@ export default function ExportTaskDock() {
 
   if (tasks.length === 0) return null
 
-  return createPortal(
+  return createPortal(<>
     <div className={`export-dock${expanded ? ' is-expanded' : ''}`}>
       <button className="export-dock__head" onClick={() => setExpanded(!expanded)}>
         <Download size={15} />
@@ -127,14 +137,35 @@ export default function ExportTaskDock() {
       {expanded && (
         <div className="export-dock__body">
           <div className="export-dock__list">
-            {tasks.map(task => <TaskRow key={task.id} task={task} now={now} />)}
+            {tasks.map(task => <TaskRow key={task.id} task={task} now={now} onShowError={setErrorTask} />)}
           </div>
           {tasks.some(t => t.status !== 'running') && (
             <button className="export-dock__clear" onClick={clearDone}>清除已结束任务</button>
           )}
         </div>
       )}
-    </div>,
+    </div>
+    {errorTask?.error && (
+      <div className="cdlg-overlay" onMouseDown={() => setErrorTask(null)}>
+        <div className="cdlg-box" onMouseDown={e => e.stopPropagation()}
+          style={{ width: 620, maxWidth: 'calc(100vw - 32px)', borderRadius: 14, overflow: 'hidden' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '14px 16px', borderBottom: '1px solid var(--border)' }}>
+            <AlertCircle size={15} color="#dc2626" />
+            <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-bright)' }}>导出错误详情</span>
+            <button onClick={() => setErrorTask(null)} style={{ marginLeft: 'auto', color: 'var(--text-muted)', lineHeight: 0 }}><X size={15} /></button>
+          </div>
+          <div style={{ padding: 16 }}>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8 }}>{errorTask.label}</div>
+            <pre style={{ margin: 0, padding: 12, maxHeight: '45vh', overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12, lineHeight: 1.6, color: 'var(--text)', background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 8 }}>{errorTask.error}</pre>
+          </div>
+          <div style={{ padding: '12px 16px', borderTop: '1px solid var(--border)', display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+            <button onClick={() => setErrorTask(null)} style={{ padding: '7px 16px', borderRadius: 8, background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'var(--text)' }}>关闭</button>
+            <button onClick={() => void copyText(errorTask.error ?? '')} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '7px 16px', borderRadius: 8, background: 'var(--accent)', color: '#fff' }}><ClipboardCopy size={13} />复制错误</button>
+          </div>
+        </div>
+      </div>
+    )}
+  </>,
     document.body,
   )
 }

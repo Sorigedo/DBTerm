@@ -1,6 +1,6 @@
 ﻿import { useState, useEffect, useRef, useCallback } from 'react'
 import { createPortal } from 'react-dom'
-import { X, Download, FolderOpen, CheckCircle, XCircle, Loader, AlertTriangle } from 'lucide-react'
+import { X, Download, FolderOpen, CheckCircle, XCircle, Loader, AlertTriangle, Minus } from 'lucide-react'
 import SearchableSelect from '../DbTools/SearchableSelect'
 import { formatDuration } from '../../utils/formatDuration'
 import { unregisterExportCancelHandler, useExportTaskStore } from '../../stores/exportTaskStore'
@@ -85,6 +85,7 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
   const [baseDir,     setBaseDir]     = useState('')   // 默认导出目录（下载目录），保证默认路径为绝对路径
   const [elapsedMs,   setElapsedMs]   = useState(0)
   const [cancelling,  setCancelling]  = useState(false)
+  const [minimized,   setMinimized]   = useState(false)
   const exportStartRef = useRef(0)
   const exportTokenRef = useRef<string | null>(null)
   const activeTaskIdRef = useRef<string | null>(null)
@@ -123,14 +124,25 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [format, baseDir])
 
-  // 按 Esc 关闭（仅 config / done / error / cancelled 状态）
+  // 导出中关闭仅最小化；结束后才真正卸载弹窗。
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && phase !== 'running') onClose()
+      if (e.key !== 'Escape') return
+      if (phase === 'running') setMinimized(true)
+      else onClose()
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
   }, [phase, onClose])
+
+  useEffect(() => {
+    const restore = (event: Event) => {
+      const taskId = (event as CustomEvent<{ taskId?: string }>).detail?.taskId
+      if (taskId && taskId === activeTaskIdRef.current) setMinimized(false)
+    }
+    window.addEventListener('dbterm:restore-export-dialog', restore)
+    return () => window.removeEventListener('dbterm:restore-export-dialog', restore)
+  }, [])
 
   const pickFile = async () => {
     try {
@@ -166,7 +178,6 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
     registerStreamExportCancellation(taskId, connectionId, () => exportTokenRef.current, () => {
       cancelRequestedRef.current = true
     })
-    onClose()
 
     // DuckDB 高速通道（COPY TO，无需把结果拉回前端）。CSV 仅 UTF-8 时走原生 COPY，避免忽略用户选择的 GBK/BOM。
     if (isDuck && (format === 'parquet' || (format === 'csv' && encoding === 'utf8'))) {
@@ -293,6 +304,13 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
 
   const runningElapsedMs = Math.max(elapsedMs, progress?.elapsed_ms ?? 0)
 
+  if (minimized) return null
+
+  const closeOrMinimize = () => {
+    if (phase === 'running') setMinimized(true)
+    else onClose()
+  }
+
   return createPortal(
     <div className="cdlg-overlay" onMouseDown={phase !== 'running' ? onClose : undefined}>
       <div
@@ -310,11 +328,10 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
            : phase === 'cancelled'? '已取消'
            :                        '导出失败'}
           </span>
-          {phase !== 'running' && (
-            <button onClick={onClose} style={{ marginLeft: 'auto', color: 'var(--text-muted)', lineHeight: 0 }}>
-              <X size={15} />
-            </button>
-          )}
+          <button onClick={closeOrMinimize} data-tip={phase === 'running' ? '最小化到导出任务' : '关闭'}
+            style={{ marginLeft: 'auto', color: 'var(--text-muted)', lineHeight: 0 }}>
+            {phase === 'running' ? <Minus size={15} /> : <X size={15} />}
+          </button>
         </div>
 
         <div style={{ padding: '16px' }}>

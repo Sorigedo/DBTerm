@@ -9,7 +9,7 @@ use crate::{
     storage::StorageState,
 };
 use super::duckdb::{DuckPool, dispatch_duck_query};
-use super::sqlserver::{SsPool, dispatch_ss_query, dispatch_ss_columns};
+use super::sqlserver::{SsPool, dispatch_ss_query, dispatch_ss_columns, dispatch_ss_ddl};
 use super::driver::DriverRegistry;
 
 // ── 客户端标识 ────────────────────────────────────────────────────────────────
@@ -1373,6 +1373,20 @@ pub async fn db_export_table(
     };
     let tagged_sql = tag_sql(&select_sql);
 
+    let sqlserver_has_identity = if matches!(config.conn_type, ConnType::SqlServer) && format == "sql" {
+        let db_context = if schema.is_empty() { String::new() } else {
+            format!("USE [{}]; ", schema.replace(']', "]]"))
+        };
+        let object_name = format!("[dbo].[{}]", table.replace(']', "]]"));
+        let identity_sql = format!(
+            "{db_context}SELECT CASE WHEN EXISTS (SELECT 1 FROM sys.identity_columns WHERE object_id=OBJECT_ID(N'{}')) THEN 1 ELSE 0 END AS has_identity",
+            object_name.replace('\'', "''")
+        );
+        super::sqlserver::dispatch_ss_query(&id, &config, &identity_sql, &*ss_pool).await
+            .ok().and_then(|r| r.rows.first().and_then(|row| row.first()).cloned().flatten())
+            .as_deref() == Some("1")
+    } else { false };
+
     // 结构导出仅支持 MySQL 系（SHOW CREATE TABLE）
     if structure.is_some()
         && !matches!(config.conn_type, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase) {
@@ -1502,8 +1516,15 @@ pub async fn db_export_table(
                     let is_my = matches!(conn_type, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase);
                     if row_count == 0 {
                         write!(w, "-- ----------------------------\n-- Records of {table}\n-- ----------------------------\n").ok();
-                        // Oracle 的 BEGIN 是 PL/SQL 块起始，不能用作事务包裹；其余库用 BEGIN;
-                        if !matches!(conn_type, ConnType::Oracle) { write!(w, "BEGIN;\n").ok(); }
+                        // Oracle 的 BEGIN 是 PL/SQL 块起始；SQL Server 需明确写 BEGIN TRANSACTION。
+                        if matches!(conn_type, ConnType::SqlServer) {
+                            write!(w, "BEGIN TRANSACTION;\n").ok();
+                        } else if !matches!(conn_type, ConnType::Oracle) {
+                            write!(w, "BEGIN;\n").ok();
+                        }
+                        if sqlserver_has_identity {
+                            write!(w, "SET IDENTITY_INSERT [{}] ON;\n", table.replace(']', "]]" )).ok();
+                        }
                     }
                     let tbl_ref = q(&table);
                     let col_list = col_names.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
@@ -1669,6 +1690,9 @@ pub async fn db_export_table(
     match format.as_str() {
         "sql" => {
             // Oracle 不用 BEGIN/COMMIT 包裹（BEGIN 为 PL/SQL 块）；SET FOREIGN_KEY_CHECKS 仅 MySQL
+            if row_count > 0 && sqlserver_has_identity {
+                write!(w, "SET IDENTITY_INSERT [{}] OFF;\n", table.replace(']', "]]" )).ok();
+            }
             if row_count > 0 && !matches!(conn_type, ConnType::Oracle) { write!(w, "COMMIT;\n").ok(); }
             if matches!(conn_type, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase) {
                 write!(w, "\nSET FOREIGN_KEY_CHECKS = 1;\n").ok();
@@ -4548,6 +4572,7 @@ pub async fn db_logical_backup(
     app_handle: tauri::AppHandle,
     cancel_map: State<'_, crate::commands::db_export::ExportCancelMap>,
     storage:    State<'_, StorageState>,
+    ss_pool:    State<'_, SsPool>,
 ) -> Result<BackupResult, String> {
     use std::io::{BufWriter, Write};
     use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
@@ -4578,6 +4603,139 @@ pub async fn db_logical_backup(
 
     let total_tables = table_list.len() as u64;
 
+    // SQL Server 大库按表拆分，避免单个 SQL 文件过大，也便于按表恢复。
+    if config.conn_type == ConnType::SqlServer {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let file = std::fs::File::create(&path).map_err(|e| format!("创建备份文件失败: {e}"))?;
+        let mut zip = zip::ZipWriter::new(BufWriter::with_capacity(1024 * 1024, file));
+        // 表数据量不可预知，始终使用 ZIP64 条目；否则单表 SQL 超过 4 GiB 会在导出末尾失败。
+        let options = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .large_file(true);
+
+        let emit = |current_table: &str, done: u64, current_rows: u64| {
+            #[derive(serde::Serialize, Clone)]
+            #[serde(rename_all = "camelCase")]
+            struct P { current_table: String, total_tables: u64, done_tables: u64, current_rows: u64 }
+            let payload = P { current_table: current_table.to_string(), total_tables, done_tables: done, current_rows };
+            let _ = app_handle.emit("backup_progress", payload.clone());
+            if let Some(ref tid) = task_id {
+                let _ = app_handle.emit(&format!("backup_progress_{tid}"), payload);
+            }
+        };
+
+        let q = |name: &str| format!("[{}]", name.replace(']', "]]"));
+        // SchemaBrowser 的 `schema` 对 SQL Server 表示数据库名；当前平铺列表使用默认 dbo schema。
+        let database_name = schema.as_str();
+        let schema_name = "dbo";
+        let mut tables_done = 0u64;
+        let mut total_rows_backed = 0u64;
+
+        for tbl in &table_list {
+            if cancel_flag.load(Ordering::Relaxed) {
+                cleanup_cancel();
+                drop(zip);
+                let _ = std::fs::remove_file(&path);
+                return Err("备份已取消".into());
+            }
+            emit(tbl, tables_done, 0);
+            let entry_name = format!("tables/{}.sql", tbl.replace(['/', '\\', ':'], "_"));
+            zip.start_file(entry_name, options).map_err(|e| format!("创建 ZIP 条目失败: {e}"))?;
+            writeln!(zip, "-- DBTerm SQL Server logical backup\n-- Database: {}\n-- Table: {}.{}\nSET NOCOUNT ON;\n", database_name, schema_name, tbl)
+                .map_err(|e| format!("写入备份失败: {e}"))?;
+
+            let table_ref = format!("{}.{}", q(schema_name), q(tbl));
+            if with_structure {
+                let ddl = dispatch_ss_ddl(&id, &config, database_name, tbl, &ss_pool).await?;
+                writeln!(zip, "IF OBJECT_ID(N'{}', N'U') IS NOT NULL DROP TABLE {};\n{}\nGO\n", table_ref.replace('\'', "''"), table_ref, ddl)
+                    .map_err(|e| format!("写入表结构失败: {e}"))?;
+            }
+
+            let mut row_count = 0u64;
+            if with_data {
+                use futures::TryStreamExt;
+                use tiberius::QueryItem;
+                let entry_arc = super::sqlserver::get_entry(&id, &ss_pool, &config, password.as_deref()).await?;
+                let mut entry = entry_arc.lock().await;
+                let db_context = if database_name.is_empty() { String::new() } else { format!("USE {}; ", q(database_name)) };
+                let identity_sql = format!(
+                    "{db_context}SELECT CASE WHEN EXISTS (SELECT 1 FROM sys.identity_columns WHERE object_id = OBJECT_ID(N'{}')) THEN 1 ELSE 0 END",
+                    table_ref.replace('\'', "''")
+                );
+                let has_identity = entry.client.simple_query(identity_sql).await
+                    .map_err(|e| format!("读取表 {tbl} 自增信息失败: {e}"))?
+                    .into_row().await
+                    .map_err(|e| format!("读取表 {tbl} 自增信息失败: {e}"))?
+                    .and_then(|r| r.get::<i32, _>(0)).unwrap_or(0) == 1;
+                if has_identity {
+                    writeln!(zip, "SET IDENTITY_INSERT {table_ref} ON;")
+                        .map_err(|e| format!("写入表 {tbl} 数据失败: {e}"))?;
+                }
+                let mut stream = entry.client.simple_query(format!("{db_context}SELECT * FROM {table_ref}")).await
+                    .map_err(|e| format!("读取表 {tbl} 失败: {e}"))?;
+                let mut columns: Vec<String> = Vec::new();
+                while let Some(item) = stream.try_next().await.map_err(|e| format!("读取表 {tbl} 失败: {e}"))? {
+                    match item {
+                        QueryItem::Metadata(meta) => {
+                            if columns.is_empty() { columns = meta.columns().iter().map(|c| q(c.name())).collect(); }
+                        }
+                        QueryItem::Row(row) => {
+                            if columns.is_empty() { columns = row.columns().iter().map(|c| q(c.name())).collect(); }
+                            let vals: Vec<Option<String>> = (0..columns.len())
+                                .map(|i| super::sqlserver::cell_to_string(&row, i)).collect();
+                            let values = vals.iter().map(sql_escape_value_std).collect::<Vec<_>>().join(", ");
+                            writeln!(zip, "INSERT INTO {table_ref} ({}) VALUES ({values});", columns.join(", "))
+                                .map_err(|e| format!("写入表 {tbl} 数据失败: {e}"))?;
+                            row_count += 1;
+                            if row_count % BACKUP_PROGRESS_INTERVAL == 0 {
+                                emit(tbl, tables_done, row_count);
+                                if cancel_flag.load(Ordering::Relaxed) {
+                                    drop(stream); drop(entry); cleanup_cancel(); drop(zip);
+                                    let _ = std::fs::remove_file(&path);
+                                    return Err("备份已取消".into());
+                                }
+                            }
+                        }
+                    }
+                }
+                if has_identity {
+                    writeln!(zip, "SET IDENTITY_INSERT {table_ref} OFF;")
+                        .map_err(|e| format!("写入表 {tbl} 数据失败: {e}"))?;
+                }
+            }
+            total_rows_backed += row_count;
+            tables_done += 1;
+            emit(tbl, tables_done, row_count);
+        }
+
+        if with_structure {
+            for (dir, names) in [
+                ("views", views.as_deref().unwrap_or(&[])),
+                ("functions", funcs.as_deref().unwrap_or(&[])),
+                ("procedures", procs.as_deref().unwrap_or(&[])),
+            ] {
+                for name in names {
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        cleanup_cancel(); drop(zip); let _ = std::fs::remove_file(&path);
+                        return Err("备份已取消".into());
+                    }
+                    let ddl = dispatch_ss_ddl(&id, &config, database_name, name, &ss_pool).await?;
+                    let entry_name = format!("{dir}/{}.sql", name.replace(['/', '\\', ':'], "_"));
+                    zip.start_file(entry_name, options).map_err(|e| format!("创建 ZIP 条目失败: {e}"))?;
+                    writeln!(zip, "-- DBTerm SQL Server logical backup\n-- Object: {name}\n{ddl}\nGO")
+                        .map_err(|e| format!("写入对象 {name} 失败: {e}"))?;
+                }
+            }
+        }
+
+        zip.finish().map_err(|e| format!("完成 ZIP 备份失败: {e}"))?;
+        cleanup_cancel();
+        let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        return Ok(BackupResult { tables_done, total_rows: total_rows_backed, file_size });
+    }
+
     // 打开输出文件（流式写）
     let file = std::fs::File::create(&path).map_err(|e| format!("创建备份文件失败: {e}"))?;
     let mut writer = BufWriter::new(file);
@@ -4600,6 +4758,7 @@ pub async fn db_logical_backup(
 
     let emit = |current_table: &str, done: u64, current_rows: u64| {
         #[derive(serde::Serialize, Clone)]
+        #[serde(rename_all = "camelCase")]
         struct P { current_table: String, total_tables: u64, done_tables: u64, current_rows: u64 }
         let payload = P {
             current_table: current_table.to_string(),

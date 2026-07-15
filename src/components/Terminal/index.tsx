@@ -809,10 +809,17 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
         xterm.clear()
         return false
       }
-      // ⌘F / Ctrl+F：打开搜索栏
+      // ⌘F / Ctrl+F：切换搜索栏
       if (mod && (e.key === 'f' || e.key === 'F') && !e.shiftKey && !e.altKey) {
-        setSearchOpen(true)
-        setTimeout(() => searchInputRef.current?.focus(), 50)
+        setSearchOpen(open => {
+          if (open) {
+            setSearchVal(''); setSearchMatchCnt(0)
+            clearHighlights(); xterm.clearSelection(); xterm.focus()
+            return false
+          }
+          setTimeout(() => searchInputRef.current?.focus(), 50)
+          return true
+        })
         return false
       }
       // ⌘C / Ctrl+C：有选中内容时复制到剪贴板，否则放行（发 ^C 中断进程）

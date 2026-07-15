@@ -21,7 +21,87 @@ use crate::commands::driver::DriverRegistry;
 
 pub type ExportCancelMap = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 
-const PROGRESS_INTERVAL: u64 = 10_000;  // 每 N 行发一次进度事件；大导出减少 IPC 干扰
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveEntry {
+    pub name: String,
+    #[serde(default)]
+    pub header: String,
+    pub source_path: Option<String>,
+    #[serde(default)]
+    pub binary: bool,
+}
+
+fn safe_archive_name(name: &str) -> Result<String, String> {
+    let normalized = name.replace('\\', "/");
+    if normalized.is_empty() || normalized.starts_with('/') || normalized.contains('\0')
+        || normalized.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
+        return Err("ZIP 条目名称无效".into());
+    }
+    Ok(normalized)
+}
+
+#[tauri::command]
+pub fn db_create_export_workspace(task_id: String) -> Result<String, String> {
+    if task_id.is_empty() || !task_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err("导出任务 ID 无效".into());
+    }
+    let dir = std::env::temp_dir().join(format!("dbterm-export-{task_id}"));
+    if dir.exists() { std::fs::remove_dir_all(&dir).map_err(|e| format!("清理临时目录失败: {e}"))?; }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
+    Ok(dir.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub fn db_cleanup_export_workspace(workspace: String) -> Result<(), String> {
+    let path = std::path::PathBuf::from(workspace);
+    if !path.exists() { return Ok(()); }
+    let canonical = path.canonicalize().map_err(|e| format!("读取临时目录失败: {e}"))?;
+    let temp_root = std::env::temp_dir().canonicalize().map_err(|e| format!("读取系统临时目录失败: {e}"))?;
+    if !canonical.starts_with(temp_root) || !canonical.file_name().and_then(|n| n.to_str()).unwrap_or("").starts_with("dbterm-export-") {
+        return Err("拒绝清理非 DBTerm 导出临时目录".into());
+    }
+    std::fs::remove_dir_all(canonical).map_err(|e| format!("清理临时目录失败: {e}"))
+}
+
+#[tauri::command]
+pub fn db_pack_export_archive(path: String, workspace: String, entries: Vec<ArchiveEntry>, cleanup: Option<bool>) -> Result<u64, String> {
+    use std::io::{BufReader, BufWriter, Write};
+    super::db_extra::validate_path(&path)?;
+    let workspace_path = std::path::PathBuf::from(&workspace);
+    let canonical_workspace = workspace_path.canonicalize().map_err(|e| format!("临时目录不存在: {e}"))?;
+    let temp_root = std::env::temp_dir().canonicalize().map_err(|e| format!("读取系统临时目录失败: {e}"))?;
+    if !canonical_workspace.starts_with(temp_root) { return Err("临时目录不在系统临时目录内".into()); }
+
+    let result = (|| -> Result<u64, String> {
+        let file = std::fs::File::create(&path).map_err(|e| format!("创建 ZIP 失败: {e}"))?;
+        let mut zip = zip::ZipWriter::new(BufWriter::with_capacity(1024 * 1024, file));
+        // 所有条目预先启用 ZIP64，避免未知大小的表 SQL 超过 4 GiB 后在收尾阶段失败。
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .large_file(true);
+        for entry in entries {
+            zip.start_file(safe_archive_name(&entry.name)?, options).map_err(|e| format!("创建 ZIP 条目失败: {e}"))?;
+            if !entry.binary && !entry.header.is_empty() {
+                zip.write_all(entry.header.as_bytes()).map_err(|e| format!("写入 ZIP 失败: {e}"))?;
+                if !entry.header.ends_with('\n') { zip.write_all(b"\n").map_err(|e| format!("写入 ZIP 失败: {e}"))?; }
+            }
+            if let Some(source) = entry.source_path {
+                let canonical_source = std::path::PathBuf::from(source).canonicalize().map_err(|e| format!("临时导出文件不存在: {e}"))?;
+                if !canonical_source.starts_with(&canonical_workspace) { return Err("ZIP 源文件不在导出临时目录内".into()); }
+                let source_file = std::fs::File::open(canonical_source).map_err(|e| format!("读取临时导出文件失败: {e}"))?;
+                std::io::copy(&mut BufReader::new(source_file), &mut zip).map_err(|e| format!("写入 ZIP 数据失败: {e}"))?;
+            }
+        }
+        zip.finish().map_err(|e| format!("完成 ZIP 失败: {e}"))?;
+        Ok(std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0))
+    })();
+    if cleanup.unwrap_or(true) { let _ = std::fs::remove_dir_all(&canonical_workspace); }
+    if result.is_err() { let _ = std::fs::remove_file(&path); }
+    result
+}
+
+const PROGRESS_INTERVAL: u64 = 1_000;   // 大表持续反馈进度，避免长时间看起来卡死
 const CANCEL_CHECK_INTERVAL: u64 = 500; // 每 N 行检查取消标志
 const XLSX_MAX_ROWS: u64 = 1_048_576;
 
@@ -101,14 +181,16 @@ fn sql_escape(s: &str) -> String {
 #[derive(Clone, Copy)]
 enum IdentQuote {
     Backtick, // MySQL 系：`x`，内部 ` 翻倍
-    Double,   // PG/SQLite/DuckDB/SqlServer 等：\"x\"，内部 \" 翻倍
+    Double,   // PG/SQLite/DuckDB/Oracle 等：\"x\"，内部 \" 翻倍
+    Bracket,  // SQL Server：[x]，内部 ] 翻倍
 }
 
 impl IdentQuote {
     fn from_conn(ct: &ConnType) -> Self {
         match ct {
-            ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => Self::Backtick,
-            _ => Self::Double, // Postgres/KingBase/OpenGauss/Sqlite/Duckdb/SqlServer 等统一双引号
+            ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase | ConnType::ClickHouse => Self::Backtick,
+            ConnType::SqlServer => Self::Bracket,
+            _ => Self::Double,
         }
     }
     /// 转义并加引号；内部引号字符翻倍，防止标识符借引号逃逸（导出写入、回放触发注入）。
@@ -116,6 +198,7 @@ impl IdentQuote {
         match self {
             Self::Backtick => format!("`{}`", s.replace('`', "``")),
             Self::Double   => format!("\"{}\"", s.replace('"', "\"\"")),
+            Self::Bracket  => format!("[{}]", s.replace(']', "]]")),
         }
     }
 }
@@ -125,7 +208,7 @@ enum RowWriter<'a> {
     Jsonl,
     Json { wrote_any: bool },
     Md,
-    Sql { table: &'a str, quote: IdentQuote },
+    Sql { table: &'a str, quote: IdentQuote, mysql_escape: bool },
 }
 
 impl<'a> RowWriter<'a> {
@@ -195,7 +278,7 @@ impl<'a> RowWriter<'a> {
                 }
                 out.push('\n');
             }
-            Self::Sql { table, quote } => {
+            Self::Sql { table, quote, mysql_escape } => {
                 // 按方言加引号；内部引号翻倍，防止标识符借引号逃逸（导出写入、回放触发注入）
                 out.push_str("INSERT INTO ");
                 out.push_str(&quote.quote(table));
@@ -210,9 +293,14 @@ impl<'a> RowWriter<'a> {
                     match val {
                         None => out.push_str("NULL"),
                         Some(s) => {
-                            out.push('\'');
-                            out.push_str(&sql_escape(s));
-                            out.push('\'');
+                            if s.starts_with("0x") && s.len() > 2 && s[2..].chars().all(|c| c.is_ascii_hexdigit()) {
+                                out.push_str(s);
+                            } else {
+                                out.push('\'');
+                                if *mysql_escape { out.push_str(&sql_escape(s)); }
+                                else { out.push_str(&s.replace('\'', "''")); }
+                                out.push('\'');
+                            }
                         }
                     }
                 }
@@ -1603,12 +1691,15 @@ pub async fn db_stream_export(
     }
 
     // SQL 格式需按源连接方言选择标识符引号；查不到连接时回退双引号（更通用）
-    let ident_quote = {
+    let (ident_quote, mysql_escape) = {
         let ct = storage.lock().unwrap().load().ok()
             .and_then(|cfgs| cfgs.into_iter().find(|c| c.id == id).map(|c| c.conn_type));
         match ct {
-            Some(ct) => IdentQuote::from_conn(&ct),
-            None     => IdentQuote::Double,
+            Some(ct) => (
+                IdentQuote::from_conn(&ct),
+                matches!(ct, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase),
+            ),
+            None => (IdentQuote::Double, false),
         }
     };
 
@@ -1618,7 +1709,7 @@ pub async fn db_stream_export(
         "jsonl"=> RowWriter::Jsonl,
         "json" => RowWriter::Json { wrote_any: false },
         "md"   => RowWriter::Md,
-        "sql"  => RowWriter::Sql { table: &insert_table, quote: ident_quote },
+        "sql"  => RowWriter::Sql { table: &insert_table, quote: ident_quote, mysql_escape },
         _      => RowWriter::Csv { sep: b',' },  // csv (default)
     };
 
@@ -1755,6 +1846,116 @@ pub async fn read_file_first_line(path: String) -> Result<String, String> {
     let mut line = String::new();
     reader.read_line(&mut line).map_err(|e| format!("读取失败: {e}"))?;
     Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    fn unique_id(label: &str) -> String {
+        format!("{label}-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0))
+    }
+
+    #[test]
+    fn packs_one_sql_file_per_table() {
+        let id = unique_id("schema-archive");
+        let workspace = db_create_export_workspace(id.clone()).unwrap();
+        let source = std::path::Path::new(&workspace).join("users-data.sql");
+        std::fs::write(&source, "INSERT INTO users (id) VALUES ('1');\n").unwrap();
+        let output = std::env::temp_dir().join(format!("{id}.zip"));
+
+        let bytes = db_pack_export_archive(
+            output.to_string_lossy().into_owned(),
+            workspace,
+            vec![ArchiveEntry {
+                name: "tables/users.sql".into(),
+                header: "CREATE TABLE users (id INTEGER);".into(),
+                source_path: Some(source.to_string_lossy().into_owned()),
+                binary: false,
+            }],
+            Some(true),
+        ).unwrap();
+        assert!(bytes > 0);
+
+        let file = std::fs::File::open(&output).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        assert_eq!(archive.len(), 1);
+        let mut sql = String::new();
+        archive.by_name("tables/users.sql").unwrap().read_to_string(&mut sql).unwrap();
+        assert!(sql.contains("CREATE TABLE users"));
+        assert!(sql.contains("INSERT INTO users"));
+        std::fs::remove_file(output).ok();
+    }
+
+    #[test]
+    fn packs_schema_zips_inside_database_zip() {
+        let id = unique_id("database-archive");
+        let workspace = db_create_export_workspace(id.clone()).unwrap();
+        let schema_zip = std::path::Path::new(&workspace).join("sales.zip");
+        {
+            let file = std::fs::File::create(&schema_zip).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("tables/orders.sql", zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(b"CREATE TABLE orders (id INTEGER);").unwrap();
+            zip.finish().unwrap();
+        }
+        let output = std::env::temp_dir().join(format!("{id}.zip"));
+        db_pack_export_archive(
+            output.to_string_lossy().into_owned(),
+            workspace,
+            vec![ArchiveEntry {
+                name: "sales.zip".into(), header: String::new(),
+                source_path: Some(schema_zip.to_string_lossy().into_owned()), binary: true,
+            }],
+            Some(true),
+        ).unwrap();
+
+        let outer_file = std::fs::File::open(&output).unwrap();
+        let mut outer = zip::ZipArchive::new(outer_file).unwrap();
+        let mut nested_bytes = Vec::new();
+        outer.by_name("sales.zip").unwrap().read_to_end(&mut nested_bytes).unwrap();
+        let mut inner = zip::ZipArchive::new(std::io::Cursor::new(nested_bytes)).unwrap();
+        assert!(inner.by_name("tables/orders.sql").is_ok());
+        std::fs::remove_file(output).ok();
+    }
+
+    #[test]
+    fn rejects_archive_path_traversal() {
+        assert!(safe_archive_name("../secret.sql").is_err());
+        assert!(safe_archive_name("tables/../../secret.sql").is_err());
+        assert!(safe_archive_name("tables/users.sql").is_ok());
+    }
+
+    #[test]
+    fn stream_sql_writer_uses_dialect_quotes_and_escaping() {
+        let cols = vec!["na]me".to_string(), "payload".to_string()];
+        let vals = vec![Some("O'Reilly\\docs".to_string()), Some("0xABCD".to_string())];
+
+        let mut standard = RowWriter::Sql {
+            table: "users", quote: IdentQuote::Double, mysql_escape: false,
+        };
+        let mut pg_sql = String::new();
+        standard.write_row_to(&mut pg_sql, &cols, &vals);
+        assert!(pg_sql.contains("INSERT INTO \"users\""));
+        assert!(pg_sql.contains("'O''Reilly\\docs'"));
+        assert!(pg_sql.contains("0xABCD"));
+
+        let mut sqlserver = RowWriter::Sql {
+            table: "users", quote: IdentQuote::Bracket, mysql_escape: false,
+        };
+        let mut ss_sql = String::new();
+        sqlserver.write_row_to(&mut ss_sql, &cols, &vals);
+        assert!(ss_sql.contains("[na]]me]"));
+        assert!(ss_sql.contains("'O''Reilly\\docs'"));
+
+        let mut mysql = RowWriter::Sql {
+            table: "users", quote: IdentQuote::Backtick, mysql_escape: true,
+        };
+        let mut mysql_sql = String::new();
+        mysql.write_row_to(&mut mysql_sql, &cols, &vals);
+        assert!(mysql_sql.contains("'O\\'Reilly\\\\docs'"));
+    }
 }
 
 /// 用系统文件管理器打开文件所在目录

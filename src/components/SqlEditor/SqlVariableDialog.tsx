@@ -16,9 +16,11 @@ interface Props {
   connType: ConnType
   onCancel: () => void
   onRun: (values: Record<string, string>, modes?: Record<string, SqlVariableMode>) => void
+  submitLabel?: string
+  previewLabel?: string
 }
 
-export default function SqlVariableDialog({ sql, variables, connType, onCancel, onRun }: Props) {
+export default function SqlVariableDialog({ sql, variables, connType, onCancel, onRun, submitLabel = '执行', previewLabel = '将执行的 SQL' }: Props) {
   const names = useMemo(() => Array.from(new Set(variables.map(v => v.name))), [variables])
   const [values, setValues] = useState<Record<string, string>>(() => Object.fromEntries(names.map(n => [n, ''])))
   const [modes, setModes] = useState<Record<string, SqlVariableMode>>(
@@ -72,7 +74,7 @@ export default function SqlVariableDialog({ sql, variables, connType, onCancel, 
               </div>
             ))}
           </div>
-          <div className="sql-var-dialog__preview-head">将执行的 SQL</div>
+          <div className="sql-var-dialog__preview-head">{previewLabel}</div>
           <pre className="sql-var-dialog__preview">{previewSql.slice(0, 4000)}{previewSql.length > 4000 ? '\n...' : ''}</pre>
         </div>
         <div className="modal-footer cf-footer">
@@ -80,7 +82,7 @@ export default function SqlVariableDialog({ sql, variables, connType, onCancel, 
             <div />
             <div style={{ display: 'flex', gap: 8 }}>
               <button className="btn-cancel" onClick={onCancel}>取消</button>
-              <button className="btn-primary" onClick={submit}>执行</button>
+              <button className="btn-primary" onClick={submit}>{submitLabel}</button>
             </div>
           </div>
         </div>

@@ -506,7 +506,11 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
   // 编辑器右键菜单 + 导出目标 SQL（区分是否选中）
   const [editorCtx,   setEditorCtx]       = useState<{ x: number; y: number; hasSel: boolean } | null>(null)
   const [exportSql,   setExportSql]       = useState('')
-  const [variablePending, setVariablePending] = useState<{ sql: string; variables: SqlVariable[] } | null>(null)
+  const [variablePending, setVariablePending] = useState<{
+    sql: string
+    variables: SqlVariable[]
+    action?: 'run' | 'export'
+  } | null>(null)
   // 结果工具栏传送插槽（页签行右侧）
   const [headSlot,    setHeadSlot]        = useState<HTMLDivElement | null>(null)
   const [sqliteAdminOpen, setSqliteAdminOpen] = useState(false)
@@ -1540,16 +1544,21 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
     const target = (sel || sqlText).trim()
     if (!target) { toast.warning('没有可导出的 SQL'); return }
     const stmts = splitSqlStatements(target, connType)
+    let sqlToExport = target
     if (stmts.length > 1) {
       toast.warning(sel
         ? `选中含 ${stmts.length} 条语句，将导出第 1 条；如需指定请只选中单条`
         : `当前共 ${stmts.length} 条语句，将导出第 1 条；选中某条可单独导出`)
-      setExportSql(stmts[0])
-    } else {
-      setExportSql(target)
+      sqlToExport = stmts[0]
     }
+    const variables = findSqlVariables(sqlToExport)
+    if (variables.length > 0) {
+      setVariablePending({ sql: sqlToExport, variables, action: 'export' })
+      return
+    }
+    setExportSql(sqlToExport)
     setExportOpen(true)
-  }, [getSelectedSql, sqlText])
+  }, [getSelectedSql, sqlText, connType])
 
   // 执行计划：把当前/选中 SQL 包成对应方言的 EXPLAIN 执行，结果走结果区
   const runExplain = useCallback(() => {
@@ -2478,11 +2487,19 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
             sql={variablePending.sql}
             variables={variablePending.variables}
             connType={connType}
+            submitLabel={variablePending.action === 'export' ? '继续导出' : '执行'}
+            previewLabel={variablePending.action === 'export' ? '将导出的 SQL' : '将执行的 SQL'}
             onCancel={() => setVariablePending(null)}
             onRun={(values, modes) => {
               const pending = variablePending
               setVariablePending(null)
-              runQuery(applySqlVariables(pending.sql, pending.variables, values, modes, connType))
+              const resolved = applySqlVariables(pending.sql, pending.variables, values, modes, connType)
+              if (pending.action === 'export') {
+                setExportSql(resolved)
+                setExportOpen(true)
+              } else {
+                runQuery(resolved)
+              }
             }}
           />
         </Suspense>

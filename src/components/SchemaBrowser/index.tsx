@@ -40,6 +40,7 @@ import { useDbToolsStore } from '../../stores/dbToolsStore'
 import { clampIntoViewport } from '../../utils/menuClamp'
 import { queueTableExport } from '../../utils/exportTasks'
 import { registerExportCancelHandler, unregisterExportCancelHandler, useExportTaskStore } from '../../stores/exportTaskStore'
+import { exportSchemaArchive } from '../../utils/schemaArchiveExport'
 
 interface TableMeta {
   name: string
@@ -291,7 +292,14 @@ export default function SchemaBrowser({ connectionId, connType, schema, category
 
   // KB3 库树快捷键
   useShortcuts('db-panel', {
-    dbTreeSearch:   () => { if (!rootRef.current?.offsetParent) return; setSearchOpen(true); setTimeout(() => { filterRef.current?.focus(); filterRef.current?.select() }, 50) },
+    dbTreeSearch:   () => {
+      if (!rootRef.current?.offsetParent) return
+      setSearchOpen(open => {
+        if (open) { setFilter(''); return false }
+        setTimeout(() => { filterRef.current?.focus(); filterRef.current?.select() }, 50)
+        return true
+      })
+    },
     dbTreeRefresh:  () => { if (!rootRef.current?.offsetParent) return; load() },
     dbObjDdl:       () => { if (!rootRef.current?.offsetParent) return; toggleDetail() },
     dbObjRename:    () => { if (!rootRef.current?.offsetParent || isRoutine) return; const name = [...selected][0]; if (name) { setRenameTarget(name); setRenameInput(name); setDialogError('') } },
@@ -567,7 +575,7 @@ export default function SchemaBrowser({ connectionId, connType, schema, category
     let createdTaskId: string | null = null
     try {
       const { save } = await import('@tauri-apps/plugin-dialog')
-      const path = await save({ defaultPath: `${schema || 'export'}_${names.length}项.sql`, filters: [{ name: 'SQL', extensions: ['sql'] }] })
+      const path = await save({ defaultPath: `${schema || 'export'}_${names.length}项.zip`, filters: [{ name: 'ZIP 分对象导出', extensions: ['zip'] }] })
       if (!path) return
       const { invoke } = await import('@tauri-apps/api/core')
       const { listen } = await import('@tauri-apps/api/event')
@@ -579,14 +587,6 @@ export default function SchemaBrowser({ connectionId, connType, schema, category
         message: '正在准备导出…',
       })
       createdTaskId = taskId
-      const payload: Record<string, unknown> = {
-        id: connectionId, schema, tables: [], views: [], funcs: [], procs: [],
-        path, content, taskId,
-      }
-      if (category === 'tables')          payload.tables = names
-      else if (category === 'views')      payload.views = names
-      else if (category === 'functions')  payload.funcs = names
-      else if (category === 'procedures') payload.procs = names
       const unlisten = await listen<{
         currentTable: string
         totalTables: number
@@ -606,7 +606,21 @@ export default function SchemaBrowser({ connectionId, connType, schema, category
       registerExportCancelHandler(taskId, async () => {
         await invoke('db_cancel_export', { taskId }).catch(() => {})
       })
-      void invoke<{ tablesDone: number; totalRows: number; fileSize: number }>('db_logical_backup', payload).then(res => {
+      const objects = {
+        tables: category === 'tables' ? names : [],
+        views: category === 'views' ? names : [],
+        funcs: category === 'functions' ? names : [],
+        procs: category === 'procedures' ? names : [],
+      }
+      void exportSchemaArchive({
+        connectionId, connType, schema, objects, path, content, taskId,
+        onProgress: (table, done, total, rows) => {
+          useExportTaskStore.getState().updateTask(taskId, {
+            progressRows: rows, progressValue: done, progressTotal: total,
+            message: `${table} · ${done} / ${total} 表`,
+          })
+        },
+      }).then(res => {
         const current = useExportTaskStore.getState().tasks.find(task => task.id === taskId)
         if (current?.status !== 'running') return
         useExportTaskStore.getState().updateTask(taskId, {
@@ -1047,8 +1061,8 @@ export default function SchemaBrowser({ connectionId, connType, schema, category
               <Upload size={14} strokeWidth={1.8} />
             </button>
           )}
-          {/* db_logical_backup 仅支持 MySQL 族 / PG 族 */}
-          {category === 'tables' && ['mysql', 'mariadb', 'tidb', 'oceanBase', 'postgres', 'kingBase', 'openGauss'].includes(connType) && (
+          {/* 关系型数据库统一导出为 ZIP，每个对象独立 SQL */}
+          {category === 'tables' && ['mysql', 'mariadb', 'tidb', 'oceanBase', 'postgres', 'kingBase', 'openGauss', 'sqlite', 'duckdb', 'oracle', 'sqlServer', 'clickHouse'].includes(connType) && (
             <button className="sb-toolbar__btn sb-toolbar__btn--icon" data-tip="整库导出 / 备份（按类型全量）" onClick={() => setBackupOpen(true)}>
               <HardDrive size={14} strokeWidth={1.8} />
             </button>
@@ -1658,7 +1672,7 @@ export default function SchemaBrowser({ connectionId, connType, schema, category
         />
       )}
       {backupOpen && (
-        <BackupPanel connectionId={connectionId} schema={schema} onClose={() => setBackupOpen(false)} />
+        <BackupPanel connectionId={connectionId} schema={schema} connType={connType} onClose={() => setBackupOpen(false)} />
       )}
       {migrationOpen && (
         <MigrationWizard connections={connections} defaultSrcId={connectionId} defaultSrcSchema={schema} defaultDstId={connectionId} defaultDstSchema={schema} onClose={() => setMigrationOpen(false)} />

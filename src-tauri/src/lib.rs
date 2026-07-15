@@ -434,6 +434,9 @@ pub fn run() {
             commands::db_diff::db_diff_data,
             // 流式导出
             commands::db_export::db_stream_export,
+            commands::db_export::db_create_export_workspace,
+            commands::db_export::db_cleanup_export_workspace,
+            commands::db_export::db_pack_export_archive,
             commands::db_export::db_cancel_export,
             commands::db_export::reveal_in_folder,
             commands::db_export::read_file_first_line,

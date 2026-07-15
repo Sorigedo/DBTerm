@@ -2,18 +2,20 @@
 // 复用后端 db_logical_backup（按库逐个顺序执行，createDb=true 让每个文件自带建库+USE）
 import { useState, useEffect, useRef } from 'react'
 import { createPortal } from 'react-dom'
-import { X, HardDrive, AlertCircle, CheckCircle2, XCircle, Database, FolderOpen, FolderInput } from 'lucide-react'
+import { X, HardDrive, AlertCircle, CheckCircle2, XCircle, Database, FolderOpen, FolderInput, ChevronRight, ChevronDown, Table2 } from 'lucide-react'
 import { registerExportCancelHandler, unregisterExportCancelHandler, useExportTaskStore } from '../../stores/exportTaskStore'
 import { toast } from '../../stores/toastStore'
+import type { ConnType } from '../../types'
+import { exportSchemaArchive, packInstanceArchive } from '../../utils/schemaArchiveExport'
 
 interface Props {
   connectionId: string
+  connType: ConnType | string
   onClose: () => void
 }
 
 interface TableInfo { name: string; isView: boolean }
 interface RoutineInfo { name: string; routineType: string }
-interface BackupResult { tablesDone: number; totalRows: number; fileSize: number }
 interface BackupProgressEvent { currentTable: string; totalTables: number; doneTables: number; currentRows: number }
 
 interface DbResult { schema: string; ok: boolean; rows?: number; tables?: number; bytes?: number; error?: string }
@@ -30,6 +32,8 @@ const OBJ_META: { key: ObjType; label: string }[] = [
 const SYSTEM_DBS = new Set([
   'information_schema', 'mysql', 'performance_schema', 'sys',
   'pg_catalog', 'pg_toast', 'template0', 'template1',
+  'master', 'tempdb', 'model', 'msdb',
+  'system', 'sysaux',
 ])
 
 function formatBytes(bytes: number): string {
@@ -50,10 +54,14 @@ function ProgressBar({ value, max }: { value: number; max: number }) {
   )
 }
 
-export default function InstanceExportPanel({ connectionId, onClose }: Props) {
+export default function InstanceExportPanel({ connectionId, connType, onClose }: Props) {
   const [schemas, setSchemas] = useState<string[]>([])
   const [loadingSchemas, setLoadingSchemas] = useState(true)
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const [schemaTables, setSchemaTables] = useState<Record<string, TableInfo[]>>({})
+  const [selectedTables, setSelectedTables] = useState<Record<string, Set<string>>>({})
+  const [loadingTableSchema, setLoadingTableSchema] = useState('')
 
   const [content, setContent] = useState<'structure' | 'data' | 'both'>('both')
   // 每个库要导出的对象类型，默认全选（表/视图/函数/存储过程）
@@ -110,6 +118,36 @@ export default function InstanceExportPanel({ connectionId, onClose }: Props) {
       return next
     })
   }
+  const loadSchemaTables = async (schema: string) => {
+    if (schemaTables[schema]) return
+    setLoadingTableSchema(schema)
+    try {
+      const { invoke } = await import('@tauri-apps/api/core')
+      const list = await invoke<TableInfo[]>('list_tables', { id: connectionId, schema })
+      setSchemaTables(prev => ({ ...prev, [schema]: list }))
+      setSelectedTables(prev => ({
+        ...prev,
+        [schema]: prev[schema] ?? new Set(list.filter(item => !item.isView).map(item => item.name)),
+      }))
+    } catch (e) { setError(String(e)) }
+    finally { setLoadingTableSchema('') }
+  }
+  const toggleExpanded = async (schema: string) => {
+    const opening = !expanded.has(schema)
+    setExpanded(prev => {
+      const next = new Set(prev)
+      opening ? next.add(schema) : next.delete(schema)
+      return next
+    })
+    if (opening) await loadSchemaTables(schema)
+  }
+  const toggleTable = (schema: string, table: string) => {
+    setSelectedTables(prev => {
+      const next = new Set(prev[schema] ?? [])
+      next.has(table) ? next.delete(table) : next.add(table)
+      return { ...prev, [schema]: next }
+    })
+  }
   const toggleAll = () => {
     if (selected.size === schemas.length) setSelected(new Set())
     else setSelected(new Set(schemas))
@@ -127,9 +165,10 @@ export default function InstanceExportPanel({ connectionId, onClose }: Props) {
 
   const pickDir = async () => {
     try {
-      const { open } = await import('@tauri-apps/plugin-dialog')
-      const dir = await open({ directory: true, multiple: false, title: '选择导出目录' })
-      if (typeof dir === 'string') setOutputDir(dir)
+      const { save } = await import('@tauri-apps/plugin-dialog')
+      const date = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+      const path = await save({ defaultPath: `database_export_${date}.zip`, filters: [{ name: 'ZIP 数据库导出', extensions: ['zip'] }] })
+      if (path) setOutputDir(path)
     } catch (e) { setError(String(e)) }
   }
 
@@ -147,9 +186,8 @@ export default function InstanceExportPanel({ connectionId, onClose }: Props) {
     const picked = schemas.filter(s => selected.has(s))
     if (picked.length === 0) { setError('请至少选择一个数据库'); return }
     if (incTypes.size === 0) { setError('请至少选择一种导出对象'); return }
-    if (!outputDir) { setError('请选择导出目录'); return }
+    if (!outputDir) { setError('请选择 ZIP 输出文件'); return }
 
-    const sep = outputDir.includes('\\') ? '\\' : '/'
     const taskId = useExportTaskStore.getState().addTask({
       connId: connectionId,
       label: `实例导出 · ${picked.length} 个数据库`,
@@ -175,6 +213,8 @@ export default function InstanceExportPanel({ connectionId, onClose }: Props) {
     try {
       const { invoke } = await import('@tauri-apps/api/core')
       const { listen } = await import('@tauri-apps/api/event')
+      const workspace = await invoke<string>('db_create_export_workspace', { taskId })
+      const schemaArchives: { schema: string; path: string }[] = []
       let currentIndex = 0
       let currentSchema = ''
       let completedRows = 0
@@ -210,19 +250,28 @@ export default function InstanceExportPanel({ connectionId, onClose }: Props) {
             let routines: RoutineInfo[] = []
             try { routines = await invoke<RoutineInfo[]>('list_routines', { id: connectionId, schema }) } catch { /* 部分类型不支持 */ }
 
-            const path = `${outputDir}${sep}${schema}.sql`
-            const res = await invoke<BackupResult>('db_logical_backup', {
-              id: connectionId,
-              schema,
-              tables: incTypes.has('t') ? tables.filter(t => !t.isView).map(t => t.name) : [],
-              views:  incTypes.has('v') ? tables.filter(t => t.isView).map(t => t.name) : [],
-              funcs:  incTypes.has('f') ? routines.filter(r => r.routineType === 'FUNCTION').map(r => r.name) : [],
-              procs:  incTypes.has('p') ? routines.filter(r => r.routineType === 'PROCEDURE').map(r => r.name) : [],
-              path,
-              content,
-              createDb: true,
-              taskId,
+            const sep = workspace.includes('\\') ? '\\' : '/'
+            const path = `${workspace}${sep}${schema.replace(/[\\/:*?"<>|]/g, '_')}.zip`
+            const chosenTables = selectedTables[schema]
+            const res = await exportSchemaArchive({
+              connectionId, connType, schema,
+              objects: {
+                tables: incTypes.has('t') ? tables.filter(t => !t.isView && (!chosenTables || chosenTables.has(t.name))).map(t => t.name) : [],
+                views: incTypes.has('v') ? tables.filter(t => t.isView).map(t => t.name) : [],
+                funcs: incTypes.has('f') ? routines.filter(r => r.routineType === 'FUNCTION').map(r => r.name) : [],
+                procs: incTypes.has('p') ? routines.filter(r => r.routineType === 'PROCEDURE').map(r => r.name) : [],
+              },
+              path, content, taskId, workspace, keepWorkspace: true,
+              onProgress: (table, done, total, rows) => {
+                useExportTaskStore.getState().updateTask(taskId, {
+                  progressRows: completedRows + rows,
+                  progressValue: i + (total > 0 ? done / total : 0),
+                  progressTotal: picked.length,
+                  message: `${schema} · ${table} · ${done} / ${total} 表 · ${rows.toLocaleString()} 行`,
+                })
+              },
             })
+            schemaArchives.push({ schema, path })
             completedRows += res.totalRows
             acc.push({ schema, ok: true, rows: res.totalRows, tables: res.tablesDone, bytes: res.fileSize })
           } catch (e) {
@@ -241,6 +290,9 @@ export default function InstanceExportPanel({ connectionId, onClose }: Props) {
           })
         }
 
+        if (!cancelledRef.current && schemaArchives.length > 0) {
+          await packInstanceArchive({ path: outputDir, workspace, schemaArchives })
+        }
         const failed = acc.filter(result => !result.ok && result.error !== '已取消')
         const current = useExportTaskStore.getState().tasks.find(task => task.id === taskId)
         if (cancelledRef.current || current?.status === 'cancelled') {
@@ -284,8 +336,7 @@ export default function InstanceExportPanel({ connectionId, onClose }: Props) {
   const openFolder = async () => {
     try {
       const { invoke } = await import('@tauri-apps/api/core')
-      const sep = outputDir.includes('\\') ? '\\' : '/'
-      await invoke('reveal_in_folder', { filePath: `${outputDir}${sep}.` })
+      await invoke('reveal_in_folder', { filePath: outputDir })
     } catch { /* ignore */ }
   }
 
@@ -304,7 +355,7 @@ export default function InstanceExportPanel({ connectionId, onClose }: Props) {
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '14px 16px', borderBottom: '1px solid var(--border)', flexShrink: 0 }}>
           <HardDrive size={15} color="var(--accent)" />
           <span style={{ fontWeight: 600, color: 'var(--text-bright)', fontSize: 14 }}>导出数据库</span>
-          <span style={{ fontSize: 12, color: 'var(--text-muted)', marginLeft: 4 }}>整实例 · 每库一个 .sql</span>
+          <span style={{ fontSize: 12, color: 'var(--text-muted)', marginLeft: 4 }}>整连接 · ZIP 内每个 Schema 一个 ZIP</span>
           {!exporting && (
             <button onClick={onClose} style={{ marginLeft: 'auto', color: 'var(--text-muted)', lineHeight: 0 }}><X size={15} /></button>
           )}
@@ -329,17 +380,40 @@ export default function InstanceExportPanel({ connectionId, onClose }: Props) {
                 {schemas.map(s => {
                   const on = selected.has(s)
                   const sys = SYSTEM_DBS.has(s.toLowerCase())
+                  const isOpen = expanded.has(s)
+                  const tables = schemaTables[s]?.filter(item => !item.isView) ?? []
                   return (
-                    <label key={s} style={{
-                      display: 'flex', alignItems: 'center', gap: 9, padding: '7px 12px',
-                      borderBottom: '1px solid var(--border-subtle)', cursor: exporting ? 'default' : 'pointer',
-                      fontSize: 12.5, color: 'var(--text)',
-                    }}>
-                      <input type="checkbox" checked={on} disabled={exporting} onChange={() => toggle(s)} />
-                      <Database size={13} color={on ? 'var(--accent)' : 'var(--text-muted)'} />
-                      <span style={{ flex: 1 }}>{s}</span>
-                      {sys && <span style={{ fontSize: 10, color: 'var(--text-muted)', background: 'var(--surface-2)', borderRadius: 4, padding: '1px 6px' }}>系统库</span>}
-                    </label>
+                    <div key={s} style={{ borderBottom: '1px solid var(--border-subtle)' }}>
+                      <label style={{
+                        display: 'flex', alignItems: 'center', gap: 9, padding: '7px 12px',
+                        cursor: exporting ? 'default' : 'pointer', fontSize: 12.5, color: 'var(--text)',
+                      }}>
+                        <button type="button" disabled={exporting} onClick={e => { e.preventDefault(); void toggleExpanded(s) }}
+                          title={isOpen ? '收起表' : '展开表'} style={{ lineHeight: 0, color: 'var(--text-muted)' }}>
+                          {isOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                        </button>
+                        <input type="checkbox" checked={on} disabled={exporting} onChange={() => toggle(s)} />
+                        <Database size={13} color={on ? 'var(--accent)' : 'var(--text-muted)'} />
+                        <span style={{ flex: 1 }}>{s}</span>
+                        {schemaTables[s] && <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{selectedTables[s]?.size ?? 0}/{tables.length} 表</span>}
+                        {sys && <span style={{ fontSize: 10, color: 'var(--text-muted)', background: 'var(--surface-2)', borderRadius: 4, padding: '1px 6px' }}>系统库</span>}
+                      </label>
+                      {isOpen && (
+                        <div style={{ maxHeight: 180, overflow: 'auto', background: 'var(--surface-2)', padding: '4px 0 6px 34px' }}>
+                          {loadingTableSchema === s ? (
+                            <div style={{ padding: '6px 12px', fontSize: 11, color: 'var(--text-muted)' }}>正在加载表…</div>
+                          ) : tables.length === 0 ? (
+                            <div style={{ padding: '6px 12px', fontSize: 11, color: 'var(--text-muted)' }}>暂无数据表</div>
+                          ) : tables.map(table => (
+                            <label key={table.name} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 12px', fontSize: 12, color: 'var(--text)', cursor: exporting ? 'default' : 'pointer' }}>
+                              <input type="checkbox" checked={selectedTables[s]?.has(table.name) ?? true} disabled={exporting || !on} onChange={() => toggleTable(s, table.name)} />
+                              <Table2 size={12} color="var(--text-muted)" />
+                              <span>{table.name}</span>
+                            </label>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                   )
                 })}
               </div>
@@ -396,13 +470,13 @@ export default function InstanceExportPanel({ connectionId, onClose }: Props) {
             </div>
           </div>
 
-          {/* 输出目录 */}
+          {/* 输出文件 */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            <label style={{ fontSize: 12, color: 'var(--text-muted)', fontWeight: 500 }}>输出目录</label>
+            <label style={{ fontSize: 12, color: 'var(--text-muted)', fontWeight: 500 }}>输出文件</label>
             <div style={{ display: 'flex', gap: 8 }}>
               <input
                 value={outputDir}
-                placeholder="点击右侧按钮选择目录"
+                placeholder="点击右侧按钮选择 ZIP 保存路径"
                 readOnly disabled={exporting}
                 style={{ flex: 1, fontSize: 12, padding: '6px 10px', cursor: 'default' }}
               />
@@ -411,7 +485,7 @@ export default function InstanceExportPanel({ connectionId, onClose }: Props) {
                   display: 'flex', alignItems: 'center', gap: 5, padding: '6px 14px', borderRadius: 7, fontSize: 12,
                   background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'var(--text)', whiteSpace: 'nowrap',
                 }}>
-                <FolderInput size={13} /> 选择目录…
+                <FolderInput size={13} /> 选择路径…
               </button>
             </div>
           </div>

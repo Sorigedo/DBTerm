@@ -293,7 +293,7 @@ export default function AssetPanel({ open, width }: Props) {
     return () => window.removeEventListener('dbterm:focus-asset-search', handler)
   }, [])
 
-  // 搜索快捷键（Ctrl+F / Cmd+F）：仅当"侧栏"为当前激活区域时，打开侧栏搜索，
+  // 搜索快捷键（Ctrl+F / Cmd+F）：仅当"侧栏"为当前激活区域时，切换侧栏搜索，
   // 并在 capture 阶段拦截，阻止工作区标签页的同名搜索快捷键（dbTreeSearch 等）触发。
   const panelRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
@@ -302,7 +302,7 @@ export default function AssetPanel({ open, width }: Props) {
       if (getActiveRegion() !== 'sidebar') return
       e.preventDefault()
       e.stopImmediatePropagation()   // 阻断后续所有 keydown 处理器（含 useShortcuts）
-      setSearchQuery(q => (q === null ? '' : q))
+      setSearchQuery(q => q === null ? '' : null)
       setTimeout(() => {
         const el = panelRef.current?.querySelector<HTMLInputElement>('.asset-panel__search-input')
         el?.focus(); el?.select()

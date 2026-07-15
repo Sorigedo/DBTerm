@@ -815,7 +815,13 @@ export default function ResultTable({
   // KB2 结果表快捷键
   useShortcuts('result-table', {
     tableRefresh:  () => onRefresh?.(),
-    tableFilter:   () => { setShowFilter(true); setTimeout(() => filterInputRef.current?.focus(), 0) },
+    tableFilter:   () => {
+      if (showFilter || filterText) {
+        setShowFilter(false); setFilterText(''); setPage(0)
+      } else {
+        setShowFilter(true); setTimeout(() => filterInputRef.current?.focus(), 0)
+      }
+    },
     tableAddRow:   () => { if (editCtx) addInsertRow() },
     tableDelRow:   () => { if (editCtx && selectedRows.size > 0) deleteSelectedRows() },
     tableCommit:   () => { if (stagedChanges.length > 0) commitAll() },

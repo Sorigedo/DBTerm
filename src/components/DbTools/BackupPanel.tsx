@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import { X, HardDrive, AlertCircle, CheckCircle2, Database, FolderOpen } from 'lucide-react'
 import { registerExportCancelHandler, unregisterExportCancelHandler, useExportTaskStore } from '../../stores/exportTaskStore'
 import { toast } from '../../stores/toastStore'
+import { exportSchemaArchive } from '../../utils/schemaArchiveExport'
 
 interface Props {
   connectionId: string
@@ -138,8 +139,8 @@ export default function BackupPanel({ connectionId, schema, connType, onClose }:
       const { save } = await import('@tauri-apps/plugin-dialog')
       const date = new Date().toISOString().slice(0, 10).replace(/-/g, '')
       const path = await save({
-        defaultPath: `${schema}_backup_${date}.sql`,
-        filters: [{ name: 'SQL 备份文件', extensions: ['sql'] }],
+        defaultPath: `${schema}_backup_${date}.zip`,
+        filters: [{ name: 'ZIP 分表备份', extensions: ['zip'] }],
       })
       if (path) setOutputPath(path)
     } catch (e) {
@@ -197,17 +198,20 @@ export default function BackupPanel({ connectionId, schema, connType, onClose }:
       })
       onClose()
 
-      void invoke<BackupResult>('db_logical_backup', {
-        id: connectionId,
+      void exportSchemaArchive({
+        connectionId,
+        connType: connType ?? 'mysql',
         schema,
-        tables: pick('t'),
-        views: pick('v'),
-        funcs: pick('f'),
-        procs: pick('p'),
-        seqs: isMaria ? pick('s') : undefined,
+        objects: { tables: pick('t'), views: pick('v'), funcs: pick('f'), procs: pick('p') },
         path: outputPath,
         content,
         taskId,
+        onProgress: (table, done, total, rows) => {
+          useExportTaskStore.getState().updateTask(taskId, {
+            progressRows: rows, progressValue: done, progressTotal: total,
+            message: `${table} · ${done} / ${total} 表`,
+          })
+        },
       }).then(res => {
         const current = useExportTaskStore.getState().tasks.find(task => task.id === taskId)
         if (current?.status !== 'running') return
@@ -350,6 +354,9 @@ export default function BackupPanel({ connectionId, schema, connType, onClose }:
               </div>
             </div>
           )}
+          <div style={{ background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 8, padding: 12, fontSize: 11.5, color: 'var(--text)', lineHeight: 1.65 }}>
+            将导出为 ZIP 压缩包，每张表对应一个可独立执行的 SQL 文件，便于大库分批恢复。
+          </div>
 
           {/* 输出路径 */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>

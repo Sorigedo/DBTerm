@@ -7669,6 +7669,13 @@ body.resizing {
 .sb-detail__ddl-cm .cm-scroller,
 .table-peek__ddl-cm .cm-scroller,
 .ddl-modal__code-cm .cm-scroller { font-family: var(--font-mono, monospace); }
+.sb-detail__ddl-cm .cm-content,
+.table-peek__ddl-cm .cm-content,
+.ddl-modal__code-cm .cm-content {
+  cursor: text;
+  user-select: text;
+  -webkit-user-select: text;
+}
 .sb-detail__ddl-cm .cm-gutters,
 .table-peek__ddl-cm .cm-gutters,
 .ddl-modal__code-cm .cm-gutters { background: transparent; border: none; }

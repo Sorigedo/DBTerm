@@ -6,6 +6,7 @@ import type { ConnType } from '../../types'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { sqlHighlight } from '../../utils/sqlHighlight'
 import { useWheelScroll, cmScroller } from '../../utils/wheelScroll'
+import { copyText } from '../../utils/clipboard'
 
 /**
  * 只读 SQL 代码查看器：与 SQL 编辑页 / 对象编辑页共用同一套关键词高亮（lang-sql + CSS 变量主题）。
@@ -73,6 +74,43 @@ export default function SqlCodeView({
     return sql({ dialect, upperCaseKeywords: true })
   }, [connType])
 
+  const interactionExt = useMemo(() => [
+    EditorView.contentAttributes.of({
+      tabindex: '0',
+      role: 'textbox',
+      'aria-readonly': 'true',
+    }),
+    EditorView.domEventHandlers({
+      mousedown(_event, view) {
+        // editable=false 的 CodeMirror 默认不一定进入键盘焦点链，点击后主动聚焦。
+        window.setTimeout(() => view.focus(), 0)
+        return false
+      },
+      keydown(event, view) {
+        if (!(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey) return false
+        const key = event.key.toLowerCase()
+        if (key === 'a') {
+          event.preventDefault()
+          event.stopPropagation()
+          view.dispatch({ selection: { anchor: 0, head: view.state.doc.length } })
+          return true
+        }
+        if (key === 'c') {
+          const text = view.state.selection.ranges
+            .filter(range => !range.empty)
+            .map(range => view.state.sliceDoc(range.from, range.to))
+            .join('\n')
+          if (!text) return false
+          event.preventDefault()
+          event.stopPropagation()
+          void copyText(text).finally(() => view.focus())
+          return true
+        }
+        return false
+      },
+    }),
+  ], [])
+
   return (
     <div ref={wrapRef} style={{ display: 'contents' }}>
       <CodeMirror
@@ -81,7 +119,9 @@ export default function SqlCodeView({
         readOnly
         className={className}
         style={style}
-        extensions={wrap ? [sqlExt, sqlHighlight, EditorView.lineWrapping] : [sqlExt, sqlHighlight]}
+        extensions={wrap
+          ? [sqlExt, sqlHighlight, interactionExt, EditorView.lineWrapping]
+          : [sqlExt, sqlHighlight, interactionExt]}
         theme={isDark ? _darkTheme : _lightTheme}
         basicSetup={{
           lineNumbers,

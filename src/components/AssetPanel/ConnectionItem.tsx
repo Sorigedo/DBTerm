@@ -325,8 +325,8 @@ export default function ConnectionItem({ conn, isActive, onDragStart: onDragStar
           }
           // 导入数据库：后端 db_import_csv / db_exec_sql_file 仅 MySQL 族 / PG 族 / SQLite / DuckDB
           const canImport = ['mysql', 'mariadb', 'tidb', 'oceanBase', 'postgres', 'kingBase', 'openGauss', 'sqlite', 'duckdb'].includes(conn.type)
-          // 导出数据库（逻辑备份）：后端 db_logical_backup 仅 MySQL 族 / PG 族
-          const canExport = ['mysql', 'mariadb', 'tidb', 'oceanBase', 'postgres', 'kingBase', 'openGauss'].includes(conn.type)
+          // 关系型数据库统一导出为 ZIP；Redis / MongoDB 使用各自原生导出页面
+          const canExport = ['mysql', 'mariadb', 'tidb', 'oceanBase', 'postgres', 'kingBase', 'openGauss', 'sqlite', 'duckdb', 'oracle', 'sqlServer', 'clickHouse'].includes(conn.type)
           if (canImport || canExport) {
             if (dbSub.length > 0) dbSub.push({ label: undefined })
             if (canImport) dbSub.push({ label: '导入数据库', icon: <FileInput  size={13} />, onClick: () => setDbPanel('import') })
@@ -510,7 +510,7 @@ export default function ConnectionItem({ conn, isActive, onDragStart: onDragStar
             />
           )}
           {dbPanel === 'export' && (
-            <InstanceExportPanel connectionId={conn.id} onClose={() => setDbPanel(null)} />
+            <InstanceExportPanel connectionId={conn.id} connType={conn.type} onClose={() => setDbPanel(null)} />
           )}
           {dbPanel === 'import' && (
             <InstanceImportPanel connectionId={conn.id} onClose={() => setDbPanel(null)} />
