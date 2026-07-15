@@ -1312,7 +1312,7 @@ export default function ResultTable({
                   data-colidx={ci}
                   data-tip="点击排序 · 拖拽换列位 · 边缘拉宽"
                   onMouseDown={(e) => startColDrag(e, ci)}
-                  style={{ cursor: draggingCol != null ? 'grabbing' : 'pointer', userSelect: 'none', position: 'relative', width: w, minWidth: w }}
+                  style={{ cursor: draggingCol != null ? 'grabbing' : 'pointer', userSelect: 'none', position: 'sticky', top: 0, width: w, minWidth: w }}
                   onClick={() => {
                     if (sortCol === ci) {
                       if (sortAsc) setSortAsc(false)

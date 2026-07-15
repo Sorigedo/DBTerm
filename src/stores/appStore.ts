@@ -125,6 +125,10 @@ interface AppState {
   pendingSchema: Record<string, string>
   setPendingSchema: (connId: string, schema: string) => void
   clearPendingSchema: (connId: string) => void
+  // 左侧库树需要默认展开的 schema（连接级）
+  pendingTreeSchema: Record<string, string>
+  setPendingTreeSchema: (connId: string, schema: string) => void
+  clearPendingTreeSchema: (connId: string) => void
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -493,5 +497,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       const next = { ...s.pendingSchema }
       delete next[connId]
       return { pendingSchema: next }
+    }),
+  pendingTreeSchema: {},
+  setPendingTreeSchema: (connId, schema) =>
+    set((s) => ({ pendingTreeSchema: { ...s.pendingTreeSchema, [connId]: schema } })),
+  clearPendingTreeSchema: (connId) =>
+    set((s) => {
+      const next = { ...s.pendingTreeSchema }
+      delete next[connId]
+      return { pendingTreeSchema: next }
     }),
 }))

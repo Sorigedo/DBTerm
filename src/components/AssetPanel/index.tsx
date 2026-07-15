@@ -92,7 +92,7 @@ function GroupRenameInput({ initialName, onConfirm, onCancel }: {
 }
 
 export default function AssetPanel({ open, width }: Props) {
-  const { activeView, connections, activeTabId, tabs, openNewConn, loadConnections, openSettings, saveConnection, openTab, closeTab, setActiveTab, connectedDbConns, markDbConnected, markDbDisconnected, dbErrorConns, markDbError } = useAppStore()
+  const { activeView, connections, activeTabId, tabs, openNewConn, loadConnections, openSettings, saveConnection, openTab, closeTab, setActiveTab, connectedDbConns, markDbConnected, markDbDisconnected, dbErrorConns, markDbError, pendingTreeSchema } = useAppStore()
   const { groups, connGroupMap, collapsedGroups, groupOrder, connOrder, addGroup, deleteGroup, renameGroup, toggleCollapsed, collapseAll, expandAll, moveToGroup } = useGroupStore()
   const [expandedDbConns,  setExpandedDbConns]  = useState<Set<string>>(new Set())
   // 连接"变为已连接"时自动展开其库树一次（含多窗口撕离接管 DB 标签的场景）；
@@ -103,6 +103,10 @@ export default function AssetPanel({ open, width }: Props) {
     if (newly.length) setExpandedDbConns(s => new Set([...s, ...newly]))
     seenConnectedRef.current = new Set(connectedDbConns)
   }, [connectedDbConns])
+  useEffect(() => {
+    const ids = Object.keys(pendingTreeSchema)
+    if (ids.length) setExpandedDbConns(s => new Set([...s, ...ids]))
+  }, [pendingTreeSchema])
   const [disconnectFlow, setDisconnectFlow] = useState<DisconnectFlow | null>(null)
   const [knownHostsOpen, setKnownHostsOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState<string | null>(null)

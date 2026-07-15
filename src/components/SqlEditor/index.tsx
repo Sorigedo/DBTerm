@@ -528,6 +528,8 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
   const clearPendingFill = useAppStore((s) => s.clearPendingFill)
   const pendingSchema = useAppStore((s) => s.pendingSchema[tabId])
   const clearPendingSchema = useAppStore((s) => s.clearPendingSchema)
+  const setPendingTreeSchema = useAppStore((s) => s.setPendingTreeSchema)
+  const markDbConnected = useAppStore((s) => s.markDbConnected)
   const connections = useAppStore((s) => s.connections)
   const activeConn = connections.find((c) => c.id === connectionId)
   const isSqlite = activeConn?.type === 'sqlite'
@@ -687,10 +689,13 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
         const { invoke } = await import('@tauri-apps/api/core')
         const list = await invoke<string[]>('list_schemas', { id: connectionId })
         if (!alive) return
+        const nextSchema =
+          currentSchemaRef.current && list.includes(currentSchemaRef.current) ? currentSchemaRef.current
+            : (activeConn?.database && list.includes(activeConn.database) ? activeConn.database : pickDefaultSchema(list))
         setSchemas(list)
-        setCurrentSchema(prev =>
-          prev && list.includes(prev) ? prev
-            : (activeConn?.database && list.includes(activeConn.database) ? activeConn.database : pickDefaultSchema(list)))
+        setCurrentSchema(nextSchema)
+        markDbConnected(connectionId)
+        if (nextSchema) setPendingTreeSchema(connectionId, nextSchema)
       } catch { /* ignore */ }
     })()
     return () => { alive = false }
@@ -1621,6 +1626,11 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
     clearPendingSchema(tabId)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingSchema])
+
+  useEffect(() => {
+    if (!connectionId || !currentSchema) return
+    setPendingTreeSchema(connectionId, currentSchema)
+  }, [connectionId, currentSchema, setPendingTreeSchema])
 
   // 模板填充（CREATE TABLE 等）→ 只填入编辑器，不执行
   useEffect(() => {

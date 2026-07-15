@@ -91,10 +91,11 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
     return displayShortcutStr(combo)
   }
 
-  const { connections, openEditConn, openObjectTab, openQueryTab, setPendingRun, setPendingFill, setPendingSchema } = useAppStore(s => ({
+  const { connections, openEditConn, openObjectTab, openQueryTab, setPendingRun, setPendingFill, setPendingSchema, pendingTreeSchema, clearPendingTreeSchema } = useAppStore(s => ({
     connections: s.connections, openEditConn: s.openEditConn,
     openObjectTab: s.openObjectTab, openQueryTab: s.openQueryTab,
     setPendingRun: s.setPendingRun, setPendingFill: s.setPendingFill, setPendingSchema: s.setPendingSchema,
+    pendingTreeSchema: s.pendingTreeSchema[connectionId], clearPendingTreeSchema: s.clearPendingTreeSchema,
   }))
   const [schemas, setSchemas]           = useState<string[]>([])
   const [manualSchemas, setManualSchemas] = useState<string[]>([])
@@ -681,21 +682,37 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
     }
   }
 
+  function expandSchema(schema: string) {
+    setExpandedSchemas(s => new Set([...s, schema]))
+    if (isSqlServer) {
+      // SQL Server：展开数据库节点时加载其下的 SS-level Schema（dbo、HumanResources 等）
+      if (!ssSubSchemas[schema]) doLoadSsSubSchemas(schema)
+    } else {
+      if (!schemaData[schema]?.tablesLoaded) doLoadTables(schema)
+      // 同时加载例程，使「函数/存储过程」计数准确（否则未展开分类时一直显示 0）
+      if (!schemaData[schema]?.routinesLoaded) doLoadRoutines(schema)
+    }
+  }
+
   function toggleSchema(schema: string) {
     if (expandedSchemas.has(schema)) {
       setExpandedSchemas(s => { const n = new Set(s); n.delete(schema); return n })
     } else {
-      setExpandedSchemas(s => new Set([...s, schema]))
-      if (isSqlServer) {
-        // SQL Server：展开数据库节点时加载其下的 SS-level Schema（dbo、HumanResources 等）
-        if (!ssSubSchemas[schema]) doLoadSsSubSchemas(schema)
-      } else {
-        if (!schemaData[schema]?.tablesLoaded) doLoadTables(schema)
-        // 同时加载例程，使「函数/存储过程」计数准确（否则未展开分类时一直显示 0）
-        if (!schemaData[schema]?.routinesLoaded) doLoadRoutines(schema)
-      }
+      expandSchema(schema)
     }
   }
+
+  useEffect(() => {
+    if (!pendingTreeSchema) return
+    const allSchemas = [...schemas, ...manualSchemas.filter(s => !schemas.includes(s))]
+    if (!allSchemas.includes(pendingTreeSchema)) {
+      if (!loading && schemas.length > 0) clearPendingTreeSchema(connectionId)
+      return
+    }
+    if (!isKv) expandSchema(pendingTreeSchema)
+    clearPendingTreeSchema(connectionId)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingTreeSchema, schemas, manualSchemas, loading, connectionId])
 
   function toggleCat(schema: string, cat: Cat) {
     const key = `${schema}::${cat}`

@@ -1277,7 +1277,8 @@ body.tab-dragging .tab.active:hover {
   border-bottom: 1px solid var(--border-subtle); padding: 6px 10px; text-align: left; color: var(--text);
   white-space: nowrap;
 }
-.dbt-action-table th { background: var(--surface-2); color: var(--text-muted); font-weight: var(--fw-semibold); position: sticky; top: 0; }
+.dbt-action-table thead { position: sticky; top: 0; z-index: 2; }
+.dbt-action-table th { background: var(--surface-2); color: var(--text-muted); font-weight: var(--fw-semibold); position: sticky; top: 0; z-index: 2; }
 .dbt-action-table .dbt-null { color: var(--text-muted); font-style: italic; }
 .modal-box {
   width: 580px;
@@ -4690,6 +4691,11 @@ body.column-dragging .table-peek__table th:hover { background: var(--surface-2);
   /* 结果数据统一用全局配置字体（与编辑器/JSON/文本/表单一致） */
   font-family: var(--font-mono);
 }
+.result-table thead {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+}
 /* 列按内容取宽，给一个合理上下限，避免单列被拉满或挤成一团 */
 .result-th, .result-td { min-width: 56px; }
 .result-th {
@@ -4703,7 +4709,7 @@ body.column-dragging .table-peek__table th:hover { background: var(--surface-2);
   text-align: left;
   border-bottom: 1px solid var(--border);
   border-right: 1px solid var(--border-subtle);
-  z-index: 1;
+  z-index: 3;
 }
 /* 列拖拽视觉反馈 */
 .result-th.col-dragging { opacity: 0.45; }
@@ -5039,6 +5045,7 @@ body.column-dragging .result-th:hover { background: var(--surface); }
 /* ── 表结构弹窗 ── */
 .tbl-struct-box { width: 560px; max-height: 70vh; }
 .tbl-struct-table { width: 100%; }
+.tbl-struct-table thead { position: sticky; top: 0; z-index: 3; }
 .tbl-struct-name { display: flex; align-items: center; gap: 5px; font-weight: var(--fw-medium); color: var(--text-bright); }
 .tbl-struct-pk { color: var(--warning); flex-shrink: 0; }
 .tbl-struct-flag { font-size: 10px; font-weight: var(--fw-semibold); padding: 1px 5px; border-radius: 4px; letter-spacing: 0.03em; }
@@ -7676,11 +7683,13 @@ body.resizing {
 .sb-detail__tbl {
   width: 100%; border-collapse: collapse; font-size: 11.5px;
 }
+.sb-detail__tbl thead { position: sticky; top: 0; z-index: 2; }
 .sb-detail__tbl th {
   position: sticky; top: 0; background: var(--surface-2);
   padding: 4px 10px; font-size: 10.5px; font-weight: var(--fw-semibold);
   color: var(--text-muted); text-align: left;
   border-bottom: 1px solid var(--border-subtle); white-space: nowrap;
+  z-index: 2;
 }
 .sb-detail__tbl td {
   padding: 3px 10px; color: var(--text); white-space: nowrap;
@@ -8559,11 +8568,13 @@ body.resizing {
   width: 100%; border-collapse: collapse; font-size: 12px;
   flex: 1; overflow-y: auto;
 }
+.redis-hash-table thead { position: sticky; top: 0; z-index: 2; }
 .redis-hash-table thead th {
   padding: 4px 8px; text-align: left; font-size: 11px;
   color: var(--text-muted); font-weight: var(--fw-medium);
   border-bottom: 1px solid var(--border-subtle); position: sticky; top: 0;
   background: var(--surface);
+  z-index: 2;
 }
 .redis-hash-table tbody tr:hover { background: var(--surface-hover); }
 .redis-hash-field {
