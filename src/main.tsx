@@ -1,5 +1,6 @@
 import ReactDOM from 'react-dom/client'
 import App from './App'
+import FileManagerWindow from './components/SshPanels/FileManagerWindow'
 import './index.css'
 
 // 根据系统在 <html> 加 is-mac 类，供 CSS 按平台切换快捷键提示文字
@@ -31,6 +32,11 @@ new MutationObserver((muts) => {
   for (const m of muts) m.addedNodes.forEach(hardenWithin)
 }).observe(document.documentElement, { childList: true, subtree: true })
 
+const params = new URLSearchParams(window.location.search)
+const fileManagerConnId = params.get('fileManager') === '1' ? params.get('connId') : null
+
 ReactDOM.createRoot(document.getElementById('root')!).render(
-  <App />
+  fileManagerConnId
+    ? <FileManagerWindow connId={fileManagerConnId} initialRemotePath={params.get('remotePath') ?? undefined} />
+    : <App />
 )

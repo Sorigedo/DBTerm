@@ -19,6 +19,13 @@ export type SshPanelType = 'files' | 'history' | 'perf' | 'snippets' | 'tunnel' 
 // 顶层查询标签的全局自增序号（保证 id 唯一，支持同一连接多开）
 let querySeq = 0
 
+function activeViewForTab(current: ActiveView, tab?: WorkspaceTab): ActiveView {
+  if (!tab) return current
+  if (tab.type === 'tool') return current === 'tools' ? 'all' : current
+  if (current === 'tools') return tab.type === 'terminal' ? 'ssh' : 'db'
+  return current
+}
+
 interface TermCallbacks {
   disconnect: () => void
   reconnect: () => void
@@ -179,11 +186,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     const activeBId = s.activeBId === tabId ? (bTabs[bTabs.length - 1]?.id ?? null) : s.activeBId
     return { splitOn: paneBTabIds.length > 0, paneBTabIds, activeAId: tabId, activeBId, focusedPane: 'a', activeTabId: tabId }
   }),
-  setPaneActive: (pane, tabId) => set(() =>
-    pane === 'b'
-      ? { activeBId: tabId, focusedPane: 'b', activeTabId: tabId }
-      : { activeAId: tabId, focusedPane: 'a', activeTabId: tabId }
-  ),
+  setPaneActive: (pane, tabId) => set((s) => {
+    const tab = s.tabs.find(t => t.id === tabId)
+    const activeView = activeViewForTab(s.activeView, tab)
+    return pane === 'b'
+      ? { activeBId: tabId, focusedPane: 'b', activeTabId: tabId, activeView }
+      : { activeAId: tabId, focusedPane: 'a', activeTabId: tabId, activeView }
+  }),
   setDraggingTab: (id) => set({ draggingTabId: id }),
   setDragPreview: (preview) => set({ dragPreview: preview }),
   setActiveView: (view) => set({ activeView: view }),
@@ -244,9 +253,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   openTab: (tab) =>
     set((s) => {
       const toB = s.splitOn && s.focusedPane === 'b'
+      const activeView = activeViewForTab(s.activeView, tab)
       const act = toB
-        ? { activeBId: tab.id, activeTabId: tab.id }
-        : { activeAId: tab.id, activeTabId: tab.id }
+        ? { activeBId: tab.id, activeTabId: tab.id, activeView }
+        : { activeAId: tab.id, activeTabId: tab.id, activeView }
       if (s.tabs.find((t) => t.id === tab.id)) return act
       const paneB = toB ? { paneBTabIds: [...s.paneBTabIds, tab.id] } : {}
       const { tabNewPosition } = useSettingsStore.getState()
@@ -429,11 +439,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   clearTabError: (tabId) =>
     set((s) => ({ tabs: s.tabs.map(t => t.id === tabId ? { ...t, error: false } : t) })),
 
-  setActiveTab: (tabId) => set((s) =>
-    s.splitOn && s.paneBTabIds.includes(tabId)
-      ? { activeBId: tabId, focusedPane: 'b', activeTabId: tabId }
-      : { activeAId: tabId, focusedPane: 'a', activeTabId: tabId }
-  ),
+  setActiveTab: (tabId) => set((s) => {
+    const tab = s.tabs.find(t => t.id === tabId)
+    const activeView = activeViewForTab(s.activeView, tab)
+    return s.splitOn && s.paneBTabIds.includes(tabId)
+      ? { activeBId: tabId, focusedPane: 'b', activeTabId: tabId, activeView }
+      : { activeAId: tabId, focusedPane: 'a', activeTabId: tabId, activeView }
+  }),
   openNewConn:  (type, preset, groupId) => set({ newConnType: type, newConnPreset: preset ?? null, newConnGroup: groupId ?? null }),
   closeNewConn: ()      => set({ newConnType: null, newConnPreset: null, newConnGroup: null }),
   openEditConn:  (conn) => set({ editingConn: conn }),

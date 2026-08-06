@@ -1091,7 +1091,7 @@ pub async fn db_truncate_table(
             // ClickHouse 的 schema 即数据库名；标识符用反引号
             let tgt = if schema.is_empty() { q_mysql(&table) }
                       else { format!("{}.{}", q_mysql(&schema), q_mysql(&table)) };
-            super::query::dispatch_query(&config, password.as_deref(), &format!("TRUNCATE TABLE {tgt}")).await.map(|_| ())
+            super::query::dispatch_query(&config, password.as_deref(), &format!("TRUNCATE TABLE {tgt}"), None).await.map(|_| ())
         }
         _ => Err("此连接类型不支持 TRUNCATE 操作".into()),
     }
@@ -1151,7 +1151,7 @@ pub async fn db_drop_table(
             // ClickHouse 的 schema 即数据库名；标识符用反引号
             let tgt = if schema.is_empty() { q_mysql(&table) }
                       else { format!("{}.{}", q_mysql(&schema), q_mysql(&table)) };
-            super::query::dispatch_query(&config, password.as_deref(), &format!("DROP TABLE IF EXISTS {tgt}")).await.map(|_| ())
+            super::query::dispatch_query(&config, password.as_deref(), &format!("DROP TABLE IF EXISTS {tgt}"), None).await.map(|_| ())
         }
         _ => Err("此连接类型不支持 DROP TABLE 操作".into()),
     }
@@ -1219,7 +1219,7 @@ pub async fn db_rename_table(
                       else { format!("{}.{}", q_mysql(&schema), q_mysql(&old_name)) };
             let dst = if schema.is_empty() { q_mysql(&new_name) }
                       else { format!("{}.{}", q_mysql(&schema), q_mysql(&new_name)) };
-            super::query::dispatch_query(&config, password.as_deref(), &format!("RENAME TABLE {src} TO {dst}")).await.map(|_| ())
+            super::query::dispatch_query(&config, password.as_deref(), &format!("RENAME TABLE {src} TO {dst}"), None).await.map(|_| ())
         }
         _ => Err("此连接类型不支持重命名表操作".into()),
     }
@@ -2536,7 +2536,7 @@ async fn mig_run(
     match config.conn_type {
         ConnType::Oracle => super::oracle::execute_query_impl(config.clone(), sql.to_string(), password.map(|s| s.to_string()), registry).await,
         ConnType::SqlServer => dispatch_ss_query(id, config, sql, ss_pool).await,
-        ConnType::ClickHouse => super::query::dispatch_query(config, password, sql).await,
+        ConnType::ClickHouse => super::query::dispatch_query(config, password, sql, None).await,
         _ => Err("不支持的连接类型".into()),
     }
 }
@@ -5130,9 +5130,8 @@ pub async fn db_terminate_process(
 }
 
 // ── 14b. db_cancel_query：按取消令牌主动终止正在运行的查询 ────────────────────
-// 前端执行查询时在 SQL 前注入注释 /* dbterm-cancel:TOKEN */，该注释会出现在
-// SHOW FULL PROCESSLIST.Info / pg_stat_activity.query 中。此处按令牌定位该会话并取消，
-// 无需改动核心 execute_query，也无需在执行连接上预取 pid。
+// 取消令牌通过 execute_query.cancelToken 单独传入，不写进 SQL 文本，避免在
+// SHOW FULL PROCESSLIST.Info / pg_stat_activity.query 中泄露内部标记。
 #[tauri::command]
 pub async fn db_cancel_query(
     id: String,
@@ -5147,42 +5146,26 @@ pub async fn db_cancel_query(
     // 中止正在执行该查询的那条连接（关连接 → 取数据类查询服务端会随之中止；客户端立即解阻塞）。
     let aborted = crate::commands::query::cancel_abort(&token);
     let (config, password) = load_conn(&id, &storage).await?;
-    let marker = format!("dbterm-cancel:{token}");
     match config.conn_type {
         ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => {
-            use sqlx::Row;
             let (mut conn, _t) = mysql_connect(&config, password.as_deref()).await?;
             // 用 `KILL <id>`（终止整条会话线程，连同其正在跑的查询），而非 `KILL QUERY`（只停语句、线程仍在）
             // —— 确保不留僵尸后台线程。杀的是本应用自己发起的查询连接（同用户），无需 SUPER 权限。
-            // 为彻底起见：已记录的 pid 与「按取消标记扫进程列表命中的线程」都杀一遍（不提前 return）。
             let mut acted = false;
-            // 1) 直接杀登记的执行连接线程（线程可能已因客户端断连被回收 → KILL 报错属正常，无残留）
+            // 直接杀登记的执行连接线程（线程可能已因客户端断连被回收 → KILL 报错属正常，无残留）
             if let Some(pid) = known_pid {
                 if pid > 0 && sqlx::query(&format!("KILL {pid}")).execute(&mut conn).await.is_ok() {
                     acted = true;
                 }
             }
-            // 2) 再按取消标记在进程列表里定位仍残留的线程并杀掉（命中说明就在本连接所在节点，可靠清除）
-            if let Ok(rows) = sqlx::query("SHOW FULL PROCESSLIST").fetch_all(&mut conn).await {
-                for r in &rows {
-                    let info = r.try_get::<Option<String>, _>("Info").ok().flatten().unwrap_or_default();
-                    if info.contains(&marker) {
-                        let pid = r.try_get::<u64, _>("Id")
-                            .or_else(|_| r.try_get::<i64, _>("Id").map(|v| v as u64))
-                            .unwrap_or(0);
-                        if pid != 0 && sqlx::query(&format!("KILL {pid}")).execute(&mut conn).await.is_ok() {
-                            acted = true;
-                        }
-                    }
-                }
-            }
-            Ok(acted || aborted) // acted=确实杀了线程；aborted=至少已断开客户端连接
+            // 返回值只表达“服务端 KILL 已确认”。aborted 只代表本地执行连接已断开，
+            // 对 FEDERATED / 代理 / 多节点场景不能等价为远端数据库已终止。
+            Ok(acted)
         }
         ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
-            use sqlx::Row;
             let (mut conn, _t) = pg_connect(&config, password.as_deref()).await?;
             // 用 pg_terminate_backend（终止整个后端连接，连同其正在跑的查询）而非 pg_cancel_backend
-            // （只取消语句、后端仍在）—— 确保不留残留后端。已记录 pid 与按标记定位的后端都终止一遍。
+            // （只取消语句、后端仍在）—— 确保不留残留后端。
             let mut acted = false;
             if let Some(pid) = known_pid {
                 if pid > 0 && sqlx::query("SELECT pg_terminate_backend($1::int4)").bind(pid as i32)
@@ -5190,19 +5173,8 @@ pub async fn db_cancel_query(
                     acted = true;
                 }
             }
-            let pat = format!("%{marker}%");
-            if let Ok(rows) = sqlx::query(
-                "SELECT pid FROM pg_stat_activity WHERE query LIKE $1 AND pid <> pg_backend_pid()")
-                .bind(&pat).fetch_all(&mut conn).await {
-                for r in &rows {
-                    let pid: i32 = r.try_get(0).unwrap_or(0);
-                    if pid != 0 && sqlx::query("SELECT pg_terminate_backend($1::int4)").bind(pid)
-                        .execute(&mut conn).await.is_ok() {
-                        acted = true;
-                    }
-                }
-            }
-            Ok(acted || aborted)
+            // 返回值只表达“服务端 terminate 已确认”。aborted 只代表本地执行连接已断开。
+            Ok(acted)
         }
         ConnType::Sqlite | ConnType::Duckdb => {
             // SQLite/DuckDB 通过 abort 信号中断 select!，无需服务端 KILL
@@ -7325,6 +7297,42 @@ pub struct DictIndex {
     pub index_type: String,
 }
 
+fn dict_index_columns_from_sql(sql: &str) -> String {
+    let Some(start) = sql.rfind('(') else { return String::new(); };
+    let Some(end) = sql.rfind(')') else { return String::new(); };
+    if end <= start { return String::new(); }
+    sql[start + 1..end]
+        .split(',')
+        .map(|s| {
+            let mut v = s.trim().trim_matches('"').trim_matches('`').to_string();
+            if v.starts_with('[') && v.ends_with(']') && v.len() > 1 {
+                v = v[1..v.len() - 1].to_string();
+            }
+            let upper = v.to_ascii_uppercase();
+            for suffix in [" ASC", " DESC"] {
+                if upper.ends_with(suffix) {
+                    v.truncate(v.len().saturating_sub(suffix.len()));
+                    break;
+                }
+            }
+            v.trim().to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn empty_query_result() -> crate::models::QueryResult {
+    crate::models::QueryResult {
+        columns: vec![],
+        rows: vec![],
+        rows_affected: 0,
+        execution_time_ms: 0,
+        truncated: false,
+        is_select: false,
+    }
+}
+
 #[tauri::command]
 pub async fn db_data_dictionary(
     id:      String,
@@ -7396,7 +7404,7 @@ pub async fn db_data_dictionary(
                 // Indexes
                 let idx_sql = format!(
                     "SELECT CAST(INDEX_NAME AS CHAR), CAST(GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS CHAR), \
-                            NOT NON_UNIQUE, CAST(INDEX_TYPE AS CHAR) \
+                            CAST(NON_UNIQUE = 0 AS SIGNED), CAST(INDEX_TYPE AS CHAR) \
                      FROM information_schema.STATISTICS \
                      WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' \
                      GROUP BY INDEX_NAME, NON_UNIQUE, INDEX_TYPE ORDER BY INDEX_NAME",
@@ -7446,15 +7454,15 @@ pub async fn db_data_dictionary(
                     comment:     r.try_get::<Option<String>, _>(6).unwrap_or(None).unwrap_or_default(),
                 }).collect();
 
-                let idx_sql = "SELECT i.relname, array_to_string(array_agg(a.attname ORDER BY ia.indnatts), ', '), \
+                let idx_sql = "SELECT i.relname, array_to_string(array_agg(a.attname ORDER BY ia.ord), ', '), \
                                       ix.indisunique, am.amname \
                                FROM pg_index ix \
                                JOIN pg_class t  ON t.oid  = ix.indrelid \
                                JOIN pg_class i  ON i.oid  = ix.indexrelid \
                                JOIN pg_am am    ON am.oid = i.relam \
                                JOIN pg_namespace n ON n.oid = t.relnamespace \
-                               CROSS JOIN LATERAL unnest(ix.indkey) AS ia(indnatts) \
-                               JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ia.indnatts \
+                               CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS ia(attnum, ord) \
+                               JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ia.attnum \
                                WHERE t.relname = $1 AND n.nspname = $2 \
                                GROUP BY i.relname, ix.indisunique, am.amname ORDER BY i.relname";
                 let idx_rows = sqlx::query(idx_sql).bind(&tname).bind(schema_name)
@@ -7501,8 +7509,30 @@ pub async fn db_data_dictionary(
                 };
                 map.entry(tbl).or_default().push(col);
             }
-            Ok(map.into_iter().map(|(name, columns)| DictTable {
-                name, comment: String::new(), columns, indexes: vec![],
+            let idx_sql = format!(
+                "SELECT table_name, index_name, is_unique, sql FROM duckdb_indexes() \
+                 WHERE schema_name = '{}' ORDER BY table_name, index_name",
+                schema_name.replace('\'', "''")
+            );
+            let idx_result = dispatch_duck_query(&id, &cfg, &idx_sql, &duck_pool, &registry)
+                .await
+                .unwrap_or_else(|_| empty_query_result());
+            let mut idx_map: std::collections::BTreeMap<String, Vec<DictIndex>> = std::collections::BTreeMap::new();
+            for row in idx_result.rows {
+                let g = |i: usize| row.get(i).and_then(|v| v.clone()).unwrap_or_default();
+                let tbl = g(0);
+                if let Some(ref set) = only { if !set.contains(&tbl) { continue; } }
+                let sql_def = g(3);
+                idx_map.entry(tbl).or_default().push(DictIndex {
+                    name: g(1),
+                    columns: dict_index_columns_from_sql(&sql_def),
+                    unique: g(2).eq_ignore_ascii_case("true") || g(2) == "1",
+                    index_type: "BTREE".into(),
+                });
+            }
+            Ok(map.into_iter().map(|(name, columns)| {
+                let indexes = idx_map.remove(&name).unwrap_or_default();
+                DictTable { name, comment: String::new(), columns, indexes }
             }).collect())
         }
         ConnType::Sqlite => {
@@ -7598,7 +7628,21 @@ pub async fn db_data_dictionary(
                        WHERE ct.constraint_type='P' AND ct.owner='{owner}' AND ct.table_name='{tn}') pk ON pk.column_name=c.column_name \
                      WHERE c.owner='{owner}' AND c.table_name='{tn}' ORDER BY c.column_id");
                 let cr = super::oracle::execute_query_impl(cfg.clone(), col_sql, pwd.clone(), &registry).await?;
-                out.push(DictTable { name: tname, comment: String::new(), columns: dict_cols(cr.rows), indexes: vec![] });
+                let idx_sql = format!(
+                    "SELECT i.index_name, LISTAGG(ic.column_name, ', ') WITHIN GROUP (ORDER BY ic.column_position), \
+                       CASE WHEN i.uniqueness='UNIQUE' THEN '1' ELSE '0' END, i.index_type \
+                     FROM all_indexes i \
+                     JOIN all_ind_columns ic ON ic.index_owner=i.owner AND ic.index_name=i.index_name \
+                     WHERE i.table_owner='{owner}' AND i.table_name='{tn}' \
+                     GROUP BY i.index_name, i.uniqueness, i.index_type ORDER BY i.index_name"
+                );
+                let ir = super::oracle::execute_query_impl(cfg.clone(), idx_sql, pwd.clone(), &registry).await
+                    .unwrap_or_else(|_| empty_query_result());
+                let indexes = ir.rows.into_iter().map(|r| {
+                    let g = |i: usize| r.get(i).cloned().flatten().unwrap_or_default();
+                    DictIndex { name: g(0), columns: g(1), unique: g(2) == "1", index_type: g(3) }
+                }).collect();
+                out.push(DictTable { name: tname, comment: String::new(), columns: dict_cols(cr.rows), indexes });
             }
             Ok(out)
         }
@@ -7628,7 +7672,26 @@ pub async fn db_data_dictionary(
                      WHERE c.TABLE_NAME='{tn}' ORDER BY c.ORDINAL_POSITION",
                     db = db, tn = tn);
                 let cr = dispatch_ss_query(&id, &cfg, &col_sql, &ss_pool).await?;
-                out.push(DictTable { name: tname, comment: String::new(), columns: dict_cols(cr.rows), indexes: vec![] });
+                let idx_sql = format!(
+                    "SELECT i.name, \
+                       STUFF((SELECT ', ' + c2.name \
+                              FROM [{db}].sys.index_columns ic2 \
+                              JOIN [{db}].sys.columns c2 ON c2.object_id=ic2.object_id AND c2.column_id=ic2.column_id \
+                              WHERE ic2.object_id=i.object_id AND ic2.index_id=i.index_id AND ic2.key_ordinal>0 \
+                              ORDER BY ic2.key_ordinal FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, ''), \
+                       CASE WHEN i.is_unique=1 THEN '1' ELSE '0' END, i.type_desc \
+                     FROM [{db}].sys.indexes i \
+                     JOIN [{db}].sys.tables t ON t.object_id=i.object_id \
+                     WHERE t.name='{tn}' AND i.index_id>0 AND i.is_hypothetical=0 \
+                     ORDER BY i.name",
+                    db = db, tn = tn);
+                let ir = dispatch_ss_query(&id, &cfg, &idx_sql, &ss_pool).await
+                    .unwrap_or_else(|_| empty_query_result());
+                let indexes = ir.rows.into_iter().map(|r| {
+                    let g = |i: usize| r.get(i).cloned().flatten().unwrap_or_default();
+                    DictIndex { name: g(0), columns: g(1), unique: g(2) == "1", index_type: g(3) }
+                }).collect();
+                out.push(DictTable { name: tname, comment: String::new(), columns: dict_cols(cr.rows), indexes });
             }
             Ok(out)
         }
@@ -7637,7 +7700,7 @@ pub async fn db_data_dictionary(
             let cr = super::query::dispatch_query(&cfg, pwd.as_deref(),
                 &format!("SELECT table, name, type, if(startsWith(type,'Nullable'),'YES',''), \
                     if(is_in_primary_key=1,'PRI',''), default_expression, comment \
-                  FROM system.columns WHERE database='{sc}' ORDER BY table, position")).await?;
+                  FROM system.columns WHERE database='{sc}' ORDER BY table, position"), None).await?;
             let mut map: std::collections::BTreeMap<String, Vec<DictColumn>> = std::collections::BTreeMap::new();
             for r in cr.rows {
                 let g = |i: usize| r.get(i).cloned().flatten().unwrap_or_default();
@@ -7649,7 +7712,23 @@ pub async fn db_data_dictionary(
                     nullable: n == "YES", key_type: g(4), default_val: g(5), extra: String::new(), comment: g(6),
                 });
             }
-            Ok(map.into_iter().map(|(name, columns)| DictTable { name, comment: String::new(), columns, indexes: vec![] }).collect())
+            let ir = super::query::dispatch_query(&cfg, pwd.as_deref(),
+                &format!("SELECT table, name, expr, type FROM system.data_skipping_indices WHERE database='{sc}' ORDER BY table, name"), None)
+                .await
+                .unwrap_or_else(|_| empty_query_result());
+            let mut idx_map: std::collections::BTreeMap<String, Vec<DictIndex>> = std::collections::BTreeMap::new();
+            for r in ir.rows {
+                let g = |i: usize| r.get(i).cloned().flatten().unwrap_or_default();
+                let tname = g(0);
+                if let Some(ref set) = only { if !set.contains(&tname) { continue; } }
+                idx_map.entry(tname).or_default().push(DictIndex {
+                    name: g(1), columns: g(2), unique: false, index_type: g(3),
+                });
+            }
+            Ok(map.into_iter().map(|(name, columns)| {
+                let indexes = idx_map.remove(&name).unwrap_or_default();
+                DictTable { name, comment: String::new(), columns, indexes }
+            }).collect())
         }
         _ => Err("不支持的连接类型".into()),
     }
@@ -7933,7 +8012,7 @@ pub async fn db_er_data(
                    if(is_in_primary_key=1,'PRI','') \
                  FROM system.columns WHERE database='{}' ORDER BY table, position",
                 schema.replace('\'', "''"));
-            let cr = super::query::dispatch_query(&config, password.as_deref(), &col_sql).await?;
+            let cr = super::query::dispatch_query(&config, password.as_deref(), &col_sql, None).await?;
             Ok(ErData { tables: build_tables(cr.rows), fks: vec![] })
         }
         ConnType::Duckdb => {
@@ -7950,7 +8029,7 @@ pub async fn db_er_data(
             // SQLite：sqlite_master 取表名，逐表 PRAGMA table_info / foreign_key_list
             let dq = |sql: String| {
                 let config = config.clone();
-                async move { super::query::dispatch_query(&config, None, &sql).await }
+                async move { super::query::dispatch_query(&config, None, &sql, None).await }
             };
             let tbl_rows = dq("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name".into()).await?;
             let mut tables: Vec<ErTable> = Vec::new();

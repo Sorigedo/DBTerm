@@ -14,6 +14,21 @@ export interface ThemeDef {
 
 export const THEMES: Record<string, ThemeDef> = {
   // ── Dark Themes ─────────────────────────────────────────
+  jetbrainsGraphite: {
+    key: 'jetbrainsGraphite', name: 'JetBrains Graphite', mode: 'dark',
+    xterm: {
+      background: '#252a33', foreground: '#c8d0dc',
+      cursor: '#7fb1f3', cursorAccent: '#252a33',
+      selectionBackground: '#3f4b63',
+      black: '#1f232b', red: '#ff7373', green: '#73c991', yellow: '#e2b86b',
+      blue: '#7fb1f3', magenta: '#b8a9ff', cyan: '#55c7bd', white: '#c8d0dc',
+      brightBlack: '#6f7b8d', brightRed: '#ff8b8b', brightGreen: '#8fdda8',
+      brightYellow: '#f0cd85', brightBlue: '#98c3fb', brightMagenta: '#cabfff',
+      brightCyan: '#75d7cf', brightWhite: '#eef3f8',
+    },
+    preview: { bg: '#252a33', fg: '#c8d0dc', swatches: ['#ff7373','#73c991','#e2b86b','#7fb1f3','#b8a9ff','#55c7bd'] },
+  },
+
   tokyoNight: {
     key: 'tokyoNight', name: 'Tokyo Night', mode: 'dark',
     xterm: {
@@ -427,6 +442,64 @@ export const ANSI_PALETTES: AnsiPalette[] = [
 ]
 export type ThemeKey = keyof typeof THEMES
 
+const JETBRAINS_GRAPHITE_UI_VARS: Record<string, string> = {
+  '--bg': '#2b303a',
+  '--surface': '#363d49',
+  '--surface-2': '#404a58',
+  '--bg-raw': '#2b303a',
+  '--surface-raw': '#363d49',
+  '--surface-2-raw': '#404a58',
+  '--surface-hover': '#4b5666',
+  '--surface-active': '#566376',
+  '--border': '#596679',
+  '--border-subtle': '#444e5d',
+  '--text': '#d4dbe6',
+  '--text-bright': '#f4f7fb',
+  '--text-muted': '#a1adbd',
+  '--accent': '#86b9ff',
+  '--accent-hover': '#a4cbff',
+  '--accent-glow': 'rgba(134,185,255,0.24)',
+  '--accent-bg': 'rgba(134,185,255,0.17)',
+  '--success': '#73c991',
+  '--warning': '#e2b86b',
+  '--error': '#ff7373',
+  '--error-bg': 'rgba(255,115,115,0.12)',
+  '--sql-keyword': '#d3a4ff',
+  '--sql-string': '#a9d978',
+  '--sql-number': '#ffc777',
+  '--sql-func': '#96c5ff',
+  '--sql-type': '#78dce8',
+}
+
+const GITHUB_LIGHT_UI_VARS: Record<string, string> = {
+  '--bg': '#f5f7fa',
+  '--surface': '#ffffff',
+  '--surface-2': '#f0f3f6',
+  '--bg-raw': '#f5f7fa',
+  '--surface-raw': '#ffffff',
+  '--surface-2-raw': '#f0f3f6',
+  '--surface-hover': '#e8edf3',
+  '--surface-active': '#dfe7f0',
+  '--border': '#cfd7e2',
+  '--border-subtle': '#e3e8ef',
+  '--text': '#1f2328',
+  '--text-bright': '#1f2328',
+  '--text-muted': '#656d76',
+  '--accent': '#0b6bd3',
+  '--accent-hover': '#075ebd',
+  '--accent-glow': 'rgba(11,107,211,0.18)',
+  '--accent-bg': 'rgba(11,107,211,0.09)',
+  '--success': '#1a7f37',
+  '--warning': '#9a6700',
+  '--error': '#cf222e',
+  '--error-bg': 'rgba(207,34,46,0.08)',
+  '--sql-keyword': '#6d28d9',
+  '--sql-string': '#047857',
+  '--sql-number': '#b45309',
+  '--sql-func': '#1d4ed8',
+  '--sql-type': '#0f766e',
+}
+
 // ── 由主题色推导整套 UI CSS 变量（全软件换肤）────────────────────────
 function clamp(n: number) { return Math.max(0, Math.min(255, Math.round(n))) }
 function parseHex(hex: string): [number, number, number] {
@@ -450,40 +523,50 @@ function alpha(c: string, a: number): string {
 }
 
 /**
- * 从主题的终端色 + 深/浅模式推导出整套界面 CSS 变量。
- * 深色：面板在背景上「提亮」分层；浅色：背景压成浅灰画布、面板回到主题原色（近白）以形成层次，
- * 避免「通体灰、无层次」。强调/语义色取自主题调色板，让每套主题界面观感各异。
+ * 界面主题必须影响全软件 UI；终端字体配色方案仅用于覆盖终端 ANSI。
+ * 默认深/浅主题使用明确色板，其它主题从自身终端色推导 UI 层级和 SQL 高亮。
  */
 export function buildThemeVars(t: ThemeDef): Record<string, string> {
+  if (t.key === 'jetbrainsGraphite') return { ...JETBRAINS_GRAPHITE_UI_VARS }
+  if (t.key === 'githubLight') return { ...GITHUB_LIGHT_UI_VARS }
+
   const x = t.xterm
-  const B = x.background || '#0d1117'
-  const F = x.foreground || '#e6edf3'
+  const B = x.background || (t.mode === 'dark' ? '#252a33' : '#f5f7fa')
+  const F = x.foreground || (t.mode === 'dark' ? '#c8d0dc' : '#1f2328')
   const dark = t.mode === 'dark'
-  const accent  = x.blue || x.brightBlue || '#2f81f7'
+  const accent = x.blue || x.brightBlue || (dark ? '#7fb1f3' : '#0b6bd3')
   const accentH = x.brightBlue || x.blue || accent
+  const uiBg = dark ? lighten(B, 0.050) : darken(B, 0.014)
+  const text = dark ? mix(F, '#ffffff', 0.22) : darken(F, 0.14)
+  const textBright = dark ? mix(F, '#ffffff', 0.42) : darken(F, 0.28)
+  const textMuted = dark ? mix(F, uiBg, 0.34) : mix(F, B, 0.38)
+
   return {
-    // 浅色：画布只比面板略暗一点点（避免「边栏发灰、与白色编辑区割裂」），分区主要靠边框；
-    // 输入/悬停/选中仍有足够灰阶对比。深色：面板在背景上提亮分层。
-    '--bg':             dark ? B                : darken(B, 0.014),
-    '--surface':        dark ? lighten(B, 0.045): B,
-    '--surface-2':      dark ? lighten(B, 0.085): darken(B, 0.045),
-    '--bg-raw':         dark ? B                : darken(B, 0.014),
-    '--surface-raw':    dark ? lighten(B, 0.045): B,
-    '--surface-2-raw':  dark ? lighten(B, 0.085): darken(B, 0.045),
-    '--surface-hover':  dark ? lighten(B, 0.065): darken(B, 0.035),
-    '--surface-active': dark ? lighten(B, 0.12) : darken(B, 0.07),
-    '--border':         dark ? lighten(B, 0.15) : darken(B, 0.12),
-    '--border-subtle':  dark ? lighten(B, 0.08) : darken(B, 0.06),
-    '--text':           F,
-    '--text-bright':    dark ? lighten(F, 0.18) : darken(F, 0.28),
-    '--text-muted':     mix(F, B, 0.42),
+    '--bg':             uiBg,
+    '--surface':        dark ? lighten(B, 0.125) : B,
+    '--surface-2':      dark ? lighten(B, 0.185) : darken(B, 0.045),
+    '--bg-raw':         uiBg,
+    '--surface-raw':    dark ? lighten(B, 0.125) : B,
+    '--surface-2-raw':  dark ? lighten(B, 0.185) : darken(B, 0.045),
+    '--surface-hover':  dark ? lighten(B, 0.245) : darken(B, 0.035),
+    '--surface-active': dark ? lighten(B, 0.305) : darken(B, 0.070),
+    '--border':         dark ? lighten(B, 0.325) : darken(B, 0.120),
+    '--border-subtle':  dark ? lighten(B, 0.200) : darken(B, 0.060),
+    '--text':           text,
+    '--text-bright':    textBright,
+    '--text-muted':     textMuted,
     '--accent':         accent,
     '--accent-hover':   accentH,
-    '--accent-glow':    alpha(accent, 0.30),
+    '--accent-glow':    alpha(accent, dark ? 0.26 : 0.18),
     '--accent-bg':      alpha(accent, dark ? 0.16 : 0.10),
-    '--success':        x.green  || '#3fb950',
-    '--warning':        x.yellow || '#d29922',
-    '--error':          x.red    || '#f85149',
-    '--error-bg':       alpha(x.red || '#f85149', dark ? 0.12 : 0.08),
+    '--success':        x.green || (dark ? '#73c991' : '#1a7f37'),
+    '--warning':        x.yellow || (dark ? '#e2b86b' : '#9a6700'),
+    '--error':          x.red || (dark ? '#ff7373' : '#cf222e'),
+    '--error-bg':       alpha(x.red || (dark ? '#ff7373' : '#cf222e'), dark ? 0.12 : 0.08),
+    '--sql-keyword':    x.magenta || accent,
+    '--sql-string':     x.green || (dark ? '#9ccc65' : '#047857'),
+    '--sql-number':     x.yellow || (dark ? '#f0b86a' : '#b45309'),
+    '--sql-func':       accent,
+    '--sql-type':       x.cyan || (dark ? '#65c7d4' : '#0f766e'),
   }
 }

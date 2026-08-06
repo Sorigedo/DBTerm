@@ -5,11 +5,24 @@ import { EditorView } from '@codemirror/view'
 import { createPortal } from 'react-dom'
 
 const _editorDark = EditorView.theme({
-  '&': { background: 'var(--bg)', color: 'var(--text)' },
-  '.cm-scroller': { background: 'var(--bg)' },
+  '&': { background: 'var(--surface)', color: 'var(--text)' },
+  '.cm-scroller': { background: 'var(--surface)' },
   '.cm-content': { caretColor: 'var(--accent)' },
   '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--accent)' },
-  '&.cm-focused .cm-selectionBackground, .cm-selectionBackground': { background: 'rgba(100,145,255,0.28) !important' },
+  '&.cm-focused .cm-selectionBackground, .cm-selectionBackground':
+    { background: 'color-mix(in srgb, var(--accent) 38%, transparent) !important' },
+  '.cm-content ::selection': { background: 'color-mix(in srgb, var(--accent) 38%, transparent) !important' },
+  '.cm-selectionMatch': {
+    background: 'color-mix(in srgb, var(--accent) 18%, transparent) !important',
+    outline: '1px solid color-mix(in srgb, var(--accent) 30%, transparent)',
+  },
+  '.cm-searchMatch': {
+    background: 'color-mix(in srgb, var(--warning) 20%, transparent) !important',
+    outline: '1px solid color-mix(in srgb, var(--warning) 34%, transparent)',
+  },
+  '.cm-searchMatch.cm-searchMatch-selected': {
+    background: 'color-mix(in srgb, var(--warning) 32%, transparent) !important',
+  },
   '.cm-activeLine': { background: 'rgba(255,255,255,0.04)' },
   '.cm-activeLineGutter': { background: 'rgba(255,255,255,0.04)' },
   '.cm-gutters': { background: 'var(--surface)', color: 'var(--text-muted)', border: 'none', borderRight: '1px solid var(--border-subtle)' },
@@ -17,17 +30,30 @@ const _editorDark = EditorView.theme({
 }, { dark: true })
 
 const _editorLight = EditorView.theme({
-  '&': { background: 'var(--bg)', color: 'var(--text)' },
-  '.cm-scroller': { background: 'var(--bg)' },
+  '&': { background: 'var(--surface)', color: 'var(--text)' },
+  '.cm-scroller': { background: 'var(--surface)' },
   '.cm-content': { caretColor: 'var(--accent)' },
   '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--accent)' },
-  '&.cm-focused .cm-selectionBackground, .cm-selectionBackground': { background: 'rgba(80,130,240,0.22) !important' },
+  '&.cm-focused .cm-selectionBackground, .cm-selectionBackground':
+    { background: 'color-mix(in srgb, var(--accent) 24%, transparent) !important' },
+  '.cm-content ::selection': { background: 'color-mix(in srgb, var(--accent) 24%, transparent) !important' },
+  '.cm-selectionMatch': {
+    background: 'color-mix(in srgb, var(--accent) 12%, transparent) !important',
+    outline: '1px solid color-mix(in srgb, var(--accent) 22%, transparent)',
+  },
+  '.cm-searchMatch': {
+    background: 'color-mix(in srgb, var(--warning) 18%, transparent) !important',
+    outline: '1px solid color-mix(in srgb, var(--warning) 28%, transparent)',
+  },
+  '.cm-searchMatch.cm-searchMatch-selected': {
+    background: 'color-mix(in srgb, var(--warning) 28%, transparent) !important',
+  },
   '.cm-activeLine': { background: 'rgba(0,0,0,0.035)' },
   '.cm-activeLineGutter': { background: 'rgba(0,0,0,0.035)' },
   '.cm-gutters': { background: 'var(--surface)', color: 'var(--text-muted)', border: 'none', borderRight: '1px solid var(--border-subtle)' },
   '.cm-gutter .cm-gutterElement': { padding: '0 8px' },
 }, { dark: false })
-import { Save, AlignLeft, Loader2, Database, ChevronRight, Play, X, ChevronUp, ChevronDown, FileCode2 } from 'lucide-react'
+import { Save, AlignLeft, Loader2, Database, ChevronRight, Play, X, ChevronUp, ChevronDown, FileCode2, StopCircle } from 'lucide-react'
 import type { ConnType } from '../../types'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useAppStore } from '../../stores/appStore'
@@ -72,6 +98,7 @@ function friendlyDbError(raw: string): string {
 }
 
 const OBJ_LABEL: Record<ObjType, string> = { view: '视图', function: '函数', procedure: '存储过程' }
+const CANCELABLE_TYPES = new Set(['mysql', 'mariadb', 'tidb', 'oceanBase', 'postgres', 'kingBase', 'openGauss', 'sqlite', 'duckdb'])
 
 export default function ObjectEditor({ tabId, connectionId, connType }: Props) {
   const draft = useObjectDraftStore((s) => s.drafts[tabId])
@@ -99,6 +126,13 @@ export default function ObjectEditor({ tabId, connectionId, connType }: Props) {
 
   // ── 执行（视图预览 / 函数求值 / 存过调用）：结果区复用查询页样式 + ResultTable ──
   const [running, setRunning] = useState(false)
+  const [runToken, setRunToken] = useState<string | null>(null)
+  const [cancelling, setCancelling] = useState(false)
+  const runTokenRef = useRef<string | null>(null)
+  const cancelRequestedRef = useRef(false)
+  const cancelMessageRef = useRef<string | null>(null)
+  const runSeqRef = useRef(0)
+  const runStartedAtRef = useRef(0)
   const [runResult, setRunResult] = useState<{ columns: string[]; rows: (string | null)[][]; rowsAffected: number; executionTimeMs: number } | null>(null)
   const [runError, setRunError] = useState('')
   const [runMs, setRunMs] = useState(0)
@@ -255,26 +289,100 @@ export default function ObjectEditor({ tabId, connectionId, connType }: Props) {
     return () => unregisterObjectSave(tabId)
   }, [tabId, handleSave])
 
+  const canCancel = CANCELABLE_TYPES.has(connType)
+  const newCancelToken = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+  const markSql = useCallback((s: string, token?: string | null) => {
+    void token
+    return s
+  }, [])
+
+  const stopQuery = useCallback(async () => {
+    if (!running || cancelRequestedRef.current) return
+    cancelRequestedRef.current = true
+    const token = runTokenRef.current || runToken
+    if (!token) {
+      cancelRequestedRef.current = false
+      toast.info('此连接类型暂不支持中途取消')
+      return
+    }
+    const seq = runSeqRef.current
+    const elapsed = Math.max(0, Math.round(performance.now() - runStartedAtRef.current))
+    const pendingMsg = '取消请求已发送，正在等待数据库确认'
+    cancelMessageRef.current = pendingMsg
+    setCancelling(true)
+    setRunResult(null)
+    setRunError(pendingMsg)
+    setRunMs(elapsed)
+    setResultTab('msg')
+    setRunning(false)
+    setCancelling(false)
+    setRunToken(null)
+    runTokenRef.current = null
+    try {
+      const { invoke } = await import('@tauri-apps/api/core')
+      const ok = await invoke<boolean>('db_cancel_query', { id: connectionId, token })
+      if (runSeqRef.current !== seq) return
+      const msg = ok
+        ? '执行已取消，数据库已确认终止请求'
+        : '取消请求已发送，本地连接已断开；服务端未返回 KILL 确认，远端/FEDERATED 引擎可能仍在处理或已自行结束'
+      cancelMessageRef.current = msg
+      setRunError(msg)
+      toast[ok ? 'success' : 'info'](ok ? '数据库已确认取消' : '已发送取消请求，本地连接已断开', {
+        title: ok ? '执行已取消' : undefined,
+        duration: 4200,
+      })
+    } catch (e) {
+      const msg = `取消请求失败：${String(e)}`
+      cancelMessageRef.current = msg
+      setRunError(msg)
+      toast.error(String(e))
+    }
+  }, [connectionId, runToken, running])
+
   // 真正执行：拼好 SQL 后发到数据库，结果进底部面板
   const execSql = useCallback(async (sqlToRun: string) => {
+    const seq = runSeqRef.current + 1
+    runSeqRef.current = seq
     setRunning(true); setRunError(''); setRunResult(null); setLastSql(sqlToRun)
+    setCancelling(false)
+    cancelRequestedRef.current = false
+    cancelMessageRef.current = null
     setResultOpen(true); setResultCollapsed(false)
+    const token = canCancel ? newCancelToken() : null
+    runTokenRef.current = token
+    setRunToken(token)
     const t0 = performance.now()
+    runStartedAtRef.current = t0
     try {
       const { invoke } = await import('@tauri-apps/api/core')
       const res = await invoke<{ columns: string[]; rows: (string | null)[][]; rowsAffected: number; executionTimeMs: number }>(
-        'execute_query', { id: connectionId, sql: sqlToRun, database: currentSchema || undefined })
+        'execute_query', { id: connectionId, sql: markSql(sqlToRun, token), database: currentSchema || undefined, cancelToken: token ?? undefined })
+      if (runSeqRef.current !== seq) return
+      if (cancelRequestedRef.current) {
+        setRunError(cancelMessageRef.current || '执行已取消')
+        setResultTab('msg')
+        return
+      }
       setRunResult(res)
       setRunMs(res.executionTimeMs)
       setResultTab(res.columns.length > 0 ? 0 : 'msg')   // 有数据 → 结果1，否则 → 消息
     } catch (e) {
-      setRunError(friendlyDbError(String(e)))
-      setRunMs(Math.round(performance.now() - t0))
+      if (runSeqRef.current !== seq) return
+      const cancelled = cancelRequestedRef.current
+      setRunError(cancelled ? (cancelMessageRef.current || '执行已取消') : friendlyDbError(String(e)))
+      if (!cancelled) setRunMs(Math.round(performance.now() - t0))
       setResultTab('msg')
     } finally {
-      setRunning(false)
+      if (runSeqRef.current === seq) {
+        setRunning(false)
+        setCancelling(false)
+        runTokenRef.current = null
+        setRunToken(null)
+        cancelRequestedRef.current = false
+        cancelMessageRef.current = null
+      }
     }
-  }, [connectionId, currentSchema])
+  }, [canCancel, connectionId, currentSchema, markSql])
 
   // 点「执行」：先保存（有改动则自动保存），再按对象类型决定是否需要参数
   const handleRun = useCallback(async () => {
@@ -359,14 +467,14 @@ export default function ObjectEditor({ tabId, connectionId, connType }: Props) {
     const onKey = (e: KeyboardEvent) => {
       if (useAppStore.getState().activeTabId !== tabId) return
       if (isModEvent(e) && (e.key === 's' || e.key === 'S')) { e.preventDefault(); handleSave(); return }
-      if (matchShortcut(e, combo('sqlRunAll')))   { e.preventDefault(); handleRun(); return }
+      if (matchShortcut(e, combo('sqlRunAll')))   { e.preventDefault(); running ? stopQuery() : handleRun(); return }
       if (matchShortcut(e, combo('sqlFormat')))   { e.preventDefault(); formatSql(); return }
       if (matchShortcut(e, combo('dbNewQuery')))  { e.preventDefault(); openInQuery(); return }
       if (matchShortcut(e, combo('sqlToggleResult'))) { e.preventDefault(); if (resultOpen) setResultCollapsed((v) => !v); return }
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [shortcuts, tabId, handleSave, handleRun, formatSql, openInQuery, resultOpen])
+  }, [shortcuts, tabId, handleSave, handleRun, stopQuery, running, formatSql, openInQuery, resultOpen])
 
   if (!draft) {
     return <div className="result-placeholder" style={{ padding: 40 }}><span>设计草稿已失效，请重新从对象树新建</span></div>
@@ -394,11 +502,13 @@ export default function ObjectEditor({ tabId, connectionId, connType }: Props) {
           {saving ? <Loader2 size={13} className="spin" strokeWidth={2.5} /> : <Save size={13} strokeWidth={2.5} />}
           保存
         </button>
-        <button className="sql-run-btn" onClick={handleRun} disabled={running || saving || !ddl.trim()}
-          data-tip={draft.objType === 'view' ? '执行：预览视图数据' : draft.objType === 'function' ? '执行：调用函数求值' : '执行：调用存储过程'}
+        <button className={`sql-run-btn${running ? ' sql-run-btn--stop' : ''}`}
+          onClick={() => running ? stopQuery() : handleRun()}
+          disabled={saving || (!running && !ddl.trim())}
+          data-tip={running ? (runToken ? '停止当前执行' : '此连接类型暂不支持中途取消') : draft.objType === 'view' ? '执行：预览视图数据' : draft.objType === 'function' ? '执行：调用函数求值' : '执行：调用存储过程'}
           data-shortcut={sc('sqlRunAll')}>
-          {running ? <Loader2 size={13} className="spin" strokeWidth={2.5} /> : <Play size={13} strokeWidth={2.5} />}
-          执行
+          {running ? <StopCircle size={13} strokeWidth={2.5} /> : <Play size={13} strokeWidth={2.5} />}
+          {running ? '停止' : '执行'}
         </button>
         <button className="sql-tool-btn" onClick={openInQuery} disabled={!ddl.trim()}
           data-shortcut={sc('dbNewQuery')}
@@ -417,7 +527,7 @@ export default function ObjectEditor({ tabId, connectionId, connType }: Props) {
           extensions={[sqlExt, sqlHighlight, ...tableLinkExt, cmSearchPhrases]}
           theme={isDark ? _editorDark : _editorLight}
           onChange={(val) => { setDdl(val); preFormatRef.current = null }}
-          basicSetup={{ lineNumbers: true, highlightActiveLine: true, foldGutter: false, autocompletion: true }}
+          basicSetup={{ lineNumbers: true, highlightActiveLine: true, highlightSelectionMatches: true, foldGutter: false, autocompletion: true }}
         />
       </div>
 
@@ -446,7 +556,7 @@ export default function ObjectEditor({ tabId, connectionId, connType }: Props) {
           {!resultCollapsed && (
             <div className="sql-result-body">
               {running ? (
-                <div className="result-placeholder"><span>执行中…</span></div>
+                <div className="result-placeholder"><span>{cancelling ? '正在取消…' : '执行中…'}</span></div>
               ) : resultTab === 'msg' ? (
                 <div className="sql-msglog">
                   {(!lastSql && !runError) ? (

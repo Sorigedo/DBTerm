@@ -1,5 +1,5 @@
 import { lazy, Suspense, useState, useRef, useEffect, useCallback } from 'react'
-import { Wifi, Send, Terminal as TerminalIcon, Database, Table2, Columns3, FileCode2 } from 'lucide-react'
+import { Wifi, Send, Terminal as TerminalIcon, Database, Table2, Columns3, FileCode2, Wrench } from 'lucide-react'
 import TabBar from './TabBar'
 import PaneTabBar from './PaneTabBar'
 import EmptyState from './EmptyState'
@@ -19,6 +19,7 @@ const MongoBrowser = lazy(() => import('../MongoBrowser'))
 const SchemaBrowser = lazy(() => import('../SchemaBrowser'))
 const TableBrowser = lazy(() => import('../DbTools/TableBrowser'))
 const DbToolPanels = lazy(() => import('../DbTools/DbToolPanels'))
+const ToolPage = lazy(() => import('../Tools/ToolPage'))
 
 const QUERY_SLEEP_DELAY_MS = 60_000
 
@@ -63,6 +64,7 @@ function tabPreviewIcon(tab?: WorkspaceTab) {
   if (tab.type === 'table-data') return <Table2 {...props} />
   if (tab.type === 'schema-browser') return <Columns3 {...props} />
   if (tab.type === 'object-editor') return <FileCode2 {...props} />
+  if (tab.type === 'tool') return <Wrench {...props} />
   return <Database {...props} />
 }
 
@@ -367,7 +369,7 @@ export default function Workspace() {
                         sessionId={sessionId}
                         connectionId={t.connectionId}
                         connType={conn?.type}
-                        active={activeTabId === t.id}
+                        active={isTabVisible(t.id)}
                         onError={() => markTabError(t.id)}
                         onConnected={() => clearTabError(t.id)}
                       />
@@ -470,6 +472,19 @@ export default function Workspace() {
                 </div>
               )
             })}
+
+          {/* 本地工具标签页 */}
+          {tabs
+            .filter(t => t.type === 'tool')
+            .map(t => (
+              <div key={t.id} style={paneStyle(t.id)}>
+                <ErrorBoundary label="工具">
+                  <Suspense fallback={<LazyPaneFallback label="正在加载工具..." />}>
+                    <ToolPage toolId={t.toolId ?? 'json'} />
+                  </Suspense>
+                </ErrorBoundary>
+              </div>
+            ))}
 
           {/* 分屏已开但副屏为空：占位提示 + 取消分屏（纯视觉，drop 由 overlay 处理） */}
           {splitOn && paneBTabs.length === 0 && (

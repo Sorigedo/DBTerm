@@ -790,9 +790,20 @@ pub async fn dispatch_duck_query(
     pool: &DuckPool,
     registry: &DriverRegistry,
 ) -> Result<QueryResult, String> {
+    dispatch_duck_query_with_cancel(id, config, sql, pool, registry, None).await
+}
+
+pub async fn dispatch_duck_query_with_cancel(
+    id: &str,
+    config: &ConnConfig,
+    sql: &str,
+    pool: &DuckPool,
+    registry: &DriverRegistry,
+    cancel_token: Option<&str>,
+) -> Result<QueryResult, String> {
     let lib_path = get_duck_lib_path(registry).await?;
     let conn = get_or_open(id, config, pool, &lib_path).await?;
-    let token = crate::commands::query::extract_cancel_token(sql);
+    let token = cancel_token.map(str::to_string);
     let abort_rx = token.as_ref().map(|t| crate::commands::query::abort_register(t));
     let sql_owned = sql.to_string();
 

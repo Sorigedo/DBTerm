@@ -40,6 +40,13 @@ interface NewIndex {
   method: IndexMethod
 }
 
+interface DictIndex {
+  name: string
+  columns: string
+  unique: boolean
+  indexType: string
+}
+
 interface NewFK {
   _id: string
   name: string
@@ -225,6 +232,36 @@ function newFK(): NewFK {
 
 function newTrigger(): NewTrigger {
   return { _id: uid(), name: '', timing: 'AFTER', event: 'INSERT', body: 'BEGIN\n  -- 在此编写触发器逻辑\nEND' }
+}
+
+function normalizeIndexMethod(raw: string): IndexMethod {
+  const upper = raw.toUpperCase()
+  if (upper.includes('FULLTEXT')) return 'FULLTEXT'
+  if (upper.includes('SPATIAL')) return 'SPATIAL'
+  if (upper.includes('HASH')) return 'HASH'
+  return 'BTREE'
+}
+
+function sameIndexColumns(a: string, b: string): boolean {
+  const norm = (s: string) => s.split(',').map(x => x.trim()).filter(Boolean).join('\u0001').toLowerCase()
+  return norm(a) === norm(b)
+}
+
+function isPrimaryIndex(idx: DictIndex, pkColumns: string): boolean {
+  if (!pkColumns) return false
+  const name = idx.name.toLowerCase()
+  return (name === 'primary' || name.endsWith('_pkey') || name.startsWith('sqlite_autoindex_')) &&
+    idx.unique && sameIndexColumns(idx.columns, pkColumns)
+}
+
+function dictIndexToNewIndex(idx: DictIndex): NewIndex {
+  return {
+    _id: uid(),
+    name: idx.name,
+    columns: idx.columns,
+    unique: idx.unique,
+    method: normalizeIndexMethod(idx.indexType),
+  }
 }
 
 // ── SQL 生成 ─────────────────────────────────────────────────────────────────
@@ -517,6 +554,7 @@ export default function CreateTableWizard({ connectionId, connType, schema, edit
         const { invoke } = await import('@tauri-apps/api/core')
         type Rows = { rows: (string | null)[][] }
         const esc = (s: string) => s.replace(/'/g, "''")
+        let loadedColsSnapshot: NewCol[] = []
         if (isMy) {
           // MySQL 系：information_schema 文本列为二进制字符集，全部 CAST AS CHAR 强制为字符串；并带 EXTRA/COMMENT
           const colRes = await invoke<Rows>('execute_query', {
@@ -527,6 +565,7 @@ export default function CreateTableWizard({ connectionId, connType, schema, edit
           })
           if (cancelled) return
           const loaded = colRes.rows.map(rowToCol)
+          loadedColsSnapshot = loaded
           setCols(loaded)
           setOrigCols(loaded.map(c => ({ ...c })))
           // 表选项（ENGINE/CHARSET/COLLATION/ROW_FORMAT/AUTO_INCREMENT/COMMENT）
@@ -565,9 +604,19 @@ export default function CreateTableWizard({ connectionId, connType, schema, edit
               primaryKey: c.key === 'PRI', autoIncrement: false, defaultType, defaultValue,
             })
           })
+          loadedColsSnapshot = loaded
           setCols(loaded)
           setOrigCols(loaded.map(c => ({ ...c })))
         }
+        try {
+          const dict = await invoke<{ indexes: DictIndex[] }[]>('db_data_dictionary', {
+            id: connectionId, schema, tables: [editTable],
+          })
+          if (!cancelled && dict[0]) {
+            const pkCols = loadedColsSnapshot.filter(c => c.primaryKey && c.name.trim()).map(c => c.name.trim()).join(', ')
+            setIndexes(dict[0].indexes.filter(idx => !isPrimaryIndex(idx, pkCols)).map(dictIndexToNewIndex))
+          }
+        } catch { /* 索引加载失败时不阻塞字段编辑 */ }
         // 当前完整 DDL（无改动时预览展示）—— 后端 get_table_ddl 已按方言分派
         try {
           const ddl = await invoke<string>('get_table_ddl', { id: connectionId, schema, table: editTable })

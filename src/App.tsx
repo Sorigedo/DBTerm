@@ -72,7 +72,7 @@ export default function App() {
       // 终端：接管活会话 + 还原画面快照
       markAdopt(tab.id)
       if (snapshot) setAdoptSnapshot(tab.id, snapshot)
-    } else {
+    } else if (tab.type !== 'tool') {
       // DB 标签：把连接标成已连接，让目标窗口左侧亮绿点并展开库树
       st.markDbConnected(tab.connectionId)
       // 查询页：还原迁移前的 SQL 草稿，避免空白

@@ -131,6 +131,46 @@ function sqlLiteral(v: string | null): string {
   return sqlStr(v)
 }
 
+function parseSortNumber(v: string): number | null {
+  if (!/^-?(?:\d+\.?\d*|\d*\.\d+)(?:[eE][+-]?\d+)?$/.test(v)) return null
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
+
+function parseSortTime(v: string): number | null {
+  const s = v.trim()
+  const m = s.match(
+    /^(\d{4})[-/](\d{2})[-/](\d{2})(?:[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?)?(?:Z|[+-]\d{2}:?\d{2})?$/
+  )
+  if (!m) return null
+  const [, yy, mm, dd, hh = '0', mi = '0', ss = '0', ms = '0'] = m
+  const tz = /Z|[+-]\d{2}:?\d{2}$/.test(s)
+  if (tz) {
+    const t = Date.parse(s.replace(' ', 'T'))
+    return Number.isFinite(t) ? t : null
+  }
+  const t = Date.UTC(
+    Number(yy),
+    Number(mm) - 1,
+    Number(dd),
+    Number(hh),
+    Number(mi),
+    Number(ss),
+    Number(ms.padEnd(3, '0')),
+  )
+  return Number.isFinite(t) ? t : null
+}
+
+function compareCellValue(av: string, bv: string): number {
+  const an = parseSortNumber(av)
+  const bn = parseSortNumber(bv)
+  if (an !== null && bn !== null) return an - bn
+  const at = parseSortTime(av)
+  const bt = parseSortTime(bv)
+  if (at !== null && bt !== null) return at - bt
+  return av.localeCompare(bv, undefined, { numeric: true, sensitivity: 'base' })
+}
+
 // 当前焦点、事件或文本选区是否在编辑器 / 输入框。
 // CodeMirror 只读视图在 WebKit 中不保证 activeElement 始终是 .cm-content，
 // 因此也检查 .cm-editor 祖先和选区锚点，避免结果表抢占 DDL 的全选/复制。
@@ -736,8 +776,7 @@ export default function ResultTable({
       rows = [...rows].sort((a, b) => {
         const av = a[sortCol] ?? ''
         const bv = b[sortCol] ?? ''
-        const n1 = parseFloat(av), n2 = parseFloat(bv)
-        const cmp = !isNaN(n1) && !isNaN(n2) ? n1 - n2 : av.localeCompare(bv)
+        const cmp = compareCellValue(av, bv)
         return sortAsc ? cmp : -cmp
       })
     }
@@ -884,7 +923,8 @@ export default function ResultTable({
       topPad: start * GRID_ROW_HEIGHT,
       bottomPad: Math.max(0, (rowCount - end) * GRID_ROW_HEIGHT),
     }
-  }, [filteredRows, gridScrollTop, gridViewportH])
+	  }, [filteredRows, gridScrollTop, gridViewportH])
+  const gridTableWidth = 6 + colOrder.reduce((sum, ci) => sum + (colWidths.get(ci) ?? GRID_DEFAULT_COL_WIDTH), 0)
 
   // Mod+A：全选当前结果区所有单元格（仅激活标签响应；编辑器/输入框内不拦）
   useEffect(() => {
@@ -1291,7 +1331,7 @@ export default function ResultTable({
       </div>
       ) : (
       <div className="result-table-scroll" ref={tableScrollRef} onScroll={onGridScroll}>
-        <table className="result-table">
+	        <table className="result-table" style={{ width: gridTableWidth, minWidth: gridTableWidth }}>
           <colgroup>
             <col style={{ width: 6, minWidth: 6 }} />
             {colOrder.map((ci, orderIdx) => {

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { X, Plus, Minimize2, Terminal, Database, Table2, Columns3, FileCode2 } from 'lucide-react'
+import { X, Plus, Minimize2, Terminal, Database, Table2, Columns3, FileCode2, Wrench } from 'lucide-react'
 import { useAppStore } from '../../stores/appStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import SshToolsMenu from './SshToolsMenu'
@@ -20,6 +20,7 @@ function tabIcon(tab: WorkspaceTab) {
   if (tab.type === 'table-data')     return <Table2 {...p} />
   if (tab.type === 'schema-browser') return <Columns3 {...p} />
   if (tab.type === 'object-editor')  return <FileCode2 {...p} />
+  if (tab.type === 'tool')           return <Wrench {...p} />
   return <Database {...p} />
 }
 

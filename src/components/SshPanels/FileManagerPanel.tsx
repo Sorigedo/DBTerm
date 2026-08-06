@@ -4,8 +4,9 @@ import ConfirmDialog from '../shared/ConfirmDialog'
 import {
   Folder, File, RefreshCw, FolderPlus, ChevronRight,
   Loader2, X, Trash2, Edit3, Download, Upload, ArrowLeft, FolderOpen,
-  Copy, FolderInput, CheckCircle2, AlertCircle, Shield, FolderDown, FileEdit, Save,
+  Copy, FolderInput, CheckCircle2, AlertCircle, Shield, FolderDown, FileEdit, Save, Maximize2,
 } from 'lucide-react'
+import { openSftpFileManagerWindow } from '../../utils/multiWindow'
 
 interface Transfer {
   id: string
@@ -678,6 +679,13 @@ export default function FileManagerPanel({ sessionId, initialPath, onClose }: Pr
           </button>
           <button className="ssh-panel__btn" onClick={() => loadDir(path)} data-tip="刷新">
             <RefreshCw size={13} strokeWidth={2} />
+          </button>
+          <button
+            className="ssh-panel__btn"
+            onClick={() => openSftpFileManagerWindow(sessionId, path).then(onClose).catch((e) => setError(String(e)))}
+            data-tip="全功能窗口"
+          >
+            <Maximize2 size={13} strokeWidth={2} />
           </button>
           <button className="ssh-panel__btn" onClick={onClose} data-tip="关闭">
             <X size={13} strokeWidth={2} />

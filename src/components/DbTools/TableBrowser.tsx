@@ -33,6 +33,7 @@ interface Props {
 }
 
 type SortDir = 'asc' | 'desc'
+type RowDetailView = 'table' | 'json' | 'text'
 
 interface ColFilter {
   value: string
@@ -47,6 +48,8 @@ interface QueryResult {
 
 const PAGE_SIZES = [50, 100, 200, 500] as const
 type PageSize = typeof PAGE_SIZES[number]
+const TB_DEFAULT_COL_WIDTH = 160
+const TB_MIN_COL_WIDTH = 56
 
 // 标识符引号 / 表引用一律走共享方言层 sqlDialect（qid / tableRef），
 // 禁止在组件内再写一份 backtick 实现（历史上漏 sqlServer/sqlite/duckdb 导致拼 SQL 崩）。
@@ -60,6 +63,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
   }
 
   const [columns, setColumns]         = useState<string[]>([])
+  const [colWidths, setColWidths]     = useState<Map<string, number>>(new Map())
   const [rows, setRows]               = useState<(string | null)[][]>([])
   const [totalCount, setTotalCount]   = useState<number | null>(null)
   const [loading, setLoading]         = useState(false)
@@ -137,7 +141,9 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
   // 行右键菜单 / 行详情
   const [rowCtx, setRowCtx]           = useState<{ x: number; y: number; ri: number; ci: number } | null>(null)
   const [detailRow, setDetailRow]     = useState<number | null>(null)
-  const [detailView, setDetailView]   = useState<'table' | 'text'>('table')
+  const [detailView, setDetailView]   = useState<RowDetailView>('table')
+  const [cellDetail, setCellDetail]   = useState<{ ri: number; ci: number } | null>(null)
+  const cellDetailTimerRef = useRef<number | null>(null)
   const rowCtxRef = useRef<HTMLDivElement>(null)
 
   const tableRef = dialectTableRef(connType, schema, table)
@@ -494,6 +500,32 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
     }
   }
 
+  useEffect(() => {
+    setColWidths(new Map())
+  }, [columns.join('|')])
+
+  function startColResize(e: React.MouseEvent, col: string) {
+    e.preventDefault()
+    e.stopPropagation()
+    const th = (e.currentTarget as HTMLElement).closest('th') as HTMLElement | null
+    const startX = e.clientX
+    const startW = th?.getBoundingClientRect().width || colWidths.get(col) || TB_DEFAULT_COL_WIDTH
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+    const onMove = (me: MouseEvent) => {
+      const nextW = Math.max(TB_MIN_COL_WIDTH, startW + me.clientX - startX)
+      setColWidths(prev => new Map(prev).set(col, nextW))
+    }
+    const onUp = () => {
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
   function setFilterValue(col: string, value: string) {
     setFilters((prev) => ({ ...prev, [col]: { value } }))
   }
@@ -557,6 +589,10 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
     if (/^-?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(v)) return v
     return `'${v.replace(/'/g, "''")}'`
   }
+  function isTemporalColumn(col: string): boolean {
+    const type = (colMeta[col]?.type ?? '').toLowerCase()
+    return /\b(date|time|timestamp|year)\b|datetime2?|datetimeoffset|smalldatetime/.test(type)
+  }
   async function commitDrafts() {
     if (readOnly) return
     if (draftRows.length === 0) return
@@ -591,6 +627,8 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
   function startEdit(ri: number, ci: number) {
     if (readOnly) return
     if (columns.length === 0) { toast.warning('无法读取表结构，无法行内编辑'); return }
+    clearCellDetailTimer()
+    setCellDetail(null)
     setEditCell({ ri, ci })
     setEditVal(rows[ri][ci] ?? '')
   }
@@ -600,7 +638,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
     const { ri, ci } = editCell
     const col = columns[ci]
     const orig = rows[ri][ci]
-    const next = editVal === '' && orig === null ? null : editVal
+    const next = editVal === '' && isTemporalColumn(col) ? null : editVal
     // 值未变化直接退出
     if ((orig ?? '') === editVal) { setEditCell(null); return }
     cellBusyRef.current = true
@@ -932,6 +970,51 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
     setCellSel(s => s ? { a: s.a, f: { ri, ci } } : { a: { ri, ci }, f: { ri, ci } })
     setActiveCell({ ri, ci })
   }
+  function clearCellDetailTimer() {
+    if (cellDetailTimerRef.current !== null) {
+      window.clearTimeout(cellDetailTimerRef.current)
+      cellDetailTimerRef.current = null
+    }
+  }
+  function openCellDetailDelayed(ri: number, ci: number) {
+    clearCellDetailTimer()
+    cellDetailTimerRef.current = window.setTimeout(() => {
+      cellDetailTimerRef.current = null
+      if (editCell) return
+      setCellDetail({ ri, ci })
+    }, 180)
+  }
+  function openCellDetailIfTruncated(e: React.MouseEvent<HTMLTableCellElement>, ri: number, ci: number) {
+    if (editCell) return
+    const value = rows[ri]?.[ci]
+    if (value === null || value === undefined || value === '') return
+    const valueEl = e.currentTarget.querySelector<HTMLElement>('.tb-cell-content')
+    const target = valueEl ?? e.currentTarget
+    const truncated = target.scrollWidth > target.clientWidth + 1
+    if (truncated) openCellDetailDelayed(ri, ci)
+  }
+  function openRowContext(e: React.MouseEvent, ri: number, ci: number) {
+    e.preventDefault()
+    clearCellDetailTimer()
+    setActiveCell({ ri, ci })
+    setSelectedRows(prev => prev.has(ri) ? prev : new Set([ri]))
+    setRowCtx({ x: e.clientX, y: e.clientY, ri, ci })
+  }
+  function isSingleCellSelection(ri: number, ci: number): boolean {
+    return !cellSel || (
+      cellSel.a.ri === ri && cellSel.a.ci === ci &&
+      cellSel.f.ri === ri && cellSel.f.ci === ci
+    )
+  }
+  function rowObject(ri: number): Record<string, string | null> {
+    const row = rows[ri] ?? []
+    return Object.fromEntries(columns.map((c, i) => [c, row[i] ?? null]))
+  }
+  function rowText(ri: number): string {
+    const row = rows[ri] ?? []
+    return columns.map((c, i) => `${c}: ${row[i] ?? 'NULL'}`).join('\n')
+  }
+  useEffect(() => () => clearCellDetailTimer(), [])
   // Mod+A：全选当前页所有单元格（激活区域的表数据）
   const selectAllCells = useCallback(() => {
     if (rows.length === 0 || columns.length === 0) return
@@ -1001,6 +1084,8 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
 
   // 滚轮驱动横向滚动条：统一规则（见 utils/wheelScroll）
   useWheelScroll(tableWrapRef)
+  const tablePixelWidth = 12 + (draftRows.length > 0 ? 34 : 0) +
+    columns.reduce((sum, col) => sum + (colWidths.get(col) ?? TB_DEFAULT_COL_WIDTH), 0)
 
   const card = (
       <div
@@ -1222,7 +1307,15 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
             <div className="tb-error">{error}</div>
           )}
           {!error && (
-            <table className="tb-table">
+            <table className="tb-table" style={{ width: tablePixelWidth, minWidth: tablePixelWidth }}>
+              <colgroup>
+                <col style={{ width: 12, minWidth: 12 }} />
+                {draftRows.length > 0 && <col style={{ width: 34, minWidth: 34 }} />}
+                {columns.map(col => {
+                  const w = colWidths.get(col) ?? TB_DEFAULT_COL_WIDTH
+                  return <col key={col} style={{ width: w, minWidth: w }} />
+                })}
+              </colgroup>
               <thead>
                 <tr>
                   <th className="tb-th tb-th--rownum" />
@@ -1232,6 +1325,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
                     const isSorted  = sortCol === col
                     return (
                       <th key={col} className="tb-th"
+                        style={{ width: colWidths.get(col) ?? TB_DEFAULT_COL_WIDTH, minWidth: colWidths.get(col) ?? TB_DEFAULT_COL_WIDTH }}
                         data-tip={(() => {
                           const m = colMeta[col]
                           if (!m) return col
@@ -1294,6 +1388,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
                             )}
                           </div>
                         </div>
+                        <div className="tb-th-resizer" onMouseDown={(e) => startColResize(e, col)} />
                       </th>
                     )
                   })}
@@ -1324,27 +1419,24 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
                 {visibleRows.map(({ row, ri }) => (
                   <tr key={ri} data-ri={ri}
                     className={`tb-tr${selectedRows.has(ri) ? ' tb-tr--selected' : ''}${currentMatch === ri ? ' tb-tr--match' : ''}`}>
-                    <td className="tb-td tb-td--rownum tb-td--gutter"
-                      data-tip="点击/拖拽选择行"
-                      onClick={(e) => handleRowClick(e, ri)}
-                      onMouseDown={(e) => onRowMouseDown(e, ri)}
-                      onMouseEnter={() => onRowMouseEnter(ri)} />
+	                    <td className="tb-td tb-td--rownum tb-td--gutter"
+	                      data-tip="点击/拖拽选择行"
+	                      onClick={(e) => handleRowClick(e, ri)}
+	                      onMouseDown={(e) => onRowMouseDown(e, ri)}
+	                      onMouseEnter={() => onRowMouseEnter(ri)}
+	                      onContextMenu={(e) => openRowContext(e, ri, 0)} />
                     {draftRows.length > 0 && <td className="tb-td tb-td--ops" />}
                     {row.map((cell, ci) => {
                       const isEditing = editCell?.ri === ri && editCell?.ci === ci
                       return (
                         <td
                           key={ci}
-                          className={`tb-td ${cell === null ? 'tb-td--null' : ''}${isEditing ? ' tb-td--editing' : ''}${activeCell?.ri === ri && activeCell?.ci === ci ? ' tb-td--active' : ''}${cellInSel(ri, ci) ? ' tb-td--cellsel' : ''}`}
-                          onMouseDown={(e) => onCellMouseDown(e, ri, ci)}
-                          onMouseEnter={() => onCellMouseEnter(ri, ci)}
-                          onDoubleClick={() => startEdit(ri, ci)}
-                          onContextMenu={(e) => {
-                            e.preventDefault()
-                            setActiveCell({ ri, ci })
-                            setSelectedRows(prev => prev.has(ri) ? prev : new Set([ri]))
-                            setRowCtx({ x: e.clientX, y: e.clientY, ri, ci })
-                          }}
+	                          className={`tb-td ${cell === null ? 'tb-td--null' : ''}${isEditing ? ' tb-td--editing' : ''}${activeCell?.ri === ri && activeCell?.ci === ci ? ' tb-td--active' : ''}${cellInSel(ri, ci) ? ' tb-td--cellsel' : ''}`}
+	                          onMouseDown={(e) => onCellMouseDown(e, ri, ci)}
+	                          onMouseEnter={() => onCellMouseEnter(ri, ci)}
+	                          onClick={(e) => { if (!isEditing && isSingleCellSelection(ri, ci)) openCellDetailIfTruncated(e, ri, ci) }}
+	                          onDoubleClick={() => startEdit(ri, ci)}
+	                          onContextMenu={(e) => openRowContext(e, ri, ci)}
                         >
                           {isEditing ? (
                             <div className="tb-cell-edit">
@@ -1369,7 +1461,11 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
                                 <X size={14} />
                               </button>
                             </div>
-                          ) : (cell === null ? 'NULL' : hl(cell))}
+                          ) : (
+                            <span className="tb-cell-content">
+                              {cell === null ? 'NULL' : hl(cell)}
+                            </span>
+                          )}
                         </td>
                       )
                     })}
@@ -1538,58 +1634,89 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
         )}
 
         {/* 行详情 */}
-        {detailRow !== null && rows[detailRow] && (
-          <div className="tb-confirm-overlay">
+	        {detailRow !== null && rows[detailRow] && (
+	          <div className="tb-confirm-overlay">
             <div className="tb-confirm tb-detail" onClick={(e) => e.stopPropagation()}>
-              <div className="tb-detail__head">
-                <span className="tb-confirm__title" style={{ margin: 0 }}>行详情</span>
-                <div className="tb-detail__head-actions">
-                  <button className="tb-icon-btn"
-                    data-tip={detailView === 'table' ? '切换为文本' : '切换为表格'}
-                    onClick={() => setDetailView(v => v === 'table' ? 'text' : 'table')}>
-                    {detailView === 'table' ? <AlignLeft size={14} /> : <Table2 size={14} />}
-                  </button>
-                  <button className="tb-icon-btn" data-tip="复制整行"
-                    onClick={() => {
-                      const text = columns.map((c, i) => `${c}: ${rows[detailRow][i] ?? 'NULL'}`).join('\n')
-                      copyText(text)
-                      toast.success('已复制整行')
-                    }}>
+	              <div className="tb-detail__head">
+	                <span className="tb-confirm__title" style={{ margin: 0 }}>行详情</span>
+	                <div className="tb-detail__head-actions">
+	                  <div className="tb-detail__tabs">
+	                    <button className={detailView === 'table' ? 'active' : ''} onClick={() => setDetailView('table')}><Table2 size={13} />表格</button>
+	                    <button className={detailView === 'json' ? 'active' : ''} onClick={() => setDetailView('json')}><Code2 size={13} />JSON</button>
+	                    <button className={detailView === 'text' ? 'active' : ''} onClick={() => setDetailView('text')}><AlignLeft size={13} />文本</button>
+	                  </div>
+	                  <button className="tb-icon-btn" data-tip="复制整行"
+	                    onClick={() => {
+	                      copyText(JSON.stringify(rowObject(detailRow), null, 2))
+	                      toast.success('已复制整行')
+	                    }}>
                     <Copy size={14} />
                   </button>
                 </div>
               </div>
-              {detailView === 'table' ? (
-                <div className="tb-detail__body">
-                  {columns.map((col, ci) => (
-                    <div key={col} className="tb-detail__row"
-                      data-tip="点击复制该值"
-                      onClick={() => {
-                        const v = rows[detailRow][ci]
-                        copyText(v ?? 'NULL')
-                        toast.success(`已复制 ${col} 的值`)
-                      }}>
-                      <span className="tb-detail__col">
-                        {colMeta[col]?.key === 'PRI' && '🔑 '}{col}
-                        <em>{colMeta[col]?.type}</em>
-                      </span>
-                      <span className={`tb-detail__val${rows[detailRow][ci] === null ? ' null' : ''}`}>
-                        {rows[detailRow][ci] ?? 'NULL'}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <textarea className="tb-detail__text" readOnly spellCheck={false}
-                  value={columns.map((c, i) => `${c}: ${rows[detailRow][i] ?? 'NULL'}`).join('\n')}
-                  onFocus={(e) => e.currentTarget.select()} />
-              )}
+              <div className="tb-detail__content">
+                {detailView === 'table' ? (
+                  <div className="tb-detail__body">
+                    {columns.map((col, ci) => (
+                      <div key={col} className="tb-detail__row"
+                        data-tip="点击复制该值"
+                        onClick={() => {
+                          const v = rows[detailRow][ci]
+                          copyText(v ?? 'NULL')
+                          toast.success(`已复制 ${col} 的值`)
+                        }}>
+                        <span className="tb-detail__col">
+                          {colMeta[col]?.key === 'PRI' && '🔑 '}{col}
+                          <em>{colMeta[col]?.type}</em>
+                        </span>
+                        <span className={`tb-detail__val${rows[detailRow][ci] === null ? ' null' : ''}`}>
+                          {rows[detailRow][ci] ?? 'NULL'}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+	                ) : detailView === 'json' ? (
+	                  <textarea className="tb-detail__text" readOnly spellCheck={false}
+	                    value={JSON.stringify(rowObject(detailRow), null, 2)}
+	                    onFocus={(e) => e.currentTarget.select()} />
+	                ) : (
+	                  <textarea className="tb-detail__text" readOnly spellCheck={false}
+	                    value={rowText(detailRow)}
+	                    onFocus={(e) => e.currentTarget.select()} />
+	                )}
+              </div>
               <div className="tb-confirm__actions">
                 <button className="tb-text-btn" onClick={() => setDetailRow(null)}>关闭</button>
               </div>
             </div>
-          </div>
-        )}
+	          </div>
+	        )}
+
+	        {/* 单元格完整值 */}
+	        {cellDetail && rows[cellDetail.ri] && columns[cellDetail.ci] && (
+	          <div className="tb-confirm-overlay" onMouseDown={() => setCellDetail(null)}>
+	            <div className="tb-confirm tb-cell-detail" onMouseDown={(e) => e.stopPropagation()}>
+	              <div className="tb-detail__head">
+	                <span className="tb-confirm__title" style={{ margin: 0 }}>{columns[cellDetail.ci]}</span>
+	                <div className="tb-detail__head-actions">
+	                  <button className="tb-icon-btn" data-tip="复制完整值"
+	                    onClick={() => {
+	                      copyText(rows[cellDetail.ri][cellDetail.ci] ?? 'NULL')
+	                      toast.success('已复制单元格完整值')
+	                    }}>
+	                    <Copy size={14} />
+	                  </button>
+	                  <button className="tb-icon-btn" data-tip="关闭" onClick={() => setCellDetail(null)}><X size={14} /></button>
+	                </div>
+	              </div>
+	              <div className="tb-cell-detail__content">
+	                <textarea className="tb-cell-detail__text" readOnly spellCheck={false}
+	                  value={rows[cellDetail.ri][cellDetail.ci] ?? 'NULL'}
+	                  onFocus={(e) => e.currentTarget.select()} />
+	              </div>
+	            </div>
+	          </div>
+	        )}
 
         {/* 清空表强确认（需输入表名） */}
         {truncOpen && (
@@ -1664,10 +1791,10 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
           {sc('tableSetNull') && <span className="ctx-item__shortcut">{sc('tableSetNull')}</span>}
         </button>
       )}
-      <button onClick={() => { setDetailRow(rowCtx.ri); setRowCtx(null) }}>
-        <span className="btn-label"><Search size={12} />查看行详情</span>
-        {sc('tableRowDetail') && <span className="ctx-item__shortcut">{sc('tableRowDetail')}</span>}
-      </button>
+	      <button onClick={() => { setDetailRow(rowCtx.ri); setRowCtx(null) }}>
+	        <span className="btn-label"><Search size={12} />查看整行数据</span>
+	        {sc('tableRowDetail') && <span className="ctx-item__shortcut">{sc('tableRowDetail')}</span>}
+	      </button>
       {!readOnly && (
         <>
           <div className="tb-row-ctx__sep" />
@@ -1786,7 +1913,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
           padding: 16px; color: var(--error); font-size: 12px;
         }
         .tb-table {
-          width: 100%; border-collapse: collapse;
+          border-collapse: collapse; table-layout: fixed;
           font-size: 12px;
         }
         .tb-th {
@@ -1798,6 +1925,12 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
           text-align: left;
         }
         .tb-th { border-right: 1px solid var(--border-subtle); }
+        .tb-th-resizer {
+          position: absolute; right: -3px; top: 0; bottom: 0; width: 8px;
+          cursor: col-resize; z-index: 8; background: transparent;
+          transition: background 0.15s; touch-action: none;
+        }
+        .tb-th-resizer:hover { background: var(--accent); opacity: 0.5; }
         /* 行首窄边：用于整行选择（点击/拖拽），不显示行号 */
         .tb-th--rownum, .tb-td--rownum { width: 12px; min-width: 12px; max-width: 12px; padding: 0; }
         .tb-td--gutter { cursor: pointer; background: var(--surface-2); }
@@ -1859,7 +1992,11 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
           padding: 5px 8px; border-bottom: 1px solid var(--border-subtle);
           border-right: 1px solid var(--border-subtle);
           color: var(--text); font-size: 12px;
-          max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+          overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .tb-cell-content {
+          display: block; width: 100%; min-width: 0;
+          overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
         }
         .tb-th--ops, .tb-td--ops { width: 34px; min-width: 34px; text-align: center; }
         .tb-td--ops { padding: 2px; }
@@ -1999,21 +2136,44 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
         .tb-row-ctx button.danger:hover:not(:disabled) { background: rgba(220,38,38,0.1); }
         .tb-row-ctx__sep { height: 1px; background: var(--border-subtle); margin: 3px 6px; }
         /* 行详情 */
-        .tb-detail { width: 460px; max-height: 70%; }
+        .tb-detail {
+          width: min(1120px, calc(100% - 56px));
+          height: min(760px, calc(100% - 56px));
+          min-width: min(620px, calc(100% - 56px));
+          min-height: min(420px, calc(100% - 56px));
+          max-width: calc(100% - 56px); max-height: calc(100% - 56px);
+          resize: both; overflow: hidden;
+        }
         .tb-detail__head {
           display: flex; align-items: center; justify-content: space-between;
           margin-bottom: 10px;
+          flex-shrink: 0;
         }
-        .tb-detail__head-actions { display: flex; gap: 4px; }
-        .tb-detail__text {
-          width: 100%; min-height: 200px; max-height: 50vh; resize: vertical;
+	        .tb-detail__head-actions { display: flex; align-items: center; gap: 4px; }
+	        .tb-detail__tabs {
+	          display: inline-flex; align-items: center; gap: 2px;
+	          padding: 2px; border: 1px solid var(--border-subtle);
+	          border-radius: 8px; background: var(--surface-2);
+	        }
+	        .tb-detail__tabs button {
+	          display: inline-flex; align-items: center; gap: 4px;
+	          height: 24px; padding: 0 8px; border-radius: 6px;
+	          color: var(--text-muted); font-size: 11px;
+	        }
+	        .tb-detail__tabs button:hover { color: var(--text); background: var(--surface-hover); }
+	        .tb-detail__tabs button.active { color: #fff; background: var(--accent); }
+	        .tb-detail__text {
+	          width: 100%; height: 100%; resize: none;
           box-sizing: border-box; padding: 10px 12px; border-radius: 8px;
           border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
           font-family: var(--font-mono); font-size: 12px; line-height: 1.7;
           outline: none;
         }
         .tb-detail__text:focus { border-color: var(--accent); }
-        .tb-detail__body { overflow-y: auto; display: flex; flex-direction: column; }
+        .tb-detail__content {
+          flex: 1; min-height: 0; display: flex; flex-direction: column;
+        }
+        .tb-detail__body { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
         .tb-detail__row {
           display: flex; gap: 12px; padding: 7px 4px;
           border-bottom: 1px solid var(--border-subtle); cursor: pointer; border-radius: 4px;
@@ -2027,12 +2187,31 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
           font-style: normal; font-size: 10.5px; color: var(--text-muted);
           font-family: var(--font-mono);
         }
-        .tb-detail__val {
-          flex: 1; font-size: 12px; color: var(--text); word-break: break-all;
-          font-family: var(--font-mono);
-        }
-        .tb-detail__val.null { color: var(--text-muted); font-style: italic; }
-        /* 表信息 */
+	        .tb-detail__val {
+	          flex: 1; font-size: 12px; color: var(--text); word-break: break-all;
+	          font-family: var(--font-mono);
+	        }
+	        .tb-detail__val.null { color: var(--text-muted); font-style: italic; }
+	        .tb-cell-detail {
+	          width: min(980px, calc(100% - 56px));
+	          height: min(620px, calc(100% - 56px));
+	          min-width: min(520px, calc(100% - 56px));
+	          min-height: min(320px, calc(100% - 56px));
+	          max-width: calc(100% - 56px); max-height: calc(100% - 56px);
+	          resize: both; overflow: hidden;
+	        }
+	        .tb-cell-detail__content {
+	          flex: 1; min-height: 0; display: flex; flex-direction: column;
+	        }
+	        .tb-cell-detail__text {
+	          width: 100%; height: 100%; resize: none;
+	          box-sizing: border-box; padding: 12px; border-radius: 8px;
+	          border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
+	          font-family: var(--font-mono); font-size: 12px; line-height: 1.7;
+	          word-break: break-all; outline: none;
+	        }
+	        .tb-cell-detail__text:focus { border-color: var(--accent); }
+	        /* 表信息 */
         .tb-info { width: 640px; max-height: 76%; }
         .tb-info__body { overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
         .tb-info__props { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px 16px; }

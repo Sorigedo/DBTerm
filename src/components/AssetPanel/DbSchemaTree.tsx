@@ -391,9 +391,15 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
   }
 
   // 打开查询页并填入 SQL 模板（不执行，由用户确认后运行）——新建标签，避免覆盖已有查询
-  function openSchemaFill(sql: string) {
+  function openSchemaFill(sql: string, schemaName?: string) {
     const tabId = openQueryTab(connectionId)
+    if (schemaName) setPendingSchema(tabId, schemaName)
     setPendingFill(tabId, sql)
+  }
+
+  function queryPageObjectRef(name: string, ssSchema?: string) {
+    if (connType === 'sqlServer' && ssSchema) return `${qid(connType, ssSchema)}.${qid(connType, name)}`
+    return qid(connType, name)
   }
 
   // 打开一条保存的查询：新建查询页，回填 SQL 与所在 schema（不自动执行）
@@ -1475,11 +1481,13 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
             <span className="ctx-item__shortcut">{ctxMenu.isView ? `${modLabel()}-双击` : '双击'}</span>
           </button>
           <button onMouseEnter={() => setSubOpen(null)} onClick={() => {
+            const ref = queryPageObjectRef(ctxMenu.table, ctxMenu.ssSchema)
             openSchemaFill(connType === 'oracle'
-              ? `SELECT * FROM ${tableRef(connType, ctxMenu.schema, ctxMenu.table, ctxMenu.ssSchema)} FETCH FIRST 100 ROWS ONLY;`
+              ? `SELECT * FROM ${ref} FETCH FIRST 100 ROWS ONLY;`
               : connType === 'sqlServer'
-                ? `SELECT TOP 100 * FROM ${tableRef(connType, ctxMenu.schema, ctxMenu.table, ctxMenu.ssSchema)};`
-                : `SELECT * FROM ${tableRef(connType, ctxMenu.schema, ctxMenu.table, ctxMenu.ssSchema)} LIMIT 100;`)
+                ? `SELECT TOP 100 * FROM ${ref};`
+                : `SELECT * FROM ${ref} LIMIT 100;`,
+              ctxMenu.schema)
             closeMenu()
           }}>
             <Terminal size={12} strokeWidth={1.8} />查询此{ctxMenu.isView ? '视图' : '表'}
@@ -1616,7 +1624,7 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
             <span className="ctx-item__shortcut">双击</span>
           </button>
           {supportsShowStatements(connType) && (
-            <button onClick={() => { openSchemaFill(`SHOW CREATE ${routineCtx.kind === 'function' ? 'FUNCTION' : 'PROCEDURE'} ${tableRef(connType, routineCtx.schema, routineCtx.name)};`); setRoutineCtx(null) }}>
+            <button onClick={() => { openSchemaFill(`SHOW CREATE ${routineCtx.kind === 'function' ? 'FUNCTION' : 'PROCEDURE'} ${qid(connType, routineCtx.name)};`, routineCtx.schema); setRoutineCtx(null) }}>
               <Terminal size={12} strokeWidth={1.8} />在查询页查看定义
             </button>
           )}

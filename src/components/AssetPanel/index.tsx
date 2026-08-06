@@ -37,6 +37,7 @@ const TITLES: Record<ActiveView, string> = {
   all: '全部连接',
   ssh: 'SSH 会话',
   db:  '数据库',
+  tools: '工具',
 }
 
 function LazyAssetModalFallback() {

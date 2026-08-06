@@ -34,7 +34,7 @@ import CreateTableWizard from '../DbTools/CreateTableWizard'
 import ViewWizard from '../DbTools/ViewWizard'
 import RoutineWizard from '../DbTools/RoutineWizard'
 import { openEditObject, prettyViewDdl, prettyRoutineDdl } from '../../utils/objectEditor'
-import { tableRef, supportsShowStatements, supportsMyMaintenance, supportsOptimizeTable, checkTableSql, previewSelect, buildIndexSql, MIGRATABLE_DB_TYPES } from '../../utils/sqlDialect'
+import { qid, tableRef, supportsShowStatements, supportsMyMaintenance, supportsOptimizeTable, checkTableSql, previewSelect, buildIndexSql, MIGRATABLE_DB_TYPES } from '../../utils/sqlDialect'
 import { toolsFor } from '../DbTools/dbToolsCatalog'
 import { useDbToolsStore } from '../../stores/dbToolsStore'
 import { clampIntoViewport } from '../../utils/menuClamp'
@@ -401,10 +401,12 @@ export default function SchemaBrowser({ connectionId, connType, schema, category
     const conn = connections.find(c => c.id === connectionId)
     if (!conn) return
     const tabId = openQueryTabAction(connectionId)
+    if (schema) setPendingSchema(tabId, schema)
     setPendingFill(tabId, sql)
   }
   // 标识符引号 / 表引用：走共享方言层（按 connType 选 backtick/双引号/方括号），禁止本地写死反引号
   const tref = (name: string) => tableRef(connType, schema, name)
+  const localRef = (name: string) => qid(connType, name)
 
   function openTableData(name: string) {
     // 打开表数据：独立的数据网格标签页（每张表一个 tab）
@@ -1320,11 +1322,11 @@ export default function SchemaBrowser({ connectionId, connType, schema, category
               <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}><Pencil size={12} strokeWidth={1.8} />编辑{rlabel}</span>
               <span className="ctx-item__shortcut">双击</span>
             </button>
-            <button onClick={() => { fillQuery(category === 'functions' ? `SELECT ${tref(name)}();` : `CALL ${tref(name)}();`); closeMenu() }}>
+            <button onClick={() => { fillQuery(category === 'functions' ? `SELECT ${localRef(name)}();` : `CALL ${localRef(name)}();`); closeMenu() }}>
               <Terminal size={12} strokeWidth={1.8} />在查询页{category === 'functions' ? '调用函数' : '调用'}
             </button>
             {supportsShowStatements(connType) && (
-              <button onClick={() => { fillQuery(`SHOW CREATE ${rkind} ${tref(name)};`); closeMenu() }}>
+              <button onClick={() => { fillQuery(`SHOW CREATE ${rkind} ${localRef(name)};`); closeMenu() }}>
                 <Terminal size={12} strokeWidth={1.8} />在查询页查看定义
               </button>
             )}
@@ -1356,7 +1358,7 @@ export default function SchemaBrowser({ connectionId, connType, schema, category
             <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}><Table2 size={12} strokeWidth={1.8} />打开{isView ? '视图' : '表'}数据</span>
             <span className="ctx-item__shortcut">{isView ? `${modLabel()}-双击` : '双击'}</span>
           </button>
-          <button onMouseEnter={() => setSbSub(null)} onClick={() => { fillQuery(`${previewSelect(connType, tref(name), 100)};`); closeMenu() }}>
+          <button onMouseEnter={() => setSbSub(null)} onClick={() => { fillQuery(`${previewSelect(connType, localRef(name), 100)};`); closeMenu() }}>
             <Terminal size={12} strokeWidth={1.8} />查询此{isView ? '视图' : '表'}
           </button>
           <button onMouseEnter={() => setSbSub(null)} onClick={() => { setInfoTarget(name); closeMenu() }}>

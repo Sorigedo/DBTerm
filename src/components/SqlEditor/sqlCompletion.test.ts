@@ -81,7 +81,25 @@ test('sql server parsing accepts bracket identifiers', () => {
   const ssSql = 'select [o].[order id] as [order id] from [dbo].[orders] as [o]'
   assert.deepEqual(extractSelectOutputColumns(ssSql, 'sqlServer'), ['order id'])
   assert.deepEqual(buildSqlCompletionScope(ssSql, 'sqlServer').aliases, {
-    orders: 'orders',
-    o: 'orders',
+    orders: 'dbo.orders',
+    o: 'dbo.orders',
   })
+})
+
+test('member completion keeps schema qualified table aliases', () => {
+  const sql = 'select * from mysql.proc b where b.bo'
+  const dbSchema = {
+    'mysql.proc': ['db', 'name', 'body', 'body_utf8'],
+  }
+
+  assert.deepEqual(buildSqlCompletionScope(sql, 'mysql').aliases, {
+    proc: 'mysql.proc',
+    b: 'mysql.proc',
+  })
+  assert.deepEqual(memberColumnsForAlias(sql, dbSchema, 'b', 'mysql'), [
+    'db',
+    'name',
+    'body',
+    'body_utf8',
+  ])
 })

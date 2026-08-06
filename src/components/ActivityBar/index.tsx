@@ -1,5 +1,5 @@
-import { lazy, Suspense } from 'react'
-import { LayoutGrid, Terminal, Database, Settings, PanelLeftClose, PanelLeftOpen, AppWindow } from 'lucide-react'
+import { lazy, Suspense, useState } from 'react'
+import { LayoutGrid, Terminal, Database, Settings, PanelLeftClose, PanelLeftOpen, AppWindow, Wrench } from 'lucide-react'
 import { useAppStore } from '../../stores/appStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { openNewAppWindow } from '../../utils/multiWindow'
@@ -8,11 +8,13 @@ import { displayShortcutStr, DEFAULT_SHORTCUTS } from '../../utils/shortcuts'
 import type { ActiveView } from '../../types'
 
 const SettingsModal = lazy(() => import('../Settings'))
+const ToolsLauncher = lazy(() => import('../Tools/ToolsLauncher'))
 
 const NAV: { view: ActiveView; Icon: React.ElementType; label: string }[] = [
   { view: 'all', Icon: LayoutGrid, label: '全部连接' },
   { view: 'ssh', Icon: Terminal,   label: 'SSH 会话' },
   { view: 'db',  Icon: Database,   label: '数据库' },
+  { view: 'tools', Icon: Wrench,    label: '工具' },
 ]
 
 interface Props {
@@ -21,7 +23,9 @@ interface Props {
 }
 
 export default function ActivityBar({ panelOpen, onTogglePanel }: Props) {
-  const { activeView, setActiveView, settingsOpen, openSettings, closeSettings } = useAppStore()
+  const { activeView, setActiveView, settingsOpen, openSettings, closeSettings, tabs, activeTabId } = useAppStore()
+  const [toolsOpen, setToolsOpen] = useState(false)
+  const activeTab = tabs.find(t => t.id === activeTabId)
   const shortcuts = useSettingsStore(s => s.shortcuts)
   const scOf = (id: string) => displayShortcutStr(shortcuts[id] ?? DEFAULT_SHORTCUTS[id] ?? '')
 
@@ -42,16 +46,22 @@ export default function ActivityBar({ panelOpen, onTogglePanel }: Props) {
 
           <div className="activity-bar__divider" />
 
-          {NAV.map(({ view, Icon, label }) => (
-            <button
-              key={view}
-              className={`activity-btn${activeView === view ? ' active' : ''}`}
-              onClick={() => setActiveView(view)}
-            >
-              <Icon size={18} strokeWidth={1.5} />
-              <span className="tooltip">{label}</span>
-            </button>
-          ))}
+          {NAV.map(({ view, Icon, label }) => {
+            const isTools = view === 'tools'
+            return (
+              <button
+                key={view}
+                className={`activity-btn${activeView === view || (isTools && (toolsOpen || activeTab?.type === 'tool')) ? ' active' : ''}`}
+                onClick={() => {
+                  if (isTools) setToolsOpen(true)
+                  else setActiveView(view)
+                }}
+              >
+                <Icon size={18} strokeWidth={1.5} />
+                <span className="tooltip">{label}</span>
+              </button>
+            )
+          })}
         </div>
         <div className="activity-bar__bottom">
           <button
@@ -71,6 +81,11 @@ export default function ActivityBar({ panelOpen, onTogglePanel }: Props) {
       {settingsOpen && (
         <Suspense fallback={null}>
           <SettingsModal onClose={closeSettings} />
+        </Suspense>
+      )}
+      {toolsOpen && (
+        <Suspense fallback={null}>
+          <ToolsLauncher onClose={() => setToolsOpen(false)} />
         </Suspense>
       )}
     </>

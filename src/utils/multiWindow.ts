@@ -35,10 +35,43 @@ async function createWindow(url: string): Promise<void> {
   })
 }
 
+async function createSizedWindow(url: string, title: string, width: number, height: number, minWidth: number, minHeight: number): Promise<void> {
+  const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow')
+  const label = `win-${WIN_TAG}-${winSeq++}`
+  const w = new WebviewWindow(label, {
+    url,
+    title,
+    width,
+    height,
+    minWidth,
+    minHeight,
+    resizable: true,
+    transparent: true,
+    titleBarStyle: 'overlay',
+    hiddenTitle: true,
+  })
+  await new Promise<void>((resolve, reject) => {
+    let settled = false
+    const ok = () => { if (!settled) { settled = true; resolve() } }
+    const fail = (e: unknown) => { if (!settled) { settled = true; reject(new Error(String((e as { payload?: unknown })?.payload ?? e))) } }
+    w.once('tauri://created', ok).catch(() => {})
+    w.once('tauri://error', fail).catch(() => {})
+    setTimeout(ok, 800)
+  })
+}
+
 /** 新建一个空白 DBTerm 窗口（加载同一份前端）。 */
 export async function openNewAppWindow(): Promise<void> {
   if (!isTauri) return
   await createWindow('index.html')
+}
+
+/** 打开全功能 SFTP 文件管理窗口（左本地、右远程）。 */
+export async function openSftpFileManagerWindow(connId: string, remotePath?: string): Promise<void> {
+  if (!isTauri) return
+  const params = new URLSearchParams({ fileManager: '1', connId })
+  if (remotePath) params.set('remotePath', remotePath)
+  await createSizedWindow(`index.html?${params.toString()}`, '文件管理', 1280, 760, 920, 560)
 }
 
 // ── 标签撕离：把一个标签连同其活会话迁移到新窗口 ─────────────────────

@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { createPortal } from 'react-dom'
-import { X, Terminal, Database, Power, RefreshCw, ChevronDown, Table2, Columns3, Plus, FileCode2, SquareSplitHorizontal, SquareSplitVertical } from 'lucide-react'
+import { X, Terminal, Database, Power, RefreshCw, ChevronDown, Table2, Columns3, Plus, FileCode2, SquareSplitHorizontal, SquareSplitVertical, Wrench } from 'lucide-react'
 import { useAppStore } from '../../stores/appStore'
 import { resolveDropTarget } from './splitDrop'
 import SshToolsMenu from './SshToolsMenu'
@@ -186,6 +186,7 @@ export default function TabBar() {
     if (tab.type === 'table-data')     return <Table2 size={12} strokeWidth={1.5} style={{ flexShrink: 0 }} />
     if (tab.type === 'schema-browser') return <Columns3 size={12} strokeWidth={1.5} style={{ flexShrink: 0 }} />
     if (tab.type === 'object-editor')  return <FileCode2 size={12} strokeWidth={1.5} style={{ flexShrink: 0 }} />
+    if (tab.type === 'tool')           return <Wrench size={12} strokeWidth={1.5} style={{ flexShrink: 0 }} />
     return <Database size={12} strokeWidth={1.5} style={{ flexShrink: 0 }} />
   }
 

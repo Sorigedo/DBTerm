@@ -7,6 +7,106 @@ use crate::{
     storage::StorageState,
 };
 
+fn local_file_entry(path: std::path::PathBuf, meta: std::fs::Metadata) -> FileEntry {
+    let name = path.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    let modified = meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, 0))
+        .map(|dt| dt.with_timezone(&chrono::Local))
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default();
+    FileEntry {
+        name,
+        path: path.to_string_lossy().into_owned(),
+        is_dir: meta.is_dir(),
+        size: if meta.is_file() { meta.len() } else { 0 },
+        modified,
+        permissions: if meta.is_dir() { "drwxr-xr-x" } else { "-rw-r--r--" }.to_string(),
+    }
+}
+
+/// 列出本地目录（SSH 文件管理全功能窗口左侧使用）
+#[tauri::command]
+pub async fn list_local_files(path: String) -> Result<Vec<FileEntry>, String> {
+    let p = std::path::PathBuf::from(if path.trim().is_empty() { "." } else { path.trim() });
+    if !p.is_absolute() {
+        return Err("本地路径必须是绝对路径".to_string());
+    }
+    let meta = tokio::fs::metadata(&p).await
+        .map_err(|e| format!("读取本地路径失败: {e}"))?;
+    if !meta.is_dir() {
+        return Err("本地路径不是文件夹".to_string());
+    }
+    let mut rd = tokio::fs::read_dir(&p).await
+        .map_err(|e| format!("读取本地目录失败: {e}"))?;
+    let mut entries = Vec::new();
+    while let Some(ent) = rd.next_entry().await.map_err(|e| format!("读取本地目录失败: {e}"))? {
+        let path = ent.path();
+        let meta = match ent.metadata().await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        entries.push(local_file_entry(path, meta));
+    }
+    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    Ok(entries)
+}
+
+/// 本地文件管理起始目录
+#[tauri::command]
+pub fn get_local_start_path(app: tauri::AppHandle) -> Result<String, String> {
+    app.path().download_dir()
+        .or_else(|_| app.path().home_dir())
+        .map(|p| p.to_string_lossy().into_owned())
+        .map_err(|e| format!("无法获取本地目录: {e}"))
+}
+
+fn require_absolute_local_path(path: &str) -> Result<std::path::PathBuf, String> {
+    let p = std::path::PathBuf::from(path.trim());
+    if !p.is_absolute() {
+        return Err("本地路径必须是绝对路径".to_string());
+    }
+    Ok(p)
+}
+
+/// 删除本地文件或目录（全功能文件管理窗口左侧使用）
+#[tauri::command]
+pub async fn delete_local_file(path: String) -> Result<(), String> {
+    let p = require_absolute_local_path(&path)?;
+    let meta = tokio::fs::metadata(&p).await
+        .map_err(|e| format!("读取本地路径失败: {e}"))?;
+    if meta.is_dir() {
+        tokio::fs::remove_dir_all(&p).await
+            .map_err(|e| format!("删除本地文件夹失败: {e}"))?;
+    } else {
+        tokio::fs::remove_file(&p).await
+            .map_err(|e| format!("删除本地文件失败: {e}"))?;
+    }
+    Ok(())
+}
+
+/// 重命名/移动本地文件或目录
+#[tauri::command]
+pub async fn rename_local_file(from: String, to: String) -> Result<(), String> {
+    let from_path = require_absolute_local_path(&from)?;
+    let to_path = require_absolute_local_path(&to)?;
+    tokio::fs::rename(&from_path, &to_path).await
+        .map_err(|e| format!("重命名本地文件失败: {e}"))?;
+    Ok(())
+}
+
+/// 创建本地目录
+#[tauri::command]
+pub async fn create_local_dir(path: String) -> Result<(), String> {
+    let p = require_absolute_local_path(&path)?;
+    tokio::fs::create_dir_all(&p).await
+        .map_err(|e| format!("创建本地文件夹失败: {e}"))?;
+    Ok(())
+}
+
 /// 建立 SSH 连接
 /// session_id: 每个 Tab 的唯一 ID（用作状态 key，事件 payload 中的 id）
 /// conn_id:    连接配置 ID（用于查找主机/用户名/密码等）
@@ -616,6 +716,32 @@ pub async fn download_file(
     Ok(local_path.to_string_lossy().into_owned())
 }
 
+/// 下载远程文件到指定本地目录，返回本地路径
+#[tauri::command]
+pub async fn download_file_to(
+    id: String,
+    remote_path: String,
+    local_dir: String,
+    transfer_id: String,
+    app: tauri::AppHandle,
+    storage: State<'_, StorageState>,
+) -> Result<String, String> {
+    let (config, password) = load_conn(&id, &storage).await?;
+    if !sftp_enabled(&config) {
+        return Err("该连接未启用 SFTP，无法下载到指定目录".to_string());
+    }
+    let local = std::path::PathBuf::from(&local_dir);
+    if !local.is_absolute() {
+        return Err("本地目录必须是绝对路径".to_string());
+    }
+    let meta = tokio::fs::metadata(&local).await
+        .map_err(|e| format!("读取本地目录失败: {e}"))?;
+    if !meta.is_dir() {
+        return Err("目标本地路径不是文件夹".to_string());
+    }
+    crate::ssh::sftp::download(&config, password.as_deref(), &remote_path, &local, &transfer_id, &app).await
+}
+
 /// 修改远程文件权限
 #[tauri::command]
 pub async fn chmod_file(
@@ -707,6 +833,32 @@ pub async fn download_dir(
     let download_dir = app.path().download_dir()
         .map_err(|e| format!("无法获取下载目录: {e}"))?;
     crate::ssh::sftp::download_dir(&config, password.as_deref(), &remote_path, &download_dir, &transfer_id, &app).await
+}
+
+/// 递归下载远程目录到指定本地目录，返回本地路径
+#[tauri::command]
+pub async fn download_dir_to(
+    id: String,
+    remote_path: String,
+    local_dir: String,
+    transfer_id: String,
+    app: tauri::AppHandle,
+    storage: State<'_, StorageState>,
+) -> Result<String, String> {
+    let (config, password) = load_conn(&id, &storage).await?;
+    if !sftp_enabled(&config) {
+        return Err("该连接未启用 SFTP，无法下载目录".to_string());
+    }
+    let local = std::path::PathBuf::from(&local_dir);
+    if !local.is_absolute() {
+        return Err("本地目录必须是绝对路径".to_string());
+    }
+    let meta = tokio::fs::metadata(&local).await
+        .map_err(|e| format!("读取本地目录失败: {e}"))?;
+    if !meta.is_dir() {
+        return Err("目标本地路径不是文件夹".to_string());
+    }
+    crate::ssh::sftp::download_dir(&config, password.as_deref(), &remote_path, &local, &transfer_id, &app).await
 }
 
 /// 递归上传本地目录到远程路径下

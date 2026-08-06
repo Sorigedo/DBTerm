@@ -4,7 +4,7 @@ import { THEMES, buildThemeVars, type ThemeKey } from '../themes'
 import { DEFAULT_SHORTCUTS } from '../utils/shortcuts'
 
 // system 模式下随 OS 切换时使用的默认深/浅主题
-export const DEFAULT_DARK_THEME:  ThemeKey = 'tokyoNight'
+export const DEFAULT_DARK_THEME:  ThemeKey = 'jetbrainsGraphite'
 export const DEFAULT_LIGHT_THEME: ThemeKey = 'githubLight'
 
 export type AppColorScheme  = 'dark' | 'light' | 'system'
@@ -351,7 +351,7 @@ export const useSettingsStore = create<SettingsState>()(
       },
       // 快捷键重排：尽量 Mod+单键、同功能统一。每次键位调整都 bump 版本，
       // 将旧持久化的快捷键全量重置为最新默认键位（否则旧 localStorage 不会更新）。
-      version: 10,
+      version: 11,
       migrate: (persisted, version) => {
         const s = (persisted ?? {}) as Partial<SettingsState>
         if (version < 4) {
@@ -364,7 +364,7 @@ export const useSettingsStore = create<SettingsState>()(
         }
         if (version < 6) {
           // v6：软件默认外观改为跟随系统。仅迁移旧默认值，保留用户主动选择的其他主题。
-          const wasOldDefault = (s.appColorScheme ?? 'dark') === 'dark' && (s.theme ?? DEFAULT_DARK_THEME) === DEFAULT_DARK_THEME
+          const wasOldDefault = (s.appColorScheme ?? 'dark') === 'dark' && (s.theme ?? 'tokyoNight') === 'tokyoNight'
           return wasOldDefault ? { ...s, appColorScheme: 'system', theme: DEFAULT_LIGHT_THEME } : s
         }
         if (version < 7) {
@@ -383,6 +383,10 @@ export const useSettingsStore = create<SettingsState>()(
         }
         if (version < 10) {
           return { ...s, shortcuts: { ...DEFAULT_SHORTCUTS, ...(s.shortcuts ?? {}) } }
+        }
+        if (version < 11) {
+          const wasOldDarkDefault = (s.appColorScheme ?? 'system') !== 'light' && (s.theme ?? 'tokyoNight') === 'tokyoNight'
+          return wasOldDarkDefault ? { ...s, theme: DEFAULT_DARK_THEME } : s
         }
         return s
       },

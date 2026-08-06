@@ -1,5 +1,7 @@
 use std::{
     collections::HashMap,
+    path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, Mutex},
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -29,33 +31,188 @@ use commands::duckdb::DuckPool;
 use commands::driver::DriverRegistry;
 use commands::sqlserver::SsPool;
 
-#[tauri::command]
-fn write_local_file(path: String, content: String) -> Result<(), String> {
-    let p = std::path::Path::new(&path);
+#[derive(serde::Serialize)]
+struct DocumentConverterProbe {
+    available: bool,
+    path: Option<String>,
+    message: String,
+}
+
+#[derive(serde::Serialize)]
+struct DocumentConvertResult {
+    path: String,
+    engine: String,
+}
+
+fn validate_local_path(path: &str, action: &str) -> Result<PathBuf, String> {
+    let p = PathBuf::from(path);
     if !p.is_absolute() {
         return Err("只允许绝对路径".to_string());
     }
-    // 禁止写入任何隐藏目录/文件（~/.ssh、~/.bashrc 等敏感位置）
     if p.components().any(|c| {
         matches!(c, std::path::Component::Normal(s) if s.to_string_lossy().starts_with('.'))
     }) {
-        return Err("不允许写入隐藏目录或隐藏文件".to_string());
+        return Err(format!("不允许{action}隐藏目录或隐藏文件"));
     }
+    Ok(p)
+}
+
+fn find_command(candidates: &[&str], version_arg: &str) -> Option<PathBuf> {
+    for candidate in candidates {
+        let path = PathBuf::from(candidate);
+        let output = Command::new(&path).arg(version_arg).output();
+        if output.is_ok() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn find_soffice() -> Option<PathBuf> {
+    find_command(
+        &[
+            "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+            "/Applications/OpenOffice.app/Contents/MacOS/soffice",
+            "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
+            "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
+            "C:\\Program Files\\OpenOffice 4\\program\\soffice.exe",
+            "/usr/bin/soffice",
+            "/usr/local/bin/soffice",
+            "/snap/bin/libreoffice",
+            "soffice",
+            "soffice.exe",
+            "libreoffice",
+        ],
+        "--version",
+    )
+}
+
+fn find_pdftotext() -> Option<PathBuf> {
+    find_command(&["pdftotext", "/opt/homebrew/bin/pdftotext", "/usr/local/bin/pdftotext"], "-v")
+}
+
+fn file_stem(path: &Path) -> Result<String, String> {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "无法识别文件名".to_string())
+}
+
+#[tauri::command]
+fn write_local_file(path: String, content: String) -> Result<(), String> {
+    let p = validate_local_path(&path, "写入")?;
     std::fs::write(p, content).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
+fn read_local_file(path: String) -> Result<String, String> {
+    let p = validate_local_path(&path, "读取")?;
+    std::fs::read_to_string(p).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn write_local_bytes(path: String, bytes: Vec<u8>) -> Result<(), String> {
-    let p = std::path::Path::new(&path);
-    if !p.is_absolute() {
-        return Err("只允许绝对路径".to_string());
-    }
-    if p.components().any(|c| {
-        matches!(c, std::path::Component::Normal(s) if s.to_string_lossy().starts_with('.'))
-    }) {
-        return Err("不允许写入隐藏目录或隐藏文件".to_string());
-    }
+    let p = validate_local_path(&path, "写入")?;
     std::fs::write(p, bytes).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn document_converter_probe() -> DocumentConverterProbe {
+    if let Some(path) = find_soffice() {
+        return DocumentConverterProbe {
+            available: true,
+            path: Some(path.to_string_lossy().to_string()),
+            message: "已找到 LibreOffice/soffice，可转换 Word、Excel、PPT、TXT、HTML、PDF 等文档。".to_string(),
+        };
+    }
+    DocumentConverterProbe {
+        available: false,
+        path: None,
+        message: "未找到 LibreOffice/soffice。请安装 LibreOffice，或把 soffice 加入 PATH 后重试。".to_string(),
+    }
+}
+
+#[tauri::command]
+fn convert_document_file(input_path: String, output_path: String, output_format: String) -> Result<DocumentConvertResult, String> {
+    let input = validate_local_path(&input_path, "读取")?;
+    let output = validate_local_path(&output_path, "写入")?;
+    if !input.exists() {
+        return Err("源文件不存在".to_string());
+    }
+    let target_ext = output_format.trim().trim_start_matches('.').to_lowercase();
+    if target_ext.is_empty() {
+        return Err("目标格式不能为空".to_string());
+    }
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let input_ext = input.extension().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if input_ext == "pdf" && target_ext == "txt" {
+        if let Some(pdftotext) = find_pdftotext() {
+            let out = Command::new(&pdftotext)
+                .arg("-layout")
+                .arg("-enc")
+                .arg("UTF-8")
+                .arg(&input)
+                .arg(&output)
+                .output()
+                .map_err(|e| format!("启动 pdftotext 失败：{e}"))?;
+            if out.status.success() {
+                return Ok(DocumentConvertResult {
+                    path: output.to_string_lossy().to_string(),
+                    engine: "pdftotext".to_string(),
+                });
+            }
+        }
+    }
+
+    let soffice = find_soffice().ok_or_else(|| {
+        "未找到 LibreOffice/soffice，无法进行 Office/PDF 互转。请安装 LibreOffice，或把 soffice 加入 PATH。".to_string()
+    })?;
+    let temp_dir = std::env::temp_dir().join(format!("dbterm-doc-convert-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+
+    let mut cmd = Command::new(&soffice);
+    cmd.arg("--headless")
+        .arg("--nologo")
+        .arg("--nofirststartwizard")
+        .arg("--nodefault")
+        .arg("--nolockcheck");
+    if input_ext == "pdf" && matches!(target_ext.as_str(), "doc" | "docx" | "odt" | "rtf") {
+        cmd.arg("--infilter=writer_pdf_import");
+    }
+    cmd.arg("--convert-to")
+        .arg(&target_ext)
+        .arg("--outdir")
+        .arg(&temp_dir)
+        .arg(&input);
+
+    let out = cmd.output().map_err(|e| format!("启动 LibreOffice 失败：{e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        return Err(format!("转换失败：{}{}", stdout, stderr));
+    }
+
+    let generated = temp_dir.join(format!("{}.{}", file_stem(&input)?, target_ext));
+    if !generated.exists() {
+        let candidates = std::fs::read_dir(&temp_dir)
+            .map_err(|e| e.to_string())?
+            .filter_map(|entry| entry.ok().map(|item| item.path()))
+            .collect::<Vec<_>>();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        return Err(format!("转换器未生成目标文件，输出目录内容：{:?}", candidates));
+    }
+    std::fs::rename(&generated, &output)
+        .or_else(|_| std::fs::copy(&generated, &output).map(|_| ()))
+        .map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    Ok(DocumentConvertResult {
+        path: output.to_string_lossy().to_string(),
+        engine: soffice.to_string_lossy().to_string(),
+    })
 }
 
 /// 退出守卫标志：仅当前端确认「仍要退出」后置 true，届时不再拦截退出。
@@ -283,16 +440,23 @@ pub fn run() {
             commands::ssh::chmod_file,
             commands::ssh::get_server_perf,
             commands::ssh::kill_process,
+            commands::ssh::list_local_files,
+            commands::ssh::get_local_start_path,
+            commands::ssh::delete_local_file,
+            commands::ssh::rename_local_file,
+            commands::ssh::create_local_dir,
             commands::ssh::list_files,
             commands::ssh::delete_file,
             commands::ssh::rename_file,
             commands::ssh::create_dir,
             commands::ssh::download_file,
+            commands::ssh::download_file_to,
             commands::ssh::upload_file,
             commands::ssh::upload_file_path,
             commands::ssh::get_file_start_path,
             commands::ssh::cancel_sftp_transfer,
             commands::ssh::download_dir,
+            commands::ssh::download_dir_to,
             commands::ssh::upload_dir,
             // 远程文件在线编辑
             commands::ssh::read_remote_file,
@@ -594,8 +758,11 @@ pub fn run() {
             commands::mongo::security::mongo_grant_roles_to_user,
             commands::mongo::security::mongo_revoke_roles_from_user,
             // 本地文件导出
+            read_local_file,
             write_local_file,
             write_local_bytes,
+            document_converter_probe,
+            convert_document_file,
             // SQLite 可选增强：EXPLAIN 字节码 / AUTOINCREMENT 计数器 / 文件变更监控
             commands::sqlite_admin::sqlite_explain_bytecode,
             commands::sqlite_admin::sqlite_sequence_list,

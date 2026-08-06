@@ -19,8 +19,6 @@ type Format   = 'csv' | 'tsv' | 'jsonl' | 'sql' | 'json' | 'md' | 'xlsx' | 'parq
 type Encoding = 'utf8' | 'utf8bom' | 'gbk'
 type Phase    = 'config' | 'running' | 'done' | 'error' | 'cancelled'
 
-const CANCELABLE_TYPES = new Set(['mysql', 'mariadb', 'tidb', 'oceanBase', 'postgres', 'kingBase', 'openGauss', 'sqlite', 'duckdb'])
-
 interface ProgressEvt {
   rows: number
   elapsed_ms: number
@@ -164,9 +162,9 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
     setErrorMsg('')
     setCancelling(false)
     cancelRequestedRef.current = false
-    const token = CANCELABLE_TYPES.has(connType ?? '') ? `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}` : null
+    const token = null
     exportTokenRef.current = token
-    const markedSql = token ? `/* dbterm-cancel:${token} */ ${sqlText.trim()}` : sqlText.trim()
+    const exportSql = sqlText.trim()
     const taskId = useExportTaskStore.getState().addTask({
       connId: connectionId,
       label: `${guessTableName(sqlText)} · ${FORMAT_OPTS.find(item => item.value === format)?.label ?? format}`,
@@ -186,7 +184,7 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
         const { invoke } = await import('@tauri-apps/api/core')
         const res = await invoke<DuckCopyResult>('duckdb_copy_to', {
           id: connectionId,
-          sql: markedSql,
+          sql: exportSql,
           path: filePath.trim(),
           format,
         })
@@ -252,7 +250,7 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
       const { invoke } = await import('@tauri-apps/api/core')
       await invoke('db_stream_export', {
         id: connectionId,
-        sql: markedSql,
+        sql: exportSql,
         filePath: filePath.trim(),
         format,
         encoding,

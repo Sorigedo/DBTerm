@@ -46,8 +46,24 @@ export interface TestResult {
   latencyMs?: number
 }
 
-export type ActiveView = 'all' | 'ssh' | 'db'
-export type TabType = 'terminal' | 'query' | 'schema-browser' | 'table-data' | 'object-editor'
+export type ActiveView = 'all' | 'ssh' | 'db' | 'tools'
+export type ToolId =
+  | 'json'
+  | 'base64'
+  | 'url'
+  | 'timestamp'
+  | 'uuid'
+  | 'hash'
+  | 'jwt'
+  | 'regex'
+  | 'color'
+  | 'text'
+  | 'password'
+  | 'case'
+  | 'diff'
+  | 'number'
+  | 'documentConvert'
+export type TabType = 'terminal' | 'query' | 'schema-browser' | 'table-data' | 'object-editor' | 'tool'
 
 export interface WorkspaceTab {
   id: string
@@ -56,6 +72,7 @@ export interface WorkspaceTab {
   type: TabType
   error?: boolean
   meta?: Record<string, string>
+  toolId?: ToolId
   pinned?: boolean   // 固定标签（最左、不可关闭）：每个连接的对象浏览标签
   dirty?: boolean    // 有未保存编辑（对象编辑页）：标签显示 * 标志
 }

@@ -29,8 +29,25 @@ test('does not mistake blocks, savepoints or unsupported engines for top-level c
 test('only mysql session setup statements are accepted as transaction preamble', () => {
   assert.equal(isMysqlTransactionPreamble('-- variables\nSET @parent_id := 1'), true)
   assert.equal(isMysqlTransactionPreamble('USE `app_db`'), true)
+  assert.equal(isMysqlTransactionPreamble('ROLLBACK'), true)
+  assert.equal(isMysqlTransactionPreamble('COMMIT WORK'), true)
   assert.equal(isMysqlTransactionPreamble('SELECT @parent_id'), false)
   assert.equal(isMysqlTransactionPreamble('UPDATE t SET value = 1'), false)
+})
+
+test('mysql variable transaction may start with cleanup rollback before setup', () => {
+  const sql = `ROLLBACK;
+SET @child_config = '[{"itemIndex":"1","itemFloor":"6"}]';
+SET @camera_config_3cam = CONCAT('[', '{"id":1,"title":"右上","pid":"-1"}', ']');
+START TRANSACTION;
+UPDATE mc_device_model SET child_config = @child_config, camera_config = @camera_config_3cam WHERE mversion = 'MZ-608CVWKT-3CAM';
+COMMIT;`
+  const statements = splitSqlStatements(sql, 'mysql')
+  const controls = statements.map(s => transactionControlStatement(s, 'mysql'))
+  const firstExplicitBegin = controls.indexOf('begin')
+
+  assert.deepEqual(controls, ['rollback', null, null, 'begin', null, 'commit'])
+  assert.equal(statements.slice(0, firstExplicitBegin).every(isMysqlTransactionPreamble), true)
 })
 
 test('mysql variable transaction script stays split while its setup remains on the transaction session', () => {

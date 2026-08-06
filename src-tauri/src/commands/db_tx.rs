@@ -381,9 +381,16 @@ pub async fn db_begin_tx(
                     .map_err(|e| format!("切换数据库失败: {e}"))?;
             }
             for stmt in &preamble {
-                let upper = super::query::strip_leading_comments(stmt).trim().to_uppercase();
-                if !upper.starts_with("SET ") && !upper.starts_with("USE ") {
-                    return Err("事务前置语句仅支持 SET / USE".to_string());
+                let text = super::query::strip_leading_comments(stmt)
+                    .trim()
+                    .trim_end_matches(';')
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_uppercase();
+                let safe_cleanup = matches!(text.as_str(), "COMMIT" | "COMMIT WORK" | "ROLLBACK" | "ROLLBACK WORK");
+                if !text.starts_with("SET ") && !text.starts_with("USE ") && !safe_cleanup {
+                    return Err("事务前置语句仅支持 SET / USE / COMMIT / ROLLBACK".to_string());
                 }
                 mysql_exec_text(&mut c, stmt).await
                     .map_err(|e| format!("事务前置语句失败: {e}"))?;

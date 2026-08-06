@@ -5,7 +5,7 @@ use crate::{
     storage::StorageState,
 };
 use super::sqlite_admin::SqliteAttachMap;
-use super::duckdb::{DuckPool, dispatch_duck_query, dispatch_duck_schemas, dispatch_duck_tables, dispatch_duck_ddl, dispatch_duck_columns};
+use super::duckdb::{DuckPool, dispatch_duck_query_with_cancel, dispatch_duck_schemas, dispatch_duck_tables, dispatch_duck_ddl, dispatch_duck_columns};
 use super::driver::DriverRegistry;
 use super::sqlserver::{SsPool, dispatch_ss_query, dispatch_ss_schemas, dispatch_ss_tables, dispatch_ss_columns, dispatch_ss_schema_columns, dispatch_ss_ddl, dispatch_ss_routines, dispatch_ss_db_schemas, dispatch_ss_schema_tables};
 
@@ -467,12 +467,14 @@ pub async fn execute_query(
     sql: String,
     database: Option<String>,   // 查询页选中的 schema/库：覆盖连接默认库（Navicat 风格切库，无需 USE）
     row_limit: Option<u64>,     // 前端行数上限（None = 全量，Some(n) = 追加 LIMIT n）
+    cancel_token: Option<String>, // 查询取消令牌：独立 IPC 参数，不写入 SQL 文本
     storage: State<'_, StorageState>,
     duck_pool: State<'_, DuckPool>,
     registry: State<'_, DriverRegistry>,
     ss_pool: State<'_, SsPool>,
 ) -> Result<QueryResult, String> {
     let (mut config, password) = load_conn(&id, &storage)?;
+    validate_cancel_token(cancel_token.as_deref())?;
     // 集中只读护栏（fail-closed）：只读连接拒绝非查询语句。覆盖所有引擎——
     // MySQL/DuckDB/SQLServer/ClickHouse 的单独路径此前没有引擎级只读，这里统一兜底。
     // 引擎级只读（PG/SQLite session、MySQL session、DuckDB access_mode）作为更精确的第二重保障。
@@ -494,9 +496,10 @@ pub async fn execute_query(
         r.truncated = limit_applied;
         return Ok(r);
     }
-    // Oracle 不支持 LIMIT，用 FETCH FIRST n ROWS ONLY；已含 FETCH/ROWNUM 子句时不再追加
+    // Oracle 不支持 LIMIT，用 FETCH FIRST n ROWS ONLY；只对 SELECT/WITH 自动限行。
+    // SHOW/DESC/EXPLAIN/PRAGMA 这类管理查询可能本身就是查询结果，但不少方言不接受尾部限行语法。
     if config.conn_type == ConnType::Oracle {
-        let oracle_sql = if is_query_stmt(&sql) && !has_limit_clause(&sql) && !has_fetch_clause(&sql) {
+        let oracle_sql = if supports_auto_row_limit(&sql) && !has_limit_clause(&sql) && !has_fetch_clause(&sql) {
             if let Some(lim) = row_limit {
                 let base = sql.trim_end().trim_end_matches(';').trim_end();
                 format!("{base} FETCH FIRST {lim} ROWS ONLY")
@@ -505,8 +508,9 @@ pub async fn execute_query(
         return super::oracle::execute_query_impl(config, oracle_sql, password, &*registry).await;
     }
 
-    // 行数限制：仅对 SELECT 类语句且用户未在 SQL 中自写 LIMIT/FETCH 时注入
-    let (effective_sql, limit_applied) = if is_query_stmt(&sql) && !has_limit_clause(&sql) {
+    // 行数限制：仅对 SELECT/WITH 且用户未在 SQL 中自写 LIMIT/FETCH 时注入。
+    // 不要给 SHOW PROCESSLIST / DESC / EXPLAIN / PRAGMA 追加 LIMIT，MySQL 等方言会直接语法错误。
+    let (effective_sql, limit_applied) = if supports_auto_row_limit(&sql) && !has_limit_clause(&sql) {
         if let Some(lim) = row_limit {
             let base = sql.trim_end().trim_end_matches(';').trim_end();
             (format!("{base} LIMIT {lim}"), true)
@@ -518,12 +522,12 @@ pub async fn execute_query(
     };
 
     if config.conn_type == ConnType::Duckdb {
-        let mut r = dispatch_duck_query(&id, &config, &effective_sql, &duck_pool, &registry).await?;
+        let mut r = dispatch_duck_query_with_cancel(&id, &config, &effective_sql, &duck_pool, &registry, cancel_token.as_deref()).await?;
         r.truncated = limit_applied;
         return Ok(r);
     }
     drop(storage);
-    let mut r = dispatch_query(&config, password.as_deref(), &effective_sql).await?;
+    let mut r = dispatch_query(&config, password.as_deref(), &effective_sql, cancel_token.as_deref()).await?;
     r.truncated = limit_applied;
     Ok(r)
 }
@@ -1252,7 +1256,6 @@ fn load_conn(
 }
 
 /// 去掉 SQL 开头的注释（块注释 /* ... */ 与行注释 -- ...）和空白，便于按首关键字判断语句类型。
-/// 关键：前端会注入 `/* dbterm-cancel:token */` 取消标记，若不剥离会导致 SELECT 被误判为写语句。
 pub(crate) fn strip_leading_comments(sql: &str) -> &str {
     let mut s = sql.trim_start();
     loop {
@@ -1303,14 +1306,14 @@ fn pid_reg() -> &'static std::sync::Mutex<std::collections::HashMap<String, i64>
 fn pid_register(token: &str, pid: i64) { if let Ok(mut m) = pid_reg().lock() { m.insert(token.to_string(), pid); } }
 fn pid_unregister(token: &str) { if let Ok(mut m) = pid_reg().lock() { m.remove(token); } }
 pub fn cancel_pid(token: &str) -> Option<i64> { pid_reg().lock().ok()?.get(token).copied() }
-/// 从 SQL 里提取 `/* dbterm-cancel:<token> */` 的 token
-pub(crate) fn extract_cancel_token(sql: &str) -> Option<String> {
-    let i = sql.find("dbterm-cancel:")?;
-    let tok: String = sql[i + "dbterm-cancel:".len()..]
-        .chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
-    if tok.is_empty() { None } else { Some(tok) }
+pub(crate) fn validate_cancel_token(token: Option<&str>) -> Result<(), String> {
+    if let Some(token) = token {
+        if token.is_empty() || !token.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err("无效的取消令牌".into());
+        }
+    }
+    Ok(())
 }
-
 /// 整词扫描写/DDL 关键字——仅用于「无引擎级只读」的引擎(SQLServer/ClickHouse)在只读模式下兜底，
 /// 防 WITH/EXPLAIN 前缀夹带 DML。只读连接上偶有误拦合法读属可接受(fail-closed)。
 fn contains_write_keyword(sql: &str) -> bool {
@@ -1355,7 +1358,7 @@ fn has_sqlserver_row_limit(sql: &str) -> bool {
 
 fn apply_sqlserver_row_limit(sql: &str, row_limit: Option<u64>) -> (String, bool) {
     let Some(lim) = row_limit else { return (sql.to_string(), false) };
-    if lim == 0 || !is_query_stmt(sql) || has_sqlserver_row_limit(sql) {
+    if lim == 0 || !supports_auto_row_limit(sql) || has_sqlserver_row_limit(sql) {
         return (sql.to_string(), false);
     }
 
@@ -1393,23 +1396,29 @@ pub(crate) fn is_query_stmt(sql: &str) -> bool {
         || up.starts_with("PRAGMA")
 }
 
+fn supports_auto_row_limit(sql: &str) -> bool {
+    let up = strip_leading_comments(sql).to_uppercase();
+    up.starts_with("SELECT") || up.starts_with("WITH")
+}
+
 // ── dispatch ──────────────────────────────────────────────────────────────────
 
 pub(crate) async fn dispatch_query(
     config: &ConnConfig,
     password: Option<&str>,
     sql: &str,
+    cancel_token: Option<&str>,
 ) -> Result<QueryResult, String> {
     match config.conn_type {
         ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => {
-            mysql_query(config, password, sql).await
+            mysql_query(config, password, sql, cancel_token).await
         }
         ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
-            pg_query(config, password, sql).await
+            pg_query(config, password, sql, cancel_token).await
         }
         ConnType::Sqlite => {
             let conn = sqlite_open(config).await?;
-            sqlite_query_conn(conn, sql).await
+            sqlite_query_conn(conn, sql, cancel_token).await
         }
         ConnType::Redis     => Err("Redis 不支持 SQL 查询".into()),
         ConnType::ClickHouse => super::clickhouse::query(config, password, sql).await,
@@ -1606,7 +1615,13 @@ fn has_mysql_user_variable(sql: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_mysql_user_variable, needs_text_protocol};
+    use super::{
+        apply_sqlserver_row_limit,
+        has_mysql_user_variable,
+        is_query_stmt,
+        needs_text_protocol,
+        supports_auto_row_limit,
+    };
 
     #[test]
     fn mysql_user_prepared_statement_commands_use_text_protocol() {
@@ -1614,7 +1629,7 @@ mod tests {
         assert!(needs_text_protocol("EXECUTE stmt"));
         assert!(needs_text_protocol("DEALLOCATE PREPARE stmt"));
         assert!(needs_text_protocol("DROP PREPARE stmt"));
-        assert!(needs_text_protocol("/* dbterm-cancel:abc123 */ PREPARE stmt FROM 'SELECT 1'"));
+        assert!(needs_text_protocol("/* app comment */ PREPARE stmt FROM 'SELECT 1'"));
         assert!(needs_text_protocol("SET @sql = 'SELECT 1'; PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt"));
     }
 
@@ -1624,6 +1639,35 @@ mod tests {
         assert!(has_mysql_user_variable("SELECT @x"));
         assert!(!has_mysql_user_variable("SELECT 'a@b'"));
         assert!(!has_mysql_user_variable("-- @x\nSELECT 1"));
+    }
+
+    #[test]
+    fn management_queries_are_query_results_but_not_auto_limited() {
+        for sql in [
+            "SHOW PROCESSLIST",
+            "SHOW FULL PROCESSLIST",
+            "DESC users",
+            "DESCRIBE users",
+            "EXPLAIN SELECT * FROM users",
+            "PRAGMA table_info(users)",
+        ] {
+            assert!(is_query_stmt(sql), "{sql}");
+            assert!(!supports_auto_row_limit(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn select_queries_support_auto_row_limit_after_comments() {
+        assert!(supports_auto_row_limit("SELECT * FROM users"));
+        assert!(supports_auto_row_limit("/* app comment */ SELECT * FROM users"));
+        assert!(supports_auto_row_limit("-- comment\nWITH x AS (SELECT 1) SELECT * FROM x"));
+    }
+
+    #[test]
+    fn sqlserver_top_is_not_added_to_management_queries() {
+        assert_eq!(apply_sqlserver_row_limit("SHOW PROCESSLIST", Some(200)), ("SHOW PROCESSLIST".to_string(), false));
+        assert_eq!(apply_sqlserver_row_limit("EXPLAIN SELECT * FROM users", Some(200)), ("EXPLAIN SELECT * FROM users".to_string(), false));
+        assert_eq!(apply_sqlserver_row_limit("SELECT * FROM users", Some(200)), ("SELECT TOP 200 * FROM users".to_string(), true));
     }
 }
 
@@ -1635,6 +1679,7 @@ fn mysql_admin_query(
     _tunnel: Option<std::sync::Arc<crate::db_tunnel::DbTunnel>>,
     tagged_sql: String,
     database: Option<String>,
+    cancel_token: Option<String>,
     start: Instant,
 ) -> futures::future::BoxFuture<'static, Result<QueryResult, String>> {
     Box::pin(async move {
@@ -1645,27 +1690,48 @@ fn mysql_admin_query(
                 .await
                 .map_err(|e| format!("切换数据库失败: {e}"))?;
         }
-        let rows = (&mut conn)
-            .fetch_all(sqlx::raw_sql(&tagged_sql))
-            .await
-            .map_err(|e| format!("执行失败: {e}"))?;
-        let columns = rows
-            .first()
-            .map(|r| r.columns().iter().map(|c| c.name().to_string()).collect())
-            .unwrap_or_default();
-        let data = rows.iter()
-            .map(|r| (0..r.columns().len()).map(|i| mysql_cell(r, i)).collect())
-            .collect();
-        Ok(QueryResult {
-            columns, rows: data,
-            rows_affected: rows.len() as u64,
-            execution_time_ms: start.elapsed().as_millis() as u64,
-            truncated: false, is_select: true,
-        })
+        let abort_rx = cancel_token.as_ref().map(|t| abort_register(t));
+        if let Some(ref t) = cancel_token {
+            if let Ok(row) = sqlx::query("SELECT CONNECTION_ID()").fetch_one(&mut conn).await {
+                let cid = row.try_get::<u64, _>(0).map(|v| v as i64)
+                    .or_else(|_| row.try_get::<i64, _>(0)).unwrap_or(0);
+                if cid != 0 { pid_register(t, cid); }
+            }
+        }
+        let run = async {
+            let rows = (&mut conn)
+                .fetch_all(sqlx::raw_sql(&tagged_sql))
+                .await
+                .map_err(|e| format!("执行失败: {e}"))?;
+            let columns = rows
+                .first()
+                .map(|r| r.columns().iter().map(|c| c.name().to_string()).collect())
+                .unwrap_or_default();
+            let data = rows.iter()
+                .map(|r| (0..r.columns().len()).map(|i| mysql_cell(r, i)).collect())
+                .collect();
+            Ok(QueryResult {
+                columns, rows: data,
+                rows_affected: rows.len() as u64,
+                execution_time_ms: start.elapsed().as_millis() as u64,
+                truncated: false, is_select: true,
+            })
+        };
+        let result = if let Some(rx) = abort_rx {
+            tokio::pin!(run);
+            tokio::select! {
+                r = &mut run => r,
+                _ = rx => Err("查询已取消".to_string()),
+            }
+        } else {
+            run.await
+        };
+        if let Some(ref t) = cancel_token { abort_unregister(t); pid_unregister(t); }
+        result
     })
 }
 
-async fn mysql_query(config: &ConnConfig, password: Option<&str>, sql: &str) -> Result<QueryResult, String> {
+async fn mysql_query(config: &ConnConfig, password: Option<&str>, sql: &str, cancel_token: Option<&str>) -> Result<QueryResult, String> {
     use sqlx::{Column, Row};
     let tagged = tag_sql(sql);
     // 复用池连接：跳过每次重建 TCP+SSH 握手，首次执行后速度显著提升。
@@ -1676,7 +1742,7 @@ async fn mysql_query(config: &ConnConfig, password: Option<&str>, sql: &str) -> 
     if needs_text_protocol(sql) {
         let conn = pool.acquire().await.map_err(|e| format!("获取连接失败: {e}"))?.detach();
         let start = Instant::now();
-        return mysql_admin_query(conn, None, tagged, config.database.clone(), start).await;
+        return mysql_admin_query(conn, None, tagged, config.database.clone(), cancel_token.map(str::to_string), start).await;
     }
 
     let mut conn = pool.acquire().await.map_err(|e| format!("获取连接失败: {e}"))?;
@@ -1692,7 +1758,7 @@ async fn mysql_query(config: &ConnConfig, password: Option<&str>, sql: &str) -> 
 
     // 取消：登记中止通道（停止时 drop PoolConnection → socket 关闭 → 服务端中止查询）
     // + 登记 CONNECTION_ID（取消时尝试服务端 KILL，多节点下不保证同节点但失败可忽略）
-    let token = extract_cancel_token(sql);
+    let token = cancel_token.map(str::to_string);
     let abort_rx = token.as_ref().map(|t| abort_register(t));
     if let Some(ref t) = token {
         if let Ok(row) = sqlx::query("SELECT CONNECTION_ID()").fetch_one(&mut *conn).await {
@@ -1873,7 +1939,7 @@ async fn mysql_tables(config: &ConnConfig, password: Option<&str>, schema: &str)
 
 // ── Postgres ──────────────────────────────────────────────────────────────────
 
-async fn pg_query(config: &ConnConfig, password: Option<&str>, sql: &str) -> Result<QueryResult, String> {
+async fn pg_query(config: &ConnConfig, password: Option<&str>, sql: &str, cancel_token: Option<&str>) -> Result<QueryResult, String> {
     use sqlx::{Column, Row};
     let tagged = tag_sql(sql);
     // 复用池连接：跳过每次重建 TCP+SSH 握手
@@ -1882,7 +1948,7 @@ async fn pg_query(config: &ConnConfig, password: Option<&str>, sql: &str) -> Res
     let start = Instant::now();
 
     // 取消：登记中止通道 + backend pid（停止时 drop PoolConnection → socket 关闭 + 尝试 pg_cancel_backend）
-    let token = extract_cancel_token(sql);
+    let token = cancel_token.map(str::to_string);
     let abort_rx = token.as_ref().map(|t| abort_register(t));
     if let Some(ref t) = token {
         if let Ok(row) = sqlx::query("SELECT pg_backend_pid()").fetch_one(&mut *conn).await {
@@ -1992,10 +2058,10 @@ async fn pg_tables(config: &ConnConfig, password: Option<&str>, schema: &str) ->
 
 // ── SQLite ────────────────────────────────────────────────────────────────────
 
-async fn sqlite_query_conn(mut conn: sqlx::sqlite::SqliteConnection, sql: &str) -> Result<QueryResult, String> {
+async fn sqlite_query_conn(mut conn: sqlx::sqlite::SqliteConnection, sql: &str, cancel_token: Option<&str>) -> Result<QueryResult, String> {
     use sqlx::{Column, Row};
     let start = Instant::now();
-    let token = extract_cancel_token(sql);
+    let token = cancel_token.map(str::to_string);
     let abort_rx = token.as_ref().map(|t| abort_register(t));
 
     let run = async {

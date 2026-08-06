@@ -1,4 +1,5 @@
 ﻿import { lazy, Suspense, useState, useCallback, useRef, useEffect, useMemo } from 'react'
+import type { MutableRefObject } from 'react'
 import { createPortal, flushSync } from 'react-dom'
 import CodeMirror from '@uiw/react-codemirror'
 import { sql, schemaCompletionSource, StandardSQL, MySQL, MariaSQL, PostgreSQL, SQLite, MSSQL } from '@codemirror/lang-sql'
@@ -7,12 +8,24 @@ import { codeFolding, foldEffect, foldGutter, foldService, foldable, foldedRange
 
 // 跟随 CSS 变量的编辑器主题（背景/前景/光标均从 app 主题继承，不固定为 oneDark 的 #282c34）
 const _editorDark = EditorView.theme({
-  '&': { background: 'var(--bg)', color: 'var(--text)' },
-  '.cm-scroller': { background: 'var(--bg)' },
+  '&': { background: 'var(--surface)', color: 'var(--text)' },
+  '.cm-scroller': { background: 'var(--surface)' },
   '.cm-content': { caretColor: 'var(--accent)' },
   '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--accent)' },
   '&.cm-focused .cm-selectionBackground, .cm-selectionBackground':
-    { background: 'rgba(100,145,255,0.28) !important' },
+    { background: 'color-mix(in srgb, var(--accent) 38%, transparent) !important' },
+  '.cm-content ::selection': { background: 'color-mix(in srgb, var(--accent) 38%, transparent) !important' },
+  '.cm-selectionMatch': {
+    background: 'color-mix(in srgb, var(--accent) 18%, transparent) !important',
+    outline: '1px solid color-mix(in srgb, var(--accent) 30%, transparent)',
+  },
+  '.cm-searchMatch': {
+    background: 'color-mix(in srgb, var(--warning) 20%, transparent) !important',
+    outline: '1px solid color-mix(in srgb, var(--warning) 34%, transparent)',
+  },
+  '.cm-searchMatch.cm-searchMatch-selected': {
+    background: 'color-mix(in srgb, var(--warning) 32%, transparent) !important',
+  },
   '.cm-activeLine': { background: 'rgba(255,255,255,0.04)' },
   '.cm-activeLineGutter': { background: 'rgba(255,255,255,0.04)' },
   '.cm-matchingBracket': { background: 'rgba(100,145,255,0.22)', borderRadius: '2px' },
@@ -26,12 +39,24 @@ const _editorDark = EditorView.theme({
 }, { dark: true })
 
 const _editorLight = EditorView.theme({
-  '&': { background: 'var(--bg)', color: 'var(--text)' },
-  '.cm-scroller': { background: 'var(--bg)' },
+  '&': { background: 'var(--surface)', color: 'var(--text)' },
+  '.cm-scroller': { background: 'var(--surface)' },
   '.cm-content': { caretColor: 'var(--accent)' },
   '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--accent)' },
   '&.cm-focused .cm-selectionBackground, .cm-selectionBackground':
-    { background: 'rgba(80,130,240,0.22) !important' },
+    { background: 'color-mix(in srgb, var(--accent) 24%, transparent) !important' },
+  '.cm-content ::selection': { background: 'color-mix(in srgb, var(--accent) 24%, transparent) !important' },
+  '.cm-selectionMatch': {
+    background: 'color-mix(in srgb, var(--accent) 12%, transparent) !important',
+    outline: '1px solid color-mix(in srgb, var(--accent) 22%, transparent)',
+  },
+  '.cm-searchMatch': {
+    background: 'color-mix(in srgb, var(--warning) 18%, transparent) !important',
+    outline: '1px solid color-mix(in srgb, var(--warning) 28%, transparent)',
+  },
+  '.cm-searchMatch.cm-searchMatch-selected': {
+    background: 'color-mix(in srgb, var(--warning) 28%, transparent) !important',
+  },
   '.cm-activeLine': { background: 'rgba(0,0,0,0.035)' },
   '.cm-activeLineGutter': { background: 'rgba(0,0,0,0.035)' },
   '.cm-matchingBracket': { background: 'rgba(80,130,240,0.18)', borderRadius: '2px' },
@@ -78,7 +103,7 @@ import { appendAuditLog } from '../../utils/auditLog'
 import { markBatchCancelledFrom, markBatchSkippedFrom } from './queryBatchCancel'
 import { hasMysqlDelimiterDirective, hasMysqlUserPreparedStmt, hasMysqlUserVariable, splitSqlStatements, stripSqlComments } from './sqlSplit'
 import { applySqlVariables, findSqlVariables, type SqlVariable } from './sqlVariables'
-import { memberColumnsForAlias, selectAliasColumnsBefore, stripQuoteIdent } from './sqlCompletion'
+import { columnsOfTable, memberColumnsForAlias, selectAliasColumnsBefore, stripQuoteIdent, tableForAlias } from './sqlCompletion'
 import { affectedRowsDisplay } from './affectedRowsDisplay'
 import { isMysqlTransactionPreamble, shouldBlockMixedAutoTransaction, transactionControlStatement } from './transactionControl'
 
@@ -281,18 +306,86 @@ export interface EditCtx {
  * 含 JOIN / GROUP BY / UNION / 子查询 / 多表的一律不可编辑。
  */
 /** `别名.` / `表名.` 成员补全：返回该表列名；非成员上下文返回 null（交回内置补全） */
-function memberCompletion(ctx: CompletionContext, dbSchema: Record<string, string[]>, connType: ConnType): CompletionResult | null {
-  const before = ctx.matchBefore(/[`"[\]\w$]+\.[\w$]*$/)
+function splitQualifiedTable(ref: string, connType: ConnType, currentSchema: string): { schema: string; table: string } {
+  const parts = ref.split('.').map(s => s.trim()).filter(Boolean)
+  if (connType === 'sqlServer') {
+    if (parts.length >= 3) return { schema: parts[0], table: parts[parts.length - 1] }
+    if (parts.length === 2) return { schema: currentSchema, table: parts[1] }
+  }
+  if (parts.length >= 2) return { schema: parts[parts.length - 2], table: parts[parts.length - 1] }
+  return { schema: '', table: parts[0] ?? ref }
+}
+
+async function memberCompletion(
+  ctx: CompletionContext,
+  dbSchema: Record<string, string[]>,
+  connType: ConnType,
+  connectionId: string,
+  currentSchema: string,
+  qualifiedCache: MutableRefObject<Record<string, string[]>>,
+): Promise<CompletionResult | null> {
+  const before = ctx.matchBefore(/[`"\[\]\w$]+\.[\w$]*$/)
   if (!before || before.from === before.to) return null
   const dot = before.text.lastIndexOf('.')
   const alias = stripQuoteIdent(before.text.slice(0, dot))
   if (!alias) return null
-  const cols = memberColumnsForAlias(ctx.state.doc.toString(), dbSchema, alias, connType)
+  const doc = ctx.state.doc.toString()
+  let cols = memberColumnsForAlias(doc, dbSchema, alias, connType)
+  if (!cols.length && connectionId) {
+    const tableRef = tableForAlias(doc, alias, connType)
+    if (tableRef) {
+      const { schema, table } = splitQualifiedTable(tableRef, connType, currentSchema)
+      const targetSchema = schema || currentSchema
+      const cacheKey = `${targetSchema}.${table}`.toLowerCase()
+      cols = qualifiedCache.current[cacheKey] ?? columnsOfTable(qualifiedCache.current, cacheKey)
+      if (!cols.length && targetSchema && table) {
+        try {
+          const { invoke } = await import('@tauri-apps/api/core')
+          const list = await invoke<{ name: string }[]>('table_columns', { id: connectionId, schema: targetSchema, table })
+          cols = list.slice(0, 200).map(c => c.name)
+          qualifiedCache.current[cacheKey] = cols
+        } catch { /* 跨 schema 列补全失败时交回默认补全 */ }
+      }
+    }
+  }
   if (!cols.length) return null
   return {
     from: before.from + dot + 1,
     options: cols.map(c => ({ label: c, type: 'property' })),
     validFor: /^[\w$]*$/,
+  }
+}
+
+async function schemaTableCompletion(
+  ctx: CompletionContext,
+  connectionId: string,
+  schemas: string[],
+  tableCache: MutableRefObject<Record<string, string[]>>,
+): Promise<CompletionResult | null> {
+  const before = ctx.matchBefore(/[`"\[\]\w$]+\.[`"\[\]\w$]*$/)
+  if (!before || before.from === before.to || !connectionId) return null
+  const dot = before.text.lastIndexOf('.')
+  const rawSchema = stripQuoteIdent(before.text.slice(0, dot))
+  if (!rawSchema) return null
+  const schema = schemas.find(s => s.toLowerCase() === rawSchema.toLowerCase())
+  if (!schema) return null
+
+  const cacheKey = schema.toLowerCase()
+  let tables = tableCache.current[cacheKey]
+  if (!tables) {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core')
+      const list = await invoke<{ name: string; isView?: boolean }[]>('list_tables', { id: connectionId, schema })
+      tables = list.map(t => t.name)
+      tableCache.current[cacheKey] = tables
+    } catch {
+      return null
+    }
+  }
+  return {
+    from: before.from + dot + 1,
+    options: tables.map(t => ({ label: t, type: 'table' })),
+    validFor: /^[`"\[\]\w$]*$/,
   }
 }
 
@@ -1021,10 +1114,14 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
   }, [activeData?.sql, activeData?.result.columns.join('|'), activeData?.srcIndex, running, connectionId, connType, isSqlite])
   // 表名/列名补全数据：表名启动时拉取，列名点击表时按需补充
   const [dbSchema, setDbSchema] = useState<Record<string, string[]>>({})
+  const qualifiedColumnsRef = useRef<Record<string, string[]>>({})
+  const schemaTablesRef = useRef<Record<string, string[]>>({})
 
   // E4 智能补全：只加载「当前 schema」的表/列名（避免把其它库的表也提示出来）
   useEffect(() => {
     const sch = currentSchema || (isSqlite ? 'main' : '')
+    qualifiedColumnsRef.current = {}
+    schemaTablesRef.current = {}
     if (!connectionId || !sch) { setDbSchema({}); return }
     let alive = true
     ;(async () => {
@@ -1126,14 +1223,12 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
     return warnings
   }
 
-  // 仅 MySQL/PG 系支持主动 kill 正在运行的查询；事务连接不注入（kill 会破坏事务连接）
-  const canCancel = !txActive && CANCELABLE_TYPES.has(connType)
   const txSupported = TX_SUPPORTED_TYPES.has(connType)
   const newCancelToken = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
-  // 给 SQL 注入取消标记注释；单次执行/批量里的每条语句都使用独立 token，停止时按当前 token 取消。
+  // 取消令牌通过 execute_query.cancelToken 单独传给后端，不写入 SQL 文本。
   const markSql = (s: string, token?: string | null): string => {
-    if (!canCancel || !token) return s
-    return `/* dbterm-cancel:${token} */ ${s}`
+    void token
+    return s
   }
   const stopQuery = useCallback(async () => {
     if (cancelRequestedRef.current) return
@@ -1146,8 +1241,8 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
     try {
       const { invoke } = await import('@tauri-apps/api/core')
       const ok = await invoke<boolean>('db_cancel_query', { id: connectionId, token })
-      toast[ok ? 'success' : 'info'](ok ? '取消请求已发送' : '查询可能已结束', {
-        title: ok ? '正在取消查询' : undefined,
+      toast[ok ? 'success' : 'info'](ok ? '数据库已确认取消' : '已发送取消请求，本地连接已断开', {
+        title: ok ? '查询已取消' : '取消未确认',
         duration: 4200,
       })
     } catch (e) { toast.error(String(e)) }
@@ -1186,7 +1281,7 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
       : 0
     if (deferredPreambleCount > 0 && !stmts.slice(0, deferredPreambleCount).every(isMysqlTransactionPreamble)) {
       setMultiResults([]); setResult(null)
-      setError('MySQL 事务开始前包含非 SET / USE 语句，无法保证 @变量与事务使用同一连接；请将这些语句移到事务之后或拆分执行')
+      setError('MySQL 事务开始前包含非 SET / USE / COMMIT / ROLLBACK 语句，无法保证 @变量与事务使用同一连接；请将这些语句移到事务之后或拆分执行')
       return
     }
     // 只读模式：拦截一切写操作（DML/DDL/权限），不可绕过
@@ -1296,10 +1391,11 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
             }
             res = await inv<QueryResult>(executeInTx ? 'db_exec_in_tx' : 'execute_query', executeInTx
               ? { id: connectionId, sql: markSql(s, token) }
-              : {
+                : {
                   id: connectionId,
                   sql: markSql(s, token),
                   database: currentSchemaRef.current || undefined,
+                  cancelToken: token ?? undefined,
                   rowLimit: effectiveLimit ?? undefined,
                 })
           }
@@ -1403,6 +1499,7 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
             id: connectionId,
             sql: markSql(trimmed, token),
             database: currentSchemaRef.current || undefined,
+            cancelToken: token ?? undefined,
             rowLimit: effectiveLimit ?? undefined,
           })
       setResult(res)
@@ -1488,7 +1585,7 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
       setRunToken(token)
       const res = await invoke<QueryResult>(executeInTx ? 'db_exec_in_tx' : 'execute_query', executeInTx
         ? { id: connectionId, sql: markSql(trimmed, token) }
-        : { id: connectionId, sql: markSql(trimmed, token), database: currentSchemaRef.current || undefined })
+        : { id: connectionId, sql: markSql(trimmed, token), database: currentSchemaRef.current || undefined, cancelToken: token ?? undefined })
       setResult(res)
       addHistory(connectionId, trimmed, true)
       setEditCtx(null)
@@ -1699,12 +1796,13 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
   const sqlExt = useMemo(() => {
     const langSupport = sql({ dialect: sqlDialect, upperCaseKeywords: true })  // 仅关键字补全
     const schemaSrc = schemaCompletionSource({ dialect: sqlDialect, schema: dbSchema })
-    const combined: CompletionSource = (ctx) =>
-      memberCompletion(ctx, dbSchema, connType)
-      ?? selectOutputCompletion(ctx, connType)
-      ?? schemaSrc(ctx)
+    const combined: CompletionSource = async (ctx) => {
+      const member = await memberCompletion(ctx, dbSchema, connType, connectionId, currentSchema, qualifiedColumnsRef)
+      const schemaTables = member ? null : await schemaTableCompletion(ctx, connectionId, schemas, schemaTablesRef)
+      return member ?? schemaTables ?? selectOutputCompletion(ctx, connType) ?? schemaSrc(ctx)
+    }
     return [langSupport, langSupport.language.data.of({ autocomplete: combined })]
-  }, [connType, dbSchema, sqlDialect])
+  }, [connectionId, connType, currentSchema, dbSchema, schemas, sqlDialect])
   const foldExt = useMemo(() => codeFolding({
     preparePlaceholder: (state, range) => {
       const fromLine = state.doc.lineAt(range.from).number
@@ -1854,10 +1952,12 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
               onPreviewTable={(schema, table) => {
                 // 按方言包裹标识符引号
                 const qi = (n: string) =>
-                  connType === 'sqlServer' ? `[${n}]`
-                  : ['mysql', 'mariadb', 'tidb', 'oceanBase', 'clickHouse'].includes(connType) ? `\`${n}\``
-                  : `"${n}"`
-                const tbl = schema ? `${qi(schema)}.${qi(table)}` : qi(table)
+	                  connType === 'sqlServer' ? `[${n}]`
+	                  : ['mysql', 'mariadb', 'tidb', 'oceanBase', 'clickHouse'].includes(connType) ? `\`${n}\``
+	                  : `"${n}"`
+	                const tbl = schema && schema.toLowerCase() !== currentSchema.toLowerCase()
+	                  ? `${qi(schema)}.${qi(table)}`
+	                  : qi(table)
                 const previewSql =
                   connType === 'sqlServer'
                     ? `SELECT TOP 50 * FROM ${tbl}`
@@ -2080,7 +2180,7 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
               autocompletion: true,
               rectangularSelection: false,
               crosshairCursor: false,
-              highlightSelectionMatches: false,
+              highlightSelectionMatches: true,
             }}
             style={{ height: '100%', fontSize: 13 }}
           />

@@ -250,14 +250,15 @@ export function buildSqlCompletionScope(doc: string, connType: ConnType | string
     const tableRef = readQualifiedIdent(doc, pos, rules)
     if (!tableRef) continue
     const table = tableRef.text.split('.').pop() ?? tableRef.text
-    if (!table) continue
-    aliases[table.toLowerCase()] = table
+    const fullTable = tableRef.text
+    if (!table || !fullTable) continue
+    aliases[table.toLowerCase()] = fullTable
 
     let aliasPos = skipWs(doc, tableRef.end)
     if (isKeywordAt(doc, aliasPos, 'as')) aliasPos = skipWs(doc, aliasPos + 2)
     const alias = readIdent(doc, aliasPos, rules)
     if (alias && !ALIAS_STOP_WORDS.has(alias.text.toLowerCase())) {
-      aliases[alias.text.toLowerCase()] = table
+      aliases[alias.text.toLowerCase()] = fullTable
     }
     i = tableRef.end
   }
@@ -269,7 +270,14 @@ export function columnsOfTable(dbSchema: Record<string, string[]>, table: string
   if (dbSchema[table]?.length) return dbSchema[table]
   const lc = table.toLowerCase()
   for (const k of Object.keys(dbSchema)) if (k.toLowerCase() === lc) return dbSchema[k]
+  const tail = table.split('.').pop() ?? table
+  if (tail !== table) return columnsOfTable(dbSchema, tail)
   return []
+}
+
+export function tableForAlias(doc: string, alias: string, connType: ConnType | string): string | null {
+  const scope = buildSqlCompletionScope(doc, connType)
+  return scope.aliases[alias.toLowerCase()] ?? null
 }
 
 export function memberColumnsForAlias(doc: string, dbSchema: Record<string, string[]>, alias: string, connType: ConnType | string): string[] {

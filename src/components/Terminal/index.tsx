@@ -13,6 +13,7 @@ import { useCommandHistoryStore } from '../../stores/commandHistoryStore'
 import { THEMES, ANSI_PALETTES } from '../../themes'
 import { consumeAdopt, isDetaching, registerSerializer, unregisterSerializer, consumeAdoptSnapshot } from '../../utils/adopt'
 import { commandsFromInputData, isRecordableShellCommand, stripShellPrompt } from '../../utils/terminalCommand'
+import { shouldCommitCanceledAsciiComposition, shouldSuppressImeAsciiCommit, shouldSuppressReturnAfterCanceledAsciiCommit } from './ime'
 import { addFrame, isRecording } from '../SshPanels/RecordingPanel'
 
 // trzsz 文件传输触发串；仅当服务器输出含此串（或正在传输）时才走 trzsz 过滤器，普通输出直写终端
@@ -239,6 +240,11 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
   const mountedRef      = useRef(true)
   const hasNavigatedRef = useRef(false)
   const lastCwdRef      = useRef('')
+  const imeComposingRef = useRef(false)
+  const imeSuppressRef  = useRef<{ text: string; until: number } | null>(null)
+  const imeSuppressReturnUntilRef = useRef(0)
+  const imeLastKeyRef   = useRef('')
+  const imePendingTextRef = useRef('')
 
   const [disconnected, setDisconnected] = useState(false)
   const disconnectedRef                 = useRef(false)
@@ -666,6 +672,54 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
     xtermRef.current = xterm
     fitRef.current   = fit
 
+    const helperTextarea = containerRef.current.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | null
+    const onImeStart = () => {
+      imeComposingRef.current = true
+      imeLastKeyRef.current = ''
+      imeSuppressRef.current = null
+      imePendingTextRef.current = ''
+    }
+    const onImeKeyDown = (e: KeyboardEvent) => {
+      if (imeComposingRef.current) imeLastKeyRef.current = e.key
+    }
+    const onImeUpdate = (e: CompositionEvent) => {
+      if (imeComposingRef.current) imePendingTextRef.current = e.data ?? imePendingTextRef.current
+    }
+    const onImeEnd = (e: CompositionEvent) => {
+      imeComposingRef.current = false
+      const text = e.data ?? ''
+      const lastKey = imeLastKeyRef.current
+      imeLastKeyRef.current = ''
+      imePendingTextRef.current = ''
+      if (shouldSuppressImeAsciiCommit(lastKey, text)) {
+        imeSuppressRef.current = { text, until: Date.now() + 80 }
+      }
+    }
+    const onImeCancel = () => {
+      const text = imePendingTextRef.current
+      const lastKey = imeLastKeyRef.current
+      imeComposingRef.current = false
+      imeLastKeyRef.current = ''
+      imeSuppressRef.current = null
+      imePendingTextRef.current = ''
+      if (shouldCommitCanceledAsciiComposition(lastKey, text)) {
+        sendRef.current(text)
+        if (shouldSuppressReturnAfterCanceledAsciiCommit(lastKey, text)) {
+          imeSuppressReturnUntilRef.current = Date.now() + 120
+        }
+        const xa = xtermRef.current
+        if (xa && xa.buffer.active.type === 'normal') {
+          inputBufRef.current += text
+          setInputBuf(inputBufRef.current)
+        }
+      }
+    }
+    helperTextarea?.addEventListener('compositionstart', onImeStart)
+    helperTextarea?.addEventListener('keydown', onImeKeyDown)
+    helperTextarea?.addEventListener('compositionupdate', onImeUpdate)
+    helperTextarea?.addEventListener('compositionend', onImeEnd)
+    helperTextarea?.addEventListener('compositioncancel', onImeCancel)
+
     // ── 高亮叠加层：直接在 .xterm-screen 上插入绝对定位 div，绕过 registerDecoration 的时序问题 ──
     const screen = containerRef.current.querySelector('.xterm-screen') as HTMLElement | null
     if (screen) {
@@ -866,6 +920,17 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
     const localConn = connType === 'local'
 
     xterm.onData((data) => {
+      if (data === '\r' && Date.now() <= imeSuppressReturnUntilRef.current) {
+        imeSuppressReturnUntilRef.current = 0
+        return
+      }
+      const imeSuppress = imeSuppressRef.current
+      if (imeSuppress && Date.now() <= imeSuppress.until && data === imeSuppress.text) {
+        imeSuppressRef.current = null
+        return
+      }
+      if (imeSuppress && Date.now() > imeSuppress.until) imeSuppressRef.current = null
+
       // 断联状态下按回车触发重连
       if (disconnectedRef.current && localConn && data === '\r') {
         reconnectRef.current()
@@ -1222,6 +1287,11 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
       cancelAnimationFrame(resizeRaf)
       cancelAnimationFrame(cwdRaf)
       ro.disconnect()
+      helperTextarea?.removeEventListener('compositionstart', onImeStart)
+      helperTextarea?.removeEventListener('keydown', onImeKeyDown)
+      helperTextarea?.removeEventListener('compositionupdate', onImeUpdate)
+      helperTextarea?.removeEventListener('compositionend', onImeEnd)
+      helperTextarea?.removeEventListener('compositioncancel', onImeCancel)
       unlisten.forEach((fn) => fn())
       searchMatchesRef.current = []
       unregisterSerializer(sessionId)

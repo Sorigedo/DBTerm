@@ -49,7 +49,9 @@ export function transactionControlStatement(sql: string, connType: ConnType): Tr
 
 /** 显式事务开始前可安全搬到同一 MySQL 会话执行的连接级语句。 */
 export function isMysqlTransactionPreamble(sql: string): boolean {
-  return /^(?:SET|USE)\b/.test(normalized(sql))
+  const text = normalized(sql)
+  return /^(?:SET|USE)\b/.test(text)
+    || /^(?:COMMIT|ROLLBACK)(?: WORK)?$/.test(text)
 }
 
 /** 仅拦截由“手动提交模式”准备自动 BEGIN 的混合脚本；显式事务脚本由用户控制边界。 */

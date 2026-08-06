@@ -14,12 +14,24 @@ import { copyText } from '../../utils/clipboard'
  */
 
 const _darkTheme = EditorView.theme({
-  '&': { background: 'var(--bg)', color: 'var(--text)' },
-  '.cm-scroller': { background: 'var(--bg)' },
+  '&': { background: 'var(--surface)', color: 'var(--text)' },
+  '.cm-scroller': { background: 'var(--surface)' },
   '.cm-content': { caretColor: 'var(--accent)' },
   '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--accent)' },
   '&.cm-focused .cm-selectionBackground, .cm-selectionBackground':
-    { background: 'rgba(100,145,255,0.28) !important' },
+    { background: 'color-mix(in srgb, var(--accent) 38%, transparent) !important' },
+  '.cm-content ::selection': { background: 'color-mix(in srgb, var(--accent) 38%, transparent) !important' },
+  '.cm-selectionMatch': {
+    background: 'color-mix(in srgb, var(--accent) 18%, transparent) !important',
+    outline: '1px solid color-mix(in srgb, var(--accent) 30%, transparent)',
+  },
+  '.cm-searchMatch': {
+    background: 'color-mix(in srgb, var(--warning) 20%, transparent) !important',
+    outline: '1px solid color-mix(in srgb, var(--warning) 34%, transparent)',
+  },
+  '.cm-searchMatch.cm-searchMatch-selected': {
+    background: 'color-mix(in srgb, var(--warning) 32%, transparent) !important',
+  },
   '.cm-activeLine': { background: 'rgba(255,255,255,0.03)' },
   '.cm-gutters': {
     background: 'var(--surface)', color: 'var(--text-muted)',
@@ -29,12 +41,24 @@ const _darkTheme = EditorView.theme({
 }, { dark: true })
 
 const _lightTheme = EditorView.theme({
-  '&': { background: 'var(--bg)', color: 'var(--text)' },
-  '.cm-scroller': { background: 'var(--bg)' },
+  '&': { background: 'var(--surface)', color: 'var(--text)' },
+  '.cm-scroller': { background: 'var(--surface)' },
   '.cm-content': { caretColor: 'var(--accent)' },
   '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--accent)' },
   '&.cm-focused .cm-selectionBackground, .cm-selectionBackground':
-    { background: 'rgba(80,130,240,0.22) !important' },
+    { background: 'color-mix(in srgb, var(--accent) 24%, transparent) !important' },
+  '.cm-content ::selection': { background: 'color-mix(in srgb, var(--accent) 24%, transparent) !important' },
+  '.cm-selectionMatch': {
+    background: 'color-mix(in srgb, var(--accent) 12%, transparent) !important',
+    outline: '1px solid color-mix(in srgb, var(--accent) 22%, transparent)',
+  },
+  '.cm-searchMatch': {
+    background: 'color-mix(in srgb, var(--warning) 18%, transparent) !important',
+    outline: '1px solid color-mix(in srgb, var(--warning) 28%, transparent)',
+  },
+  '.cm-searchMatch.cm-searchMatch-selected': {
+    background: 'color-mix(in srgb, var(--warning) 28%, transparent) !important',
+  },
   '.cm-activeLine': { background: 'rgba(0,0,0,0.03)' },
   '.cm-gutters': {
     background: 'var(--surface)', color: 'var(--text-muted)',
