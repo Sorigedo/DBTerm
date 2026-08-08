@@ -258,6 +258,10 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
   const hasConnectedRef = useRef(false)
   // 当前会话 run_id：过滤旧会话的迟到事件
   const runIdRef = useRef('')
+  // 初始命令按 SSH run_id 去重，避免重复 connected 事件导致重复执行。
+  const sshInitSentRunRef = useRef('')
+  const sshInitPendingRef = useRef<{ runId: string; command: string } | null>(null)
+  const sshInitTimerRef = useRef<number | null>(null)
   // MFA 交互式认证请求（keyboard-interactive 提示）
   const [mfaReq, setMfaReq] = useState<MfaRequest | null>(null)
 
@@ -792,6 +796,7 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
       if (!f) {
         const c = colorizeLog(bytes)
         xterm.write(c ?? bytes)
+        if (!localConn && sshInitPendingRef.current) scheduleSshInit()
         scheduleCwdUpdate()
         return
       }
@@ -804,6 +809,7 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
         const c = colorizeLog(bytes); xterm.write(c ?? bytes)
         trzszTail = text.length >= TRZSZ_MARK.length ? text.slice(-(TRZSZ_MARK.length - 1)) : (trzszTail + text).slice(-(TRZSZ_MARK.length - 1))
       }
+      if (!localConn && sshInitPendingRef.current) scheduleSshInit()
       scheduleCwdUpdate()
     }
 
@@ -918,6 +924,26 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
     updateShift()
 
     const localConn = connType === 'local'
+    const clearSshInitTimer = () => {
+      if (sshInitTimerRef.current !== null) {
+        window.clearTimeout(sshInitTimerRef.current)
+        sshInitTimerRef.current = null
+      }
+    }
+    const scheduleSshInit = (wait = 180) => {
+      clearSshInitTimer()
+      sshInitTimerRef.current = window.setTimeout(() => {
+        sshInitTimerRef.current = null
+        const pending = sshInitPendingRef.current
+        if (!pending || pending.runId === sshInitSentRunRef.current || !mountedRef.current) return
+        sshInitSentRunRef.current = pending.runId
+        sshInitPendingRef.current = null
+        import('@tauri-apps/api/core').then(({ invoke }) => {
+          const b = Array.from(new TextEncoder().encode(pending.command + '\r'))
+          invoke('write_to_ssh', { id: sessionId, data: b }).catch(() => {})
+        })
+      }, wait)
+    }
 
     xterm.onData((data) => {
       if (data === '\r' && Date.now() <= imeSuppressReturnUntilRef.current) {
@@ -1144,6 +1170,7 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
           }),
           listen<{ id: string; runId?: string }>('ssh:connected', (ev) => {
             if (staleEvent(ev.payload)) return
+            const connectedRunId = ev.payload.runId || runIdRef.current
             hasConnectedRef.current = true
             reconnectAttempts.delete(connectionId)
             sshErrorRef.current = null
@@ -1164,13 +1191,10 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
               }
             }
             if (sshInitCmd && isTauri) {
-              setTimeout(() => {
-                if (!mountedRef.current) return
-                import('@tauri-apps/api/core').then(({ invoke }) => {
-                  const b = Array.from(new TextEncoder().encode(sshInitCmd + '\r'))
-                  invoke('write_to_ssh', { id: sessionId, data: b }).catch(() => {})
-                })
-              }, 400)
+              // 等 Shell 首轮输出安静下来再注入，避免命令回显跑到首个提示符之前。
+              // 没有输出的极简 Shell 走兜底定时器；同一 run_id 始终只发送一次。
+              sshInitPendingRef.current = { runId: connectedRunId, command: sshInitCmd }
+              scheduleSshInit(1200)
             }
           }),
           listen<{ id: string; runId?: string }>('ssh:disconnected', (ev) => {
@@ -1286,6 +1310,8 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
       cancelAnimationFrame(shiftRaf)
       cancelAnimationFrame(resizeRaf)
       cancelAnimationFrame(cwdRaf)
+      clearSshInitTimer()
+      sshInitPendingRef.current = null
       ro.disconnect()
       helperTextarea?.removeEventListener('compositionstart', onImeStart)
       helperTextarea?.removeEventListener('keydown', onImeKeyDown)

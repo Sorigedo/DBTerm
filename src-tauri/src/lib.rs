@@ -2,11 +2,12 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
     sync::atomic::{AtomicBool, Ordering},
+    sync::{Arc, Mutex},
 };
-use tauri::Manager;
+use sha2::{Digest, Sha256};
 use tauri::Emitter;
+use tauri::Manager;
 
 mod commands;
 mod db_tunnel;
@@ -17,19 +18,19 @@ mod ssh;
 mod storage;
 mod tester;
 
-use pty::PtyState;
-use storage::{Storage, StorageState};
-use ssh::SshState;
-use commands::db_tx::TxState;
 use commands::db_export::ExportCancelMap;
-use commands::redis::RedisPool;
-use commands::redis::server::RedisReadonly;
-use commands::sqlite_admin::SqliteAttachMap;
-use commands::mongo::MongoPool;
-use commands::mongo::tx::MongoTxMap;
-use commands::duckdb::DuckPool;
+use commands::db_tx::TxState;
 use commands::driver::DriverRegistry;
+use commands::duckdb::DuckPool;
+use commands::mongo::tx::MongoTxMap;
+use commands::mongo::MongoPool;
+use commands::redis::server::RedisReadonly;
+use commands::redis::RedisPool;
+use commands::sqlite_admin::SqliteAttachMap;
 use commands::sqlserver::SsPool;
+use pty::PtyState;
+use ssh::SshState;
+use storage::{Storage, StorageState};
 
 #[derive(serde::Serialize)]
 struct DocumentConverterProbe {
@@ -44,51 +45,138 @@ struct DocumentConvertResult {
     engine: String,
 }
 
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DocumentConverterInstallProgress {
+    component: String,
+    stage: String,
+    downloaded: u64,
+    total: u64,
+    done: bool,
+    error: Option<String>,
+}
+
 fn validate_local_path(path: &str, action: &str) -> Result<PathBuf, String> {
     let p = PathBuf::from(path);
     if !p.is_absolute() {
         return Err("只允许绝对路径".to_string());
     }
-    if p.components().any(|c| {
-        matches!(c, std::path::Component::Normal(s) if s.to_string_lossy().starts_with('.'))
-    }) {
+    if p.components().any(
+        |c| matches!(c, std::path::Component::Normal(s) if s.to_string_lossy().starts_with('.')),
+    ) {
         return Err(format!("不允许{action}隐藏目录或隐藏文件"));
     }
     Ok(p)
 }
 
-fn find_command(candidates: &[&str], version_arg: &str) -> Option<PathBuf> {
-    for candidate in candidates {
-        let path = PathBuf::from(candidate);
-        let output = Command::new(&path).arg(version_arg).output();
+fn find_command(candidates: &[PathBuf], version_arg: &str) -> Option<PathBuf> {
+    for path in candidates {
+        let output = Command::new(path).arg(version_arg).output();
         if output.is_ok() {
-            return Some(path);
+            return Some(path.clone());
         }
     }
     None
 }
 
-fn find_soffice() -> Option<PathBuf> {
-    find_command(
-        &[
-            "/Applications/LibreOffice.app/Contents/MacOS/soffice",
-            "/Applications/OpenOffice.app/Contents/MacOS/soffice",
-            "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
-            "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
-            "C:\\Program Files\\OpenOffice 4\\program\\soffice.exe",
-            "/usr/bin/soffice",
-            "/usr/local/bin/soffice",
-            "/snap/bin/libreoffice",
-            "soffice",
-            "soffice.exe",
-            "libreoffice",
-        ],
-        "--version",
-    )
+fn bundled_converter_roots(app: Option<&tauri::AppHandle>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(path) = std::env::var("DBTERM_CONVERTER_DIR") {
+        roots.push(PathBuf::from(path));
+    }
+    if let Some(app) = app {
+        if let Ok(app_data_dir) = app.path().app_data_dir() {
+            roots.push(app_data_dir.join("converters"));
+        }
+        if let Ok(resource_dir) = app.path().resource_dir() {
+            roots.push(resource_dir.join("converters"));
+            roots.push(resource_dir.join("resources").join("converters"));
+        }
+    }
+    roots
 }
 
-fn find_pdftotext() -> Option<PathBuf> {
-    find_command(&["pdftotext", "/opt/homebrew/bin/pdftotext", "/usr/local/bin/pdftotext"], "-v")
+fn app_converter_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map_err(|e| format!("获取组件目录失败：{e}"))
+        .map(|dir| dir.join("converters"))
+}
+
+fn bundled_soffice_candidates(app: Option<&tauri::AppHandle>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for root in bundled_converter_roots(app) {
+        candidates.extend([
+            root.join("libreoffice")
+                .join("macos")
+                .join("LibreOffice.app")
+                .join("Contents")
+                .join("MacOS")
+                .join("soffice"),
+            root.join("libreoffice")
+                .join("macos")
+                .join("program")
+                .join("soffice"),
+            root.join("libreoffice").join("macos").join("soffice"),
+            root.join("libreoffice")
+                .join("windows")
+                .join("program")
+                .join("soffice.exe"),
+            root.join("libreoffice").join("windows").join("soffice.exe"),
+            root.join("libreoffice")
+                .join("linux")
+                .join("program")
+                .join("soffice"),
+            root.join("libreoffice").join("linux").join("soffice"),
+        ]);
+    }
+    candidates
+}
+
+fn system_soffice_candidates() -> Vec<PathBuf> {
+    [
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        "/Applications/OpenOffice.app/Contents/MacOS/soffice",
+        "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
+        "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
+        "C:\\Program Files\\OpenOffice 4\\program\\soffice.exe",
+        "/usr/bin/soffice",
+        "/usr/local/bin/soffice",
+        "/snap/bin/libreoffice",
+        "soffice",
+        "soffice.exe",
+        "libreoffice",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
+}
+
+fn find_soffice(app: Option<&tauri::AppHandle>) -> Option<PathBuf> {
+    let mut candidates = bundled_soffice_candidates(app);
+    candidates.extend(system_soffice_candidates());
+    find_command(&candidates, "--version")
+}
+
+fn find_pdftotext(app: Option<&tauri::AppHandle>) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for root in bundled_converter_roots(app) {
+        candidates.extend([
+            root.join("poppler").join("macos").join("pdftotext"),
+            root.join("poppler").join("windows").join("pdftotext.exe"),
+            root.join("poppler").join("linux").join("pdftotext"),
+        ]);
+    }
+    candidates.extend(
+        [
+            "pdftotext",
+            "/opt/homebrew/bin/pdftotext",
+            "/usr/local/bin/pdftotext",
+        ]
+        .into_iter()
+        .map(PathBuf::from),
+    );
+    find_command(&candidates, "-v")
 }
 
 fn file_stem(path: &Path) -> Result<String, String> {
@@ -96,6 +184,31 @@ fn file_stem(path: &Path) -> Result<String, String> {
         .map(|s| s.to_string_lossy().to_string())
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| "无法识别文件名".to_string())
+}
+
+fn find_generated_document(temp_dir: &Path, input: &Path, target_ext: &str) -> Result<PathBuf, String> {
+    let exact = temp_dir.join(format!("{}.{}", file_stem(input)?, target_ext));
+    if exact.exists() {
+        return Ok(exact);
+    }
+
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(temp_dir).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.is_file() {
+            candidates.push(path);
+        }
+    }
+
+    candidates
+        .iter()
+        .find(|path| {
+            path.extension()
+                .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case(target_ext))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .ok_or_else(|| format!("转换器未生成目标文件，输出目录内容：{:?}", candidates))
 }
 
 #[tauri::command]
@@ -117,23 +230,431 @@ fn write_local_bytes(path: String, bytes: Vec<u8>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn document_converter_probe() -> DocumentConverterProbe {
-    if let Some(path) = find_soffice() {
+fn document_converter_probe(app: tauri::AppHandle) -> DocumentConverterProbe {
+    if let Some(path) = find_soffice(Some(&app)) {
         return DocumentConverterProbe {
             available: true,
             path: Some(path.to_string_lossy().to_string()),
-            message: "已找到 LibreOffice/soffice，可转换 Word、Excel、PPT、TXT、HTML、PDF 等文档。".to_string(),
+            message: "已找到内置文档转换引擎，可转换 Word、Excel、PPT、TXT、HTML、PDF 等文档。"
+                .to_string(),
         };
     }
     DocumentConverterProbe {
         available: false,
         path: None,
-        message: "未找到 LibreOffice/soffice。请安装 LibreOffice，或把 soffice 加入 PATH 后重试。".to_string(),
+        message: "当前安装包未包含文档转换组件，无法进行 Office/PDF 互转。请使用包含转换组件的完整安装包。".to_string(),
     }
 }
 
 #[tauri::command]
-fn convert_document_file(input_path: String, output_path: String, output_format: String) -> Result<DocumentConvertResult, String> {
+fn open_document_converter_dir(app: tauri::AppHandle) -> Result<String, String> {
+    let dir = app_converter_dir(&app)?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建组件目录失败：{e}"))?;
+    open::that(&dir).map_err(|e| format!("打开组件目录失败：{e}"))?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+fn emit_converter_install_progress(
+    app: &tauri::AppHandle,
+    component: &str,
+    stage: &str,
+    downloaded: u64,
+    total: u64,
+    done: bool,
+    error: Option<String>,
+) {
+    let _ = app.emit(
+        "document-converter-install-progress",
+        DocumentConverterInstallProgress {
+            component: component.to_string(),
+            stage: stage.to_string(),
+            downloaded,
+            total,
+            done,
+            error,
+        },
+    );
+}
+
+fn validate_https_download_url(url: &str) -> Result<(), String> {
+    let rest = url
+        .trim()
+        .strip_prefix("https://")
+        .ok_or_else(|| "转换组件下载仅允许 HTTPS 地址".to_string())?;
+    if rest.split(['/', '?', '#']).next().unwrap_or("").is_empty() {
+        return Err("转换组件下载地址缺少主机名".to_string());
+    }
+    Ok(())
+}
+
+fn libreoffice_download_spec() -> Result<(&'static str, &'static str, &'static str), String> {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        return Ok((
+            "https://download.documentfoundation.org/libreoffice/stable/26.2.5/win/x86_64/LibreOffice_26.2.5_Win_x86-64.msi",
+            "LibreOffice_26.2.5_Win_x86-64.msi",
+            "f15ba07bfcb0186986cf3171063506f5d207c11f8cc051ba0d135209e9e915f9",
+        ));
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        return Ok((
+            "https://download.documentfoundation.org/libreoffice/stable/26.2.5/mac/aarch64/LibreOffice_26.2.5_MacOS_aarch64.dmg",
+            "LibreOffice_26.2.5_MacOS_aarch64.dmg",
+            "c99fb4fe574437fc4cb820a4ca15271bca325920861f7139858b36d7f9df78ad",
+        ));
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        return Ok((
+            "https://download.documentfoundation.org/libreoffice/stable/26.2.5/mac/x86_64/LibreOffice_26.2.5_MacOS_x86-64.dmg",
+            "LibreOffice_26.2.5_MacOS_x86-64.dmg",
+            "e26180298685274b54aa7fe6e1101c65465a372f457a6748ebd642720811db36",
+        ));
+    }
+    #[allow(unreachable_code)]
+    Err("当前平台暂不支持自动下载 LibreOffice 转换组件".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn poppler_download_spec() -> Result<(&'static str, &'static str, &'static str), String> {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        return Ok((
+            "https://github.com/oschwartz10612/poppler-windows/releases/download/v26.02.0-0/Release-26.02.0-0.zip",
+            "Release-26.02.0-0.zip",
+            "993e4a94376ed712fafc7058d724ea0b943d118bbd2305cd9ed55174eb85cda5",
+        ));
+    }
+    #[allow(unreachable_code)]
+    Err("当前平台暂不需要自动下载 Poppler 组件".to_string())
+}
+
+async fn download_converter_package(
+    app: &tauri::AppHandle,
+    component: &str,
+    url: &str,
+    file_name: &str,
+    expected_sha256: &str,
+    work_dir: &Path,
+) -> Result<PathBuf, String> {
+    validate_https_download_url(url)?;
+    std::fs::create_dir_all(work_dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
+    let dest = work_dir.join(file_name);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(900))
+        .build()
+        .map_err(|e| format!("HTTP 客户端初始化失败：{e}"))?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("下载请求失败：{e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("下载失败：HTTP {}", response.status()));
+    }
+
+    let total = response.content_length().unwrap_or(0);
+    let mut downloaded = 0_u64;
+    let mut hasher = Sha256::new();
+    let mut file = tokio::fs::File::create(&dest)
+        .await
+        .map_err(|e| format!("创建下载文件失败：{e}"))?;
+    let mut stream = response.bytes_stream();
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    const MAX_BYTES: u64 = 900 * 1024 * 1024;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("读取下载数据失败：{e}"))?;
+        downloaded += chunk.len() as u64;
+        if downloaded > MAX_BYTES {
+            return Err("下载文件超过 900 MB，已中止".to_string());
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("写入下载文件失败：{e}"))?;
+        emit_converter_install_progress(app, component, "下载中", downloaded, total, false, None);
+    }
+    file.flush()
+        .await
+        .map_err(|e| format!("刷新下载文件失败：{e}"))?;
+
+    let actual = hex::encode(hasher.finalize());
+    if actual != expected_sha256 {
+        let _ = std::fs::remove_file(&dest);
+        return Err(format!(
+            "SHA-256 校验失败：期望 {expected_sha256}，实际 {actual}"
+        ));
+    }
+    Ok(dest)
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("创建目录失败：{e}"))?;
+    for entry in std::fs::read_dir(src).map_err(|e| format!("读取目录失败：{e}"))? {
+        let entry = entry.map_err(|e| format!("遍历目录失败：{e}"))?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else if src_path.is_file() {
+            if let Some(parent) = dst_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{e}"))?;
+            }
+            std::fs::copy(&src_path, &dst_path)
+                .map_err(|e| format!("复制文件失败 {:?}: {e}", src_path))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn find_file_by_name(root: &Path, file_name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .file_name()
+                .map(|name| name.to_string_lossy().eq_ignore_ascii_case(file_name))
+                .unwrap_or(false)
+        {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(found) = find_file_by_name(&path, file_name) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn install_libreoffice_package(package: &Path, target_dir: &Path, work_dir: &Path) -> Result<(), String> {
+    let extract_dir = work_dir.join("libreoffice-msi");
+    if extract_dir.exists() {
+        let _ = std::fs::remove_dir_all(&extract_dir);
+    }
+    std::fs::create_dir_all(&extract_dir).map_err(|e| format!("创建解包目录失败：{e}"))?;
+    let status = Command::new("msiexec")
+        .arg("/a")
+        .arg(package)
+        .arg("/qn")
+        .arg(format!("TARGETDIR={}", extract_dir.to_string_lossy()))
+        .status()
+        .map_err(|e| format!("启动 MSI 解包失败：{e}"))?;
+    if !status.success() {
+        return Err(format!("MSI 解包失败，退出码：{status}"));
+    }
+    let soffice = find_file_by_name(&extract_dir, "soffice.exe")
+        .ok_or_else(|| "LibreOffice 包内未找到 soffice.exe".to_string())?;
+    let source_root = soffice
+        .parent()
+        .and_then(|p| {
+            if p.file_name()
+                .map(|name| name.to_string_lossy().eq_ignore_ascii_case("program"))
+                .unwrap_or(false)
+            {
+                p.parent()
+            } else {
+                Some(p)
+            }
+        })
+        .ok_or_else(|| "无法识别 LibreOffice 解包目录".to_string())?;
+    if target_dir.exists() {
+        let _ = std::fs::remove_dir_all(target_dir);
+    }
+    copy_dir_recursive(source_root, target_dir)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_libreoffice_package(package: &Path, target_dir: &Path, work_dir: &Path) -> Result<(), String> {
+    let mount_dir = work_dir.join("libreoffice-dmg");
+    if mount_dir.exists() {
+        let _ = Command::new("hdiutil")
+            .args(["detach", &mount_dir.to_string_lossy(), "-force", "-quiet"])
+            .output();
+        let _ = std::fs::remove_dir_all(&mount_dir);
+    }
+    std::fs::create_dir_all(&mount_dir).map_err(|e| format!("创建挂载目录失败：{e}"))?;
+    let attach = Command::new("hdiutil")
+        .args([
+            "attach",
+            &package.to_string_lossy(),
+            "-mountpoint",
+            &mount_dir.to_string_lossy(),
+            "-quiet",
+            "-nobrowse",
+            "-noverify",
+            "-readonly",
+        ])
+        .output()
+        .map_err(|e| format!("挂载 DMG 失败：{e}"))?;
+    if !attach.status.success() {
+        let _ = std::fs::remove_dir_all(&mount_dir);
+        return Err(format!(
+            "挂载 DMG 失败：{}",
+            String::from_utf8_lossy(&attach.stderr)
+        ));
+    }
+
+    let copy_result = (|| {
+        let app_path = mount_dir.join("LibreOffice.app");
+        if !app_path.exists() {
+            return Err("DMG 内未找到 LibreOffice.app".to_string());
+        }
+        std::fs::create_dir_all(target_dir).map_err(|e| format!("创建组件目录失败：{e}"))?;
+        let target_app = target_dir.join("LibreOffice.app");
+        if target_app.exists() {
+            let _ = std::fs::remove_dir_all(&target_app);
+        }
+        let status = Command::new("cp")
+            .arg("-R")
+            .arg(&app_path)
+            .arg(target_dir)
+            .status()
+            .map_err(|e| format!("复制 LibreOffice.app 失败：{e}"))?;
+        if !status.success() {
+            return Err(format!("复制 LibreOffice.app 失败，退出码：{status}"));
+        }
+        Ok(())
+    })();
+
+    let _ = Command::new("hdiutil")
+        .args(["detach", &mount_dir.to_string_lossy(), "-force", "-quiet"])
+        .output();
+    let _ = std::fs::remove_dir_all(&mount_dir);
+    copy_result
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn install_libreoffice_package(_package: &Path, _target_dir: &Path, _work_dir: &Path) -> Result<(), String> {
+    Err("当前平台暂不支持自动安装 LibreOffice 转换组件".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn install_poppler_package(package: &Path, target_dir: &Path) -> Result<(), String> {
+    use std::io::Read;
+    let file = std::fs::File::open(package).map_err(|e| format!("打开 Poppler 包失败：{e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("读取 Poppler zip 失败：{e}"))?;
+    let staging = target_dir.with_file_name("windows-staging");
+    if staging.exists() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    std::fs::create_dir_all(&staging).map_err(|e| format!("创建 Poppler 解压目录失败：{e}"))?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|e| format!("读取 Poppler 压缩条目失败：{e}"))?;
+        let raw_name = entry.name().replace('\\', "/");
+        let Some((_, rel)) = raw_name.split_once("/Library/bin/").or_else(|| {
+            raw_name
+                .strip_prefix("Library/bin/")
+                .map(|rest| ("", rest))
+        }) else {
+            continue;
+        };
+        if rel.is_empty() || rel.ends_with('/') || rel.contains("..") || rel.contains('/') {
+            continue;
+        }
+        let out_path = staging.join(rel);
+        let mut bytes = Vec::new();
+        entry
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("读取 Poppler 文件失败：{e}"))?;
+        std::fs::write(&out_path, bytes).map_err(|e| format!("写出 Poppler 文件失败：{e}"))?;
+    }
+
+    if !staging.join("pdftotext.exe").exists() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err("Poppler 包内未找到 pdftotext.exe".to_string());
+    }
+    if target_dir.exists() {
+        let _ = std::fs::remove_dir_all(target_dir);
+    }
+    if let Some(parent) = target_dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 Poppler 目录失败：{e}"))?;
+    }
+    std::fs::rename(&staging, target_dir).or_else(|_| {
+        copy_dir_recursive(&staging, target_dir)?;
+        let _ = std::fs::remove_dir_all(&staging);
+        Ok::<(), String>(())
+    })?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn install_document_converter_components(
+    app: tauri::AppHandle,
+) -> Result<DocumentConverterProbe, String> {
+    let root = app_converter_dir(&app)?;
+    std::fs::create_dir_all(&root).map_err(|e| format!("创建组件目录失败：{e}"))?;
+    let work_dir =
+        std::env::temp_dir().join(format!("dbterm-converter-install-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&work_dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
+
+    let result = async {
+        if find_soffice(Some(&app)).is_none() {
+            let (default_url, file_name, sha256) = libreoffice_download_spec()?;
+            let url = std::env::var("DBTERM_LIBREOFFICE_URL").unwrap_or_else(|_| default_url.to_string());
+            emit_converter_install_progress(&app, "LibreOffice", "准备下载", 0, 0, false, None);
+            let package =
+                download_converter_package(&app, "LibreOffice", &url, file_name, sha256, &work_dir)
+                    .await?;
+            emit_converter_install_progress(&app, "LibreOffice", "安装中", 0, 0, false, None);
+            install_libreoffice_package(&package, &root.join("libreoffice").join(current_os()), &work_dir)?;
+        }
+
+        #[cfg(target_os = "windows")]
+        if find_pdftotext(Some(&app)).is_none() {
+            let (default_url, file_name, sha256) = poppler_download_spec()?;
+            let url = std::env::var("DBTERM_POPPLER_URL").unwrap_or_else(|_| default_url.to_string());
+            emit_converter_install_progress(&app, "Poppler", "准备下载", 0, 0, false, None);
+            let package =
+                download_converter_package(&app, "Poppler", &url, file_name, sha256, &work_dir)
+                    .await?;
+            emit_converter_install_progress(&app, "Poppler", "安装中", 0, 0, false, None);
+            install_poppler_package(&package, &root.join("poppler").join("windows"))?;
+        }
+
+        Ok::<(), String>(())
+    }
+    .await;
+
+    let _ = std::fs::remove_dir_all(&work_dir);
+    match result {
+        Ok(()) => {
+            emit_converter_install_progress(&app, "全部组件", "安装完成", 0, 0, true, None);
+            Ok(document_converter_probe(app))
+        }
+        Err(error) => {
+            emit_converter_install_progress(
+                &app,
+                "转换组件",
+                "安装失败",
+                0,
+                0,
+                true,
+                Some(error.clone()),
+            );
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+fn convert_document_file(
+    app: tauri::AppHandle,
+    input_path: String,
+    output_path: String,
+    output_format: String,
+) -> Result<DocumentConvertResult, String> {
     let input = validate_local_path(&input_path, "读取")?;
     let output = validate_local_path(&output_path, "写入")?;
     if !input.exists() {
@@ -147,9 +668,15 @@ fn convert_document_file(input_path: String, output_path: String, output_format:
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
-    let input_ext = input.extension().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let input_ext = input
+        .extension()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if input_ext == "pdf" && matches!(target_ext.as_str(), "xls" | "xlsx" | "ppt" | "pptx") {
+        return Err("PDF 转 Excel/PPT 需要专门的表格或版面识别引擎，当前内置 LibreOffice 不支持该转换。请先转 Word 或 TXT。".to_string());
+    }
     if input_ext == "pdf" && target_ext == "txt" {
-        if let Some(pdftotext) = find_pdftotext() {
+        if let Some(pdftotext) = find_pdftotext(Some(&app)) {
             let out = Command::new(&pdftotext)
                 .arg("-layout")
                 .arg("-enc")
@@ -167,19 +694,25 @@ fn convert_document_file(input_path: String, output_path: String, output_format:
         }
     }
 
-    let soffice = find_soffice().ok_or_else(|| {
-        "未找到 LibreOffice/soffice，无法进行 Office/PDF 互转。请安装 LibreOffice，或把 soffice 加入 PATH。".to_string()
+    let soffice = find_soffice(Some(&app)).ok_or_else(|| {
+        "当前安装包未包含文档转换组件，无法进行 Office/PDF 互转。请使用包含转换组件的完整安装包。".to_string()
     })?;
-    let temp_dir = std::env::temp_dir().join(format!("dbterm-doc-convert-{}", uuid::Uuid::new_v4()));
+    let temp_dir =
+        std::env::temp_dir().join(format!("dbterm-doc-convert-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+    let profile_dir = temp_dir.join("profile");
 
     let mut cmd = Command::new(&soffice);
     cmd.arg("--headless")
         .arg("--nologo")
         .arg("--nofirststartwizard")
         .arg("--nodefault")
-        .arg("--nolockcheck");
-    if input_ext == "pdf" && matches!(target_ext.as_str(), "doc" | "docx" | "odt" | "rtf") {
+        .arg("--nolockcheck")
+        .arg(format!(
+            "-env:UserInstallation=file://{}",
+            profile_dir.to_string_lossy()
+        ));
+    if input_ext == "pdf" && matches!(target_ext.as_str(), "doc" | "docx" | "odt" | "rtf" | "txt") {
         cmd.arg("--infilter=writer_pdf_import");
     }
     cmd.arg("--convert-to")
@@ -188,7 +721,9 @@ fn convert_document_file(input_path: String, output_path: String, output_format:
         .arg(&temp_dir)
         .arg(&input);
 
-    let out = cmd.output().map_err(|e| format!("启动 LibreOffice 失败：{e}"))?;
+    let out = cmd
+        .output()
+        .map_err(|e| format!("启动 LibreOffice 失败：{e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -196,15 +731,15 @@ fn convert_document_file(input_path: String, output_path: String, output_format:
         return Err(format!("转换失败：{}{}", stdout, stderr));
     }
 
-    let generated = temp_dir.join(format!("{}.{}", file_stem(&input)?, target_ext));
-    if !generated.exists() {
-        let candidates = std::fs::read_dir(&temp_dir)
-            .map_err(|e| e.to_string())?
-            .filter_map(|entry| entry.ok().map(|item| item.path()))
-            .collect::<Vec<_>>();
+    let generated = match find_generated_document(&temp_dir, &input, &target_ext) {
+        Ok(path) => path,
+        Err(error) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
         let _ = std::fs::remove_dir_all(&temp_dir);
-        return Err(format!("转换器未生成目标文件，输出目录内容：{:?}", candidates));
-    }
+            return Err(format!("{error}。转换器输出：{}{}", stdout, stderr));
+        }
+    };
     std::fs::rename(&generated, &output)
         .or_else(|_| std::fs::copy(&generated, &output).map(|_| ()))
         .map_err(|e| e.to_string())?;
@@ -235,26 +770,34 @@ fn open_url(url: String) -> Result<(), String> {
 
 #[tauri::command]
 fn current_os() -> &'static str {
-    #[cfg(target_os = "macos")]  return "macos";
-    #[cfg(target_os = "windows")] return "windows";
-    #[cfg(target_os = "linux")]   return "linux";
-    #[allow(unreachable_code)] "unknown"
+    #[cfg(target_os = "macos")]
+    return "macos";
+    #[cfg(target_os = "windows")]
+    return "windows";
+    #[cfg(target_os = "linux")]
+    return "linux";
+    #[allow(unreachable_code)]
+    "unknown"
 }
 
 /// macOS：覆写 NSApp delegate 的 applicationShouldTerminate:，拦截程序坞/Cmd+Q/菜单退出。
 /// Tauri 的 prevent_exit 挂不到 AppKit 的优雅终止路径，必须在此返回 NSTerminateCancel。
 #[cfg(target_os = "macos")]
 mod macos_quit {
-    use std::sync::OnceLock;
-    use std::sync::atomic::Ordering;
     use objc2::runtime::{AnyObject, Sel};
     use objc2::{class, msg_send, sel};
+    use std::sync::atomic::Ordering;
+    use std::sync::OnceLock;
     use tauri::{AppHandle, Emitter};
 
     static APP: OnceLock<AppHandle> = OnceLock::new();
 
     // 返回 NSApplicationTerminateReply：0=Cancel，1=Now，2=Later
-    extern "C-unwind" fn should_terminate(_this: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) -> usize {
+    extern "C-unwind" fn should_terminate(
+        _this: *mut AnyObject,
+        _cmd: Sel,
+        _sender: *mut AnyObject,
+    ) -> usize {
         if super::EXIT_CONFIRMED.load(Ordering::SeqCst) {
             return 1; // NSTerminateNow
         }
@@ -274,7 +817,8 @@ mod macos_quit {
             }
             let cls: *const objc2::runtime::AnyClass = msg_send![delegate, class];
             let imp: unsafe extern "C-unwind" fn() = std::mem::transmute(
-                should_terminate as extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject) -> usize,
+                should_terminate
+                    as extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject) -> usize,
             );
             // 替换（或新增）applicationShouldTerminate: 方法；类型编码 Q@:@（NSUInteger, self, _cmd, id）
             objc2::ffi::class_replaceMethod(
@@ -301,15 +845,13 @@ pub fn run() {
 
             // 连接配置存储 & 密码文件存储
             // debug 构建用独立的 -dev 子目录，与 release 数据隔离，避免测试连接污染生产包
-            let prod_dir = app
-                .path()
-                .app_data_dir()
-                .expect("无法获取应用数据目录");
+            let prod_dir = app.path().app_data_dir().expect("无法获取应用数据目录");
             let data_dir = if cfg!(debug_assertions) {
                 // 取 prod 目录名追加 -dev（不硬编码 identifier，改名也不会漂移）
                 match (prod_dir.parent(), prod_dir.file_name()) {
-                    (Some(parent), Some(name)) =>
-                        parent.join(format!("{}-dev", name.to_string_lossy())),
+                    (Some(parent), Some(name)) => {
+                        parent.join(format!("{}-dev", name.to_string_lossy()))
+                    }
                     _ => prod_dir,
                 }
             } else {
@@ -340,7 +882,9 @@ pub fn run() {
                     loop {
                         tick.tick().await;
                         let n = commands::db_tx::cleanup_stale_txns(&tx_state_bg).await;
-                        if n > 0 { log::info!("已回收 {n} 个僵尸事务（释放 DB 锁）"); }
+                        if n > 0 {
+                            log::info!("已回收 {n} 个僵尸事务（释放 DB 锁）");
+                        }
                     }
                 });
             }
@@ -355,7 +899,8 @@ pub fn run() {
             app.manage(redis_pool);
 
             // Redis 只读模式集合
-            let redis_readonly: RedisReadonly = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+            let redis_readonly: RedisReadonly =
+                Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
             app.manage(redis_readonly);
 
             // SQLite ATTACH 状态（conn_id → Vec<(alias, path)>）
@@ -363,7 +908,8 @@ pub fn run() {
             app.manage(sqlite_attach);
 
             // SQLite 文件监控状态（conn_id → notify watcher）
-            let sqlite_watchers: commands::sqlite_admin::SqliteWatcherMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+            let sqlite_watchers: commands::sqlite_admin::SqliteWatcherMap =
+                Arc::new(std::sync::Mutex::new(HashMap::new()));
             app.manage(sqlite_watchers);
 
             // MongoDB 连接池（conn_id → Client + 隧道守卫）
@@ -375,7 +921,8 @@ pub fn run() {
             app.manage(mongo_tx);
 
             // MongoDB Change Streams 监听任务状态（MO11.2）
-            let mongo_watch: commands::mongo::stream::MongoWatchMap = commands::mongo::stream::init_watch_map();
+            let mongo_watch: commands::mongo::stream::MongoWatchMap =
+                commands::mongo::stream::init_watch_map();
             app.manage(mongo_watch);
 
             // DuckDB 连接池（conn_id → DuckConnState，通过 libloading C API 访问）
@@ -762,6 +1309,8 @@ pub fn run() {
             write_local_file,
             write_local_bytes,
             document_converter_probe,
+            open_document_converter_dir,
+            install_document_converter_components,
             convert_document_file,
             // SQLite 可选增强：EXPLAIN 字节码 / AUTOINCREMENT 计数器 / 文件变更监控
             commands::sqlite_admin::sqlite_explain_bytecode,

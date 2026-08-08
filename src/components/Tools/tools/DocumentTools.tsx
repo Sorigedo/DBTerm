@@ -1,6 +1,7 @@
 import MarkdownIt from 'markdown-it'
-import { ArrowRight, FileDown, FileInput, FileSpreadsheet, FileText, FileType2, Loader2, Presentation, Save, Settings2 } from 'lucide-react'
+import { ArrowRight, Download, FileDown, FileInput, FileSpreadsheet, FileText, FileType2, FolderOpen, Loader2, Presentation, RefreshCw, Save, Settings2, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
+import { createPortal } from 'react-dom'
 import { toast } from '../../../stores/toastStore'
 
 const A4_WIDTH_PX = 794
@@ -13,7 +14,7 @@ const BODY_CONTENT_HEIGHT_PX = A4_HEIGHT_PX - BODY_PADDING_TOP_PX - BODY_PADDING
 const PAGE_FIT_TOLERANCE_PX = 3
 
 const DOC_TO_PDF_EXTS = ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'csv', 'html', 'htm', 'rtf', 'odt', 'ods', 'odp', 'md', 'markdown']
-const PDF_TARGETS = ['docx', 'xlsx', 'pptx', 'txt']
+const PDF_TARGETS = ['docx', 'txt']
 const TEXT_EXTS = ['md', 'markdown', 'txt']
 
 const markdown = new MarkdownIt({ html: false, linkify: true, typographer: true })
@@ -21,6 +22,21 @@ const markdown = new MarkdownIt({ html: false, linkify: true, typographer: true 
 type ConvertResult = {
   path: string
   engine: string
+}
+
+type ConverterProbe = {
+  available: boolean
+  path: string | null
+  message: string
+}
+
+type ConverterInstallProgress = {
+  component: string
+  stage: string
+  downloaded: number
+  total: number
+  done: boolean
+  error: string | null
 }
 
 function isTauri() {
@@ -455,6 +471,71 @@ function targetIcon(ext: string) {
   return <FileType2 size={15} />
 }
 
+function ConverterMissingModal({ installing, progress, onClose, onInstall, onRetry }: {
+  installing: boolean
+  progress: ConverterInstallProgress | null
+  onClose: () => void
+  onInstall: () => void
+  onRetry: () => void
+}) {
+  const openFolder = async () => {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core')
+      const path = await invoke<string>('open_document_converter_dir')
+      toast.success(`组件目录：${path}`)
+    } catch (error) {
+      toast.error(`打开组件目录失败：${String(error)}`)
+    }
+  }
+
+  const percent = progress?.total ? Math.min(100, Math.round(progress.downloaded / progress.total * 100)) : null
+  const sizeText = progress
+    ? progress.total > 0
+      ? `${(progress.downloaded / 1024 / 1024).toFixed(1)} / ${(progress.total / 1024 / 1024).toFixed(1)} MB`
+      : progress.stage
+    : '等待安装'
+
+  return createPortal(
+    <div className="docconvert-modal-mask" onMouseDown={event => event.target === event.currentTarget && !installing && onClose()}>
+      <div className="docconvert-modal" role="dialog" aria-modal="true" aria-label="文档转换组件">
+        <div className="docconvert-modal__head">
+          <div>
+            <strong>需要安装文档转换组件</strong>
+            <span>Office / PDF 互转需要本地转换组件。点击安装后软件会自动下载、校验并放到 DBTerm 组件目录。</span>
+          </div>
+          <button onClick={onClose} aria-label="关闭" disabled={installing}><X size={16} /></button>
+        </div>
+
+        <div className="docconvert-modal__body">
+          <div className="docconvert-install-panel">
+            <div className="docconvert-install-panel__top">
+              <div>
+                <strong>{progress?.component || '文档转换组件'}</strong>
+                <span>{progress?.stage || '将安装 LibreOffice；Windows 会同时安装 Poppler。'}</span>
+              </div>
+              <small>{sizeText}</small>
+            </div>
+            <div className={`docconvert-install-progress${percent === null && installing ? ' is-indeterminate' : ''}`}>
+              <div style={percent === null ? undefined : { width: `${percent}%` }} />
+            </div>
+            {progress?.error && <p className="docconvert-install-error">{progress.error}</p>}
+          </div>
+
+          <div className="docconvert-modal__actions">
+            <button className="primary" onClick={onInstall} disabled={installing}>
+              {installing ? <Loader2 size={14} className="spin" /> : <Download size={14} />}
+              {installing ? '正在安装...' : '立即安装转换组件'}
+            </button>
+            <button onClick={onRetry} disabled={installing}><RefreshCw size={14} />重新检测</button>
+            <button onClick={openFolder} disabled={installing}><FolderOpen size={14} />打开组件目录</button>
+          </div>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  )
+}
+
 export function DocumentConvertTool() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const exportRef = useRef<HTMLDivElement>(null)
@@ -474,6 +555,9 @@ export function DocumentConvertTool() {
   const [watermarkAngle, setWatermarkAngle] = useState(29)
   const [watermarkOpacity, setWatermarkOpacity] = useState(0.06)
   const [busy, setBusy] = useState(false)
+  const [converterModalOpen, setConverterModalOpen] = useState(false)
+  const [converterInstalling, setConverterInstalling] = useState(false)
+  const [converterInstallProgress, setConverterInstallProgress] = useState<ConverterInstallProgress | null>(null)
 
   const inputExt = extName(inputPath || sourceName)
   const targetOptions = useMemo(() => targetOptionsForSource(inputExt), [inputExt])
@@ -485,7 +569,7 @@ export function DocumentConvertTool() {
   const sourceDisplayPath = hasSelectedSource ? (inputPath || sourceName) : 'Word、Excel、PPT、PDF、Markdown、TXT、CSV、HTML'
   const sourceFormatLabel = inputExt ? inputExt.toUpperCase() : '自动识别'
   const hintText = inputExt === 'pdf'
-    ? 'PDF 源文件可转为 Word、Excel、PPT 或 TXT。'
+    ? 'PDF 源文件可转为 Word 或 TXT。'
     : inputExt
       ? `${inputExt.toUpperCase()} 源文件当前可转为 ${targetFormat.toUpperCase()}。`
       : '导入文件后自动匹配可用目标格式。'
@@ -501,6 +585,32 @@ export function DocumentConvertTool() {
   useEffect(() => {
     if (!targetOptions.includes(targetFormat)) setTargetFormat(targetOptions[0] ?? 'pdf')
   }, [targetFormat, targetOptions])
+
+  useEffect(() => {
+    if (!isTauri()) return
+    let disposed = false
+    let unlisten: (() => void) | null = null
+    import('@tauri-apps/api/event')
+      .then(({ listen }) => listen<ConverterInstallProgress>('document-converter-install-progress', event => {
+        if (disposed) return
+        setConverterInstallProgress(event.payload)
+        if (event.payload.done) {
+          setConverterInstalling(false)
+          if (event.payload.error) {
+            toast.error(`组件安装失败：${event.payload.error}`)
+          }
+        }
+      }))
+      .then(fn => {
+        if (disposed) fn()
+        else unlisten = fn
+      })
+      .catch(() => {})
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [])
 
   const setStyledSource = (content: string, name = '') => {
     setSource(content)
@@ -638,6 +748,17 @@ export function DocumentConvertTool() {
       toast.error('文件互转需要在桌面应用中使用')
       return
     }
+    const { invoke } = await import('@tauri-apps/api/core')
+    try {
+      const probe = await invoke<ConverterProbe>('document_converter_probe')
+      if (!probe.available) {
+        setConverterModalOpen(true)
+        return
+      }
+    } catch {
+      setConverterModalOpen(true)
+      return
+    }
     setBusy(true)
     try {
       const { save } = await import('@tauri-apps/plugin-dialog')
@@ -647,7 +768,6 @@ export function DocumentConvertTool() {
         filters: [{ name: formatLabel(targetFormat), extensions: [targetFormat] }],
       })
       if (!outputPath) return
-      const { invoke } = await import('@tauri-apps/api/core')
       const result = await invoke<ConvertResult>('convert_document_file', {
         inputPath,
         outputPath,
@@ -658,6 +778,36 @@ export function DocumentConvertTool() {
       toast.error(`转换失败：${String(error)}`)
     } finally {
       setBusy(false)
+    }
+  }
+
+  const installConverters = async () => {
+    if (!isTauri()) {
+      toast.error('组件安装需要在桌面应用中使用')
+      return
+    }
+    setConverterInstalling(true)
+    setConverterInstallProgress({
+      component: '文档转换组件',
+      stage: '准备安装',
+      downloaded: 0,
+      total: 0,
+      done: false,
+      error: null,
+    })
+    try {
+      const { invoke } = await import('@tauri-apps/api/core')
+      const probe = await invoke<ConverterProbe>('install_document_converter_components')
+      if (probe.available) {
+        setConverterModalOpen(false)
+        toast.success('文档转换组件已安装')
+      } else {
+        toast.error(probe.message)
+      }
+    } catch (error) {
+      toast.error(`组件安装失败：${String(error)}`)
+    } finally {
+      setConverterInstalling(false)
     }
   }
 
@@ -802,6 +952,28 @@ export function DocumentConvertTool() {
           <DocumentView html={renderedHtml} />
         </div>
       </div>
+      {converterModalOpen && (
+        <ConverterMissingModal
+          installing={converterInstalling}
+          progress={converterInstallProgress}
+          onClose={() => setConverterModalOpen(false)}
+          onInstall={installConverters}
+          onRetry={async () => {
+            try {
+              const { invoke } = await import('@tauri-apps/api/core')
+              const probe = await invoke<ConverterProbe>('document_converter_probe')
+              if (probe.available) {
+                setConverterModalOpen(false)
+                toast.success('文档转换组件已就绪')
+              } else {
+                toast.error(probe.message)
+              }
+            } catch (error) {
+              toast.error(`检测失败：${String(error)}`)
+            }
+          }}
+        />
+      )}
     </div>
   )
 }
