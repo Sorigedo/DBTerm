@@ -1343,7 +1343,7 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
         }
         // MySQL @变量必须在事务连接上初始化；由后面的 BEGIN 一次性执行这些前置 SET/USE。
         if (si < deferredPreambleCount) continue
-        const token = (!executeInTx && CANCELABLE_TYPES.has(connType)) ? newCancelToken() : null
+        const token = CANCELABLE_TYPES.has(connType) ? newCancelToken() : null
         runTokenRef.current = token
         setRunToken(token)
         try {
@@ -1390,7 +1390,7 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
               setTxActive(true)
             }
             res = await inv<QueryResult>(executeInTx ? 'db_exec_in_tx' : 'execute_query', executeInTx
-              ? { id: connectionId, sql: markSql(s, token) }
+              ? { id: connectionId, sql: markSql(s, token), cancelToken: token ?? undefined }
                 : {
                   id: connectionId,
                   sql: markSql(s, token),
@@ -1485,7 +1485,7 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
 
     setMultiResults([])
     cancelRequestedRef.current = false
-    const token = (!executeInTx && CANCELABLE_TYPES.has(connType)) ? newCancelToken() : null
+    const token = CANCELABLE_TYPES.has(connType) ? newCancelToken() : null
     runTokenRef.current = token
     setRunToken(token)
     setRunning(true)
@@ -1494,7 +1494,7 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
     try {
       const { invoke } = await import('@tauri-apps/api/core')
       const res = await invoke<QueryResult>(executeInTx ? 'db_exec_in_tx' : 'execute_query', executeInTx
-        ? { id: connectionId, sql: markSql(trimmed, token) }
+        ? { id: connectionId, sql: markSql(trimmed, token), cancelToken: token ?? undefined }
         : {
             id: connectionId,
             sql: markSql(trimmed, token),
@@ -1580,11 +1580,11 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
     try {
       const { invoke } = await import('@tauri-apps/api/core')
       cancelRequestedRef.current = false
-      const token = (!executeInTx && CANCELABLE_TYPES.has(connType)) ? newCancelToken() : null
+      const token = CANCELABLE_TYPES.has(connType) ? newCancelToken() : null
       runTokenRef.current = token
       setRunToken(token)
       const res = await invoke<QueryResult>(executeInTx ? 'db_exec_in_tx' : 'execute_query', executeInTx
-        ? { id: connectionId, sql: markSql(trimmed, token) }
+        ? { id: connectionId, sql: markSql(trimmed, token), cancelToken: token ?? undefined }
         : { id: connectionId, sql: markSql(trimmed, token), database: currentSchemaRef.current || undefined, cancelToken: token ?? undefined })
       setResult(res)
       addHistory(connectionId, trimmed, true)

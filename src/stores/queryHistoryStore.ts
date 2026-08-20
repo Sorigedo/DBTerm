@@ -14,6 +14,8 @@ export interface QueryHistoryEntry {
 }
 
 const MAX_ENTRIES = 500
+const MAX_SQL_CHARS = 100_000
+const MAX_TOTAL_SQL_CHARS = 1_000_000
 const EXPIRE_MS = 30 * 24 * 60 * 60 * 1000 // 未收藏的 30 天过期
 
 interface AddQueryOpts {
@@ -32,13 +34,20 @@ interface QueryHistoryState {
 
 function prune(entries: QueryHistoryEntry[]): QueryHistoryEntry[] {
   const now = Date.now()
-  const kept = entries.filter(e => e.pinned || now - e.at < EXPIRE_MS)
-  if (kept.length <= MAX_ENTRIES) return kept
+  const kept = entries.filter(e => (e.pinned || now - e.at < EXPIRE_MS) && e.sql.length <= MAX_SQL_CHARS)
+  const trimBySize = (list: QueryHistoryEntry[]) => {
+    let total = 0
+    return list.filter(e => {
+      total += e.sql.length
+      return e.pinned || total <= MAX_TOTAL_SQL_CHARS
+    })
+  }
+  if (kept.length <= MAX_ENTRIES) return trimBySize(kept)
   const pinned = kept.filter(e => e.pinned)
   const rest = kept.filter(e => !e.pinned)
     .sort((a, b) => b.at - a.at)
     .slice(0, Math.max(0, MAX_ENTRIES - pinned.length))
-  return [...pinned, ...rest]
+  return trimBySize([...pinned, ...rest])
 }
 
 export const useQueryHistoryStore = create<QueryHistoryState>()(
@@ -48,6 +57,8 @@ export const useQueryHistoryStore = create<QueryHistoryState>()(
       addQuery: (connId, sql, success, opts) => set((s) => {
         const trimmed = sql.trim()
         if (!trimmed) return s
+        // 超长脚本仍正常执行，但不写入 localStorage 历史，避免触发 QuotaExceededError。
+        if (trimmed.length > MAX_SQL_CHARS) return s
         const dup = s.entries.find(e => e.connId === connId && e.sql === trimmed)
         const rest = s.entries.filter(e => e !== dup)
         const entry: QueryHistoryEntry = {

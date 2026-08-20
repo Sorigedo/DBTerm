@@ -200,6 +200,16 @@ if (!hasRustTarget(rustTarget)) {
 const tauriArgs = ['tauri', 'build', '--target', rustTarget, '--bundles', resolvedBundle]
 if (debug) tauriArgs.push('--debug')
 
+// Homebrew 的 rustup 是 keg-only，cargo/rustc 不一定已进入当前 shell 的 PATH。
+const buildEnv = {
+  ...process.env,
+  PATH: [
+    process.platform === 'darwin' ? '/opt/homebrew/opt/rustup/bin' : '',
+    process.platform === 'darwin' ? '/usr/local/opt/rustup/bin' : '',
+    process.env.PATH || '',
+  ].filter(Boolean).join(':'),
+}
+
 // ── 摘要 ─────────────────────────────────────────────────────────────────────
 
 console.log('\n=====================================')
@@ -215,7 +225,11 @@ console.log(`执行: npx ${tauriArgs.join(' ')}\n`)
 
 // ── 执行 ──────────────────────────────────────────────────────────────────────
 
-const result = spawnSync('npx', tauriArgs, { stdio: 'inherit', shell: process.platform === 'win32' })
+const result = spawnSync('npx', tauriArgs, {
+  stdio: 'inherit',
+  shell: process.platform === 'win32',
+  env: buildEnv,
+})
 
 if (result.status === 0) {
   // macOS DMG：隐藏多余的 .VolumeIcon.icns

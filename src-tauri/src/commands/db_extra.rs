@@ -5146,6 +5146,31 @@ pub async fn db_cancel_query(
     // 中止正在执行该查询的那条连接（关连接 → 取数据类查询服务端会随之中止；客户端立即解阻塞）。
     let aborted = crate::commands::query::cancel_abort(&token);
     let (config, password) = load_conn(&id, &storage).await?;
+    if aborted {
+        if let Some(pid) = known_pid.filter(|pid| *pid > 0) {
+            let config = config.clone();
+            let password = password.clone();
+            tauri::async_runtime::spawn(async move {
+                match config.conn_type {
+                    ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => {
+                        if let Ok((mut conn, _t)) = mysql_connect(&config, password.as_deref()).await {
+                            let _ = sqlx::query(&format!("KILL {pid}")).execute(&mut conn).await;
+                        }
+                    }
+                    ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
+                        if let Ok((mut conn, _t)) = pg_connect(&config, password.as_deref()).await {
+                            let _ = sqlx::query("SELECT pg_terminate_backend($1::int4)")
+                                .bind(pid as i32)
+                                .execute(&mut conn)
+                                .await;
+                        }
+                    }
+                    _ => {}
+                }
+            });
+        }
+        return Ok(true);
+    }
     match config.conn_type {
         ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => {
             let (mut conn, _t) = mysql_connect(&config, password.as_deref()).await?;

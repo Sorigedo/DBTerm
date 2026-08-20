@@ -1303,8 +1303,8 @@ fn pid_reg() -> &'static std::sync::Mutex<std::collections::HashMap<String, i64>
     static R: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, i64>>> = std::sync::OnceLock::new();
     R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
-fn pid_register(token: &str, pid: i64) { if let Ok(mut m) = pid_reg().lock() { m.insert(token.to_string(), pid); } }
-fn pid_unregister(token: &str) { if let Ok(mut m) = pid_reg().lock() { m.remove(token); } }
+pub(crate) fn pid_register(token: &str, pid: i64) { if let Ok(mut m) = pid_reg().lock() { m.insert(token.to_string(), pid); } }
+pub(crate) fn pid_unregister(token: &str) { if let Ok(mut m) = pid_reg().lock() { m.remove(token); } }
 pub fn cancel_pid(token: &str) -> Option<i64> { pid_reg().lock().ok()?.get(token).copied() }
 pub(crate) fn validate_cancel_token(token: Option<&str>) -> Result<(), String> {
     if let Some(token) = token {

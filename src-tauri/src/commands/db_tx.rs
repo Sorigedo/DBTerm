@@ -464,6 +464,7 @@ pub async fn db_begin_tx(
 pub async fn db_exec_in_tx(
     id: String,
     sql: String,
+    cancel_token: Option<String>,
     tx_state: State<'_, TxState>,
     storage: State<'_, StorageState>,
     duck_pool: State<'_, DuckPool>,
@@ -471,6 +472,9 @@ pub async fn db_exec_in_tx(
     oracle_tx_pool: State<'_, OracleTxPool>,
     registry: State<'_, DriverRegistry>,
 ) -> Result<QueryResult, String> {
+    super::query::validate_cancel_token(cancel_token.as_deref())?;
+    let abort_rx = cancel_token.as_ref().map(|token| super::query::abort_register(token));
+
     // 瞬时持外层锁取出 per-连接锁后立即释放；DB 执行只持内层锁
     let tx_arc = {
         let guard = tx_state.lock().await;
@@ -484,28 +488,66 @@ pub async fn db_exec_in_tx(
     }
     tx.last_used = Instant::now();
 
-    match &mut tx.conn {
-        TxConn::MySql(conn)    => run_on_mysql(conn, &sql).await,
-        TxConn::Pg(conn)       => run_on_pg(conn, &sql).await,
-        TxConn::Sqlite(conn)   => run_on_sqlite(conn, &sql).await,
-        TxConn::Duckdb(conn_id) => {
-            let conn_id = conn_id.clone();
-            drop(tx);
-            let (config, _) = load_conn(&conn_id, &storage).await?;
-            dispatch_duck_query(&conn_id, &config, &sql, &duck_pool, &registry).await
-        }
-        TxConn::SqlServer(conn_id) => {
-            let conn_id = conn_id.clone();
-            drop(tx);
-            let (config, _) = load_conn(&conn_id, &storage).await?;
-            dispatch_ss_query(&conn_id, &config, &sql, &ss_pool).await
-        }
-        TxConn::Oracle(conn_id) => {
-            let conn_id = conn_id.clone();
-            drop(tx);
-            oracle_exec_in_tx(&conn_id, sql, &oracle_tx_pool, Instant::now()).await
+    if let Some(token) = cancel_token.as_deref() {
+        match &mut tx.conn {
+            TxConn::MySql(conn) => {
+                use sqlx::Row;
+                if let Ok(row) = sqlx::query("SELECT CONNECTION_ID()").fetch_one(&mut *conn).await {
+                    let cid = row.try_get::<u64, _>(0).map(|v| v as i64)
+                        .or_else(|_| row.try_get::<i64, _>(0))
+                        .unwrap_or(0);
+                    if cid != 0 { super::query::pid_register(token, cid); }
+                }
+            }
+            TxConn::Pg(conn) => {
+                use sqlx::Row;
+                if let Ok(row) = sqlx::query("SELECT pg_backend_pid()").fetch_one(&mut *conn).await {
+                    let pid: i32 = row.try_get(0).unwrap_or(0);
+                    if pid != 0 { super::query::pid_register(token, pid as i64); }
+                }
+            }
+            _ => {}
         }
     }
+
+    let run = async {
+        match &mut tx.conn {
+            TxConn::MySql(conn)    => run_on_mysql(conn, &sql).await,
+            TxConn::Pg(conn)       => run_on_pg(conn, &sql).await,
+            TxConn::Sqlite(conn)   => run_on_sqlite(conn, &sql).await,
+            TxConn::Duckdb(conn_id) => {
+                let conn_id = conn_id.clone();
+                drop(tx);
+                let (config, _) = load_conn(&conn_id, &storage).await?;
+                dispatch_duck_query(&conn_id, &config, &sql, &duck_pool, &registry).await
+            }
+            TxConn::SqlServer(conn_id) => {
+                let conn_id = conn_id.clone();
+                drop(tx);
+                let (config, _) = load_conn(&conn_id, &storage).await?;
+                dispatch_ss_query(&conn_id, &config, &sql, &ss_pool).await
+            }
+            TxConn::Oracle(conn_id) => {
+                let conn_id = conn_id.clone();
+                drop(tx);
+                oracle_exec_in_tx(&conn_id, sql, &oracle_tx_pool, Instant::now()).await
+            }
+        }
+    };
+    let result = if let Some(rx) = abort_rx {
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => result,
+            _ = rx => Err("查询已取消".to_string()),
+        }
+    } else {
+        run.await
+    };
+    if let Some(token) = cancel_token.as_deref() {
+        super::query::abort_unregister(token);
+        super::query::pid_unregister(token);
+    }
+    result
 }
 
 /// 提交事务
