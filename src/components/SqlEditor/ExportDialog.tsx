@@ -13,6 +13,8 @@ interface Props {
   schema?: string
   onClose: () => void
   connType?: string
+  /** 多语句执行后已有的结果集；xlsx 导出时每个结果集写入独立 Sheet。 */
+  resultSets?: Array<{ sql: string; result: { columns: string[]; rows: (string | null)[][] } }>
 }
 
 type Format   = 'csv' | 'tsv' | 'jsonl' | 'sql' | 'json' | 'md' | 'xlsx' | 'parquet'
@@ -68,7 +70,7 @@ function todayStr(): string {
   return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`
 }
 
-export default function ExportDialog({ connectionId, sqlText, schema, onClose, connType }: Props) {
+export default function ExportDialog({ connectionId, sqlText, schema, onClose, connType, resultSets = [] }: Props) {
   const isDuck = connType === 'duckdb'
 
   const [format,      setFormat]      = useState<Format>('csv')
@@ -177,6 +179,39 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
       cancelRequestedRef.current = true
     })
 
+    // 多语句结果不能交给单 SQL 流式导出（后端只会生成一个 Sheet）。
+    // 结果已在执行阶段缓存，使用同一套 SheetJS 依赖组装工作簿后写入用户选择的路径。
+    if (format === 'xlsx' && resultSets.length > 1) {
+      try {
+        const xlsx = await import('xlsx')
+        const wb = xlsx.utils.book_new()
+        resultSets.forEach((item, i) => {
+          const rows = [item.result.columns, ...item.result.rows]
+          const ws = xlsx.utils.aoa_to_sheet(rows)
+          const base = `结果${i + 1}`
+          xlsx.utils.book_append_sheet(wb, ws, base.slice(0, 31))
+        })
+        const bytes = new Uint8Array(xlsx.write(wb, { type: 'array', bookType: 'xlsx' }) as ArrayBuffer)
+        const { invoke } = await import('@tauri-apps/api/core')
+        await invoke('write_export_bytes', { filePath: filePath.trim(), data: Array.from(bytes) })
+        const elapsed = Math.max(1, Date.now() - exportStartRef.current)
+        const rows = resultSets.reduce((n, item) => n + item.result.rows.length, 0)
+        setFinalRows(rows)
+        setProgress({ rows, elapsed_ms: elapsed, rows_per_sec: Math.round(rows * 1000 / elapsed), file_bytes: bytes.byteLength, done: true, cancelled: false, error: null })
+        useExportTaskStore.getState().updateTask(taskId, { status: 'done', progressRows: rows, fileBytes: bytes.byteLength, message: `已导出 ${rows.toLocaleString()} 行 · ${resultSets.length} 个 Sheet`, filePath: filePath.trim(), finishedAt: Date.now() })
+        setPhase('done')
+      } catch (e) {
+        const msg = String(e)
+        useExportTaskStore.getState().updateTask(taskId, { status: 'error', error: msg, message: '导出失败', finishedAt: Date.now() })
+        setErrorMsg(msg); setPhase('error')
+      } finally {
+        unregisterExportCancelHandler(taskId)
+        exportTokenRef.current = null
+        cancelRequestedRef.current = false
+      }
+      return
+    }
+
     // DuckDB 高速通道（COPY TO，无需把结果拉回前端）。CSV 仅 UTF-8 时走原生 COPY，避免忽略用户选择的 GBK/BOM。
     if (isDuck && (format === 'parquet' || (format === 'csv' && encoding === 'utf8'))) {
       const t0 = Date.now()
@@ -275,7 +310,7 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
       setCancelling(false)
       unlisten?.()
     }
-  }, [connectionId, sqlText, filePath, format, encoding, insertTable, connType, schema, isDuck, onClose])
+  }, [connectionId, sqlText, filePath, format, encoding, insertTable, connType, schema, isDuck, onClose, resultSets])
 
   const cancelExport = async () => {
     window.getSelection()?.removeAllRanges()
@@ -369,7 +404,9 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
                       )}
                       {format === 'xlsx' && (
                         <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>
-                          后端流式写入 Excel；Excel 单个工作表最多支持 1,048,576 行，超大数据建议用 CSV / TSV / JSON Lines
+                          {resultSets.length > 1
+                            ? `将按 ${resultSets.length} 个查询结果写入独立 Sheet`
+                            : '后端流式写入 Excel'}；Excel 单个工作表最多支持 1,048,576 行，超大数据建议用 CSV / TSV / JSON Lines
                         </div>
                       )}
                     </div>

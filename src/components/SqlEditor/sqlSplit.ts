@@ -162,3 +162,45 @@ export function hasMysqlUserVariable(sql: string): boolean {
 export function hasMysqlDelimiterDirective(sql: string): boolean {
   return sql.split(/\r?\n/).some(line => lineDirective(line, 'mysql')?.kind === 'delimiter')
 }
+
+/** MySQL/MariaDB 专属脚本门禁（迁移脚本无法可靠自动翻译到其它方言）。 */
+export function isMysqlOnlyScript(sql: string): boolean {
+  // Only inspect executable SQL.  `stripSqlComments` is intentionally small
+  // and does not understand quoted strings (and treats # as a comment), which
+  // caused valid PostgreSQL/SQL Server text to be rejected by this guard.
+  let source = ''
+  let quote: "'" | '"' | '`' | null = null
+  let lineComment = false
+  let blockComment = false
+  for (let i = 0; i < sql.length; i += 1) {
+    const ch = sql[i]
+    const next = sql[i + 1]
+    if (lineComment) {
+      if (ch === '\n') { lineComment = false; source += '\n' }
+      continue
+    }
+    if (blockComment) {
+      if (ch === '*' && next === '/') { blockComment = false; i += 1; source += '  ' }
+      continue
+    }
+    if (quote) {
+      if (ch === '\\') { i += 1; continue }
+      if (ch === quote && next === quote) { i += 1; continue }
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === '-' && next === '-') { lineComment = true; i += 1; source += '  '; continue }
+    if (ch === '/' && next === '*') { blockComment = true; i += 1; source += '  '; continue }
+    // MySQL # comments are only recognized at a token boundary.  This keeps
+    // PostgreSQL JSON operators such as #> and #>> intact.
+    if (ch === '#' && next !== '>' && next !== '<' && (i === 0 || /\s/.test(sql[i - 1]))) { lineComment = true; source += ' '; continue }
+    if (ch === "'" || ch === '"') { quote = ch; source += ' '; continue }
+    if (ch === '`') { source += ' ` '; continue }
+    source += ch
+  }
+  source = source.toUpperCase()
+  return /\bPREPARE\s+\w+\s+FROM\b/.test(source)
+    || /\bDATABASE\s*\(\s*\)/.test(source)
+    || /\bUNSIGNED\b/.test(source)
+    || /`/.test(source)
+}

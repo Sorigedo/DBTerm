@@ -1,3 +1,52 @@
+//! # DBTerm - Universal Database Terminal
+//!
+//! A cross-platform database management tool with support for 15+ database types,
+//! SSH tunneling, query execution, schema management, and system monitoring.
+//!
+//! ## Supported Databases
+//!
+//! ### SQL Databases
+//! - **MySQL** (5.7+), **MariaDB**, **TiDB**, **OceanBase**
+//! - **PostgreSQL** (10+), **KingBase**, **OpenGauss**
+//! - **SQLite** (3.x)
+//! - **SQL Server** (2012+)
+//! - **Oracle** (11g+)
+//! - **DuckDB** (0.8+)
+//!
+//! ### NoSQL Databases
+//! - **Redis** (6.0+)
+//! - **MongoDB** (4.0+)
+//! - **ClickHouse**
+//!
+//! ## Key Features
+//!
+//! - **Query Execution** - Multi-statement SQL execution with cancellation support
+//! - **Connection Pooling** - Persistent connection pools with health checks
+//! - **Schema Management** - Database/table/column metadata browsing
+//! - **SSH Tunneling** - Secure database access through bastion hosts
+//! - **Transaction Support** - Manual transaction control (BEGIN/COMMIT/ROLLBACK)
+//! - **Data Export** - Export to CSV, JSON, SQL with streaming for large datasets
+//! - **PTY Terminal** - Integrated local terminal with database CLI support
+//! - **System Monitoring** - CPU, memory, disk, network metrics collection
+//!
+//! ## Architecture
+//!
+//! The application is built on Tauri and organized into modules:
+//!
+//! - `models` - Core data structures (connection configs, query results)
+//! - `commands` - Tauri command handlers (query, metadata, export)
+//! - `storage` - Persistent storage for connection configurations
+//! - `keychain` - Secure password storage via OS keychain
+//! - `pool_manager` - Database connection pooling
+//! - `ssh` - SSH connection and tunneling
+//! - `pty` - PTY terminal emulation
+//! - `db_tunnel` - SSH tunnel management for database connections
+//!
+//! ## Examples
+//!
+//! Query execution and metadata operations are handled by the `commands` module,
+//! which dispatches to database-specific implementations based on connection type.
+
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -12,11 +61,14 @@ use tauri::Manager;
 mod commands;
 mod db_tunnel;
 mod keychain;
+mod logging;
 mod models;
+mod pool_manager;
 mod pty;
 mod ssh;
 mod storage;
 mod tester;
+mod tracing_utils;
 
 use commands::db_export::ExportCancelMap;
 use commands::db_tx::TxState;
@@ -32,6 +84,7 @@ use pty::PtyState;
 use ssh::SshState;
 use storage::{Storage, StorageState};
 
+/// Document converter availability probe result
 #[derive(serde::Serialize)]
 struct DocumentConverterProbe {
     available: bool,
@@ -39,12 +92,14 @@ struct DocumentConverterProbe {
     message: String,
 }
 
+/// Document conversion result with engine information
 #[derive(serde::Serialize)]
 struct DocumentConvertResult {
     path: String,
     engine: String,
 }
 
+/// Document converter installation progress event
 #[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DocumentConverterInstallProgress {
@@ -56,6 +111,14 @@ struct DocumentConverterInstallProgress {
     error: Option<String>,
 }
 
+/// Validates that a path is absolute and does not contain hidden components
+///
+/// # Arguments
+/// * `path` - Path string to validate
+/// * `action` - Action description for error message (e.g., "read", "write")
+///
+/// # Returns
+/// Validated absolute PathBuf, or error message if invalid
 fn validate_local_path(path: &str, action: &str) -> Result<PathBuf, String> {
     let p = PathBuf::from(path);
     if !p.is_absolute() {
@@ -69,6 +132,14 @@ fn validate_local_path(path: &str, action: &str) -> Result<PathBuf, String> {
     Ok(p)
 }
 
+/// Finds the first working command from a list of candidate paths
+///
+/// # Arguments
+/// * `candidates` - List of possible command paths to test
+/// * `version_arg` - Argument to pass for version check (e.g., "--version")
+///
+/// # Returns
+/// First path that successfully executes the version command, or None
 fn find_command(candidates: &[PathBuf], version_arg: &str) -> Option<PathBuf> {
     for path in candidates {
         let output = Command::new(path).arg(version_arg).output();
@@ -79,6 +150,18 @@ fn find_command(candidates: &[PathBuf], version_arg: &str) -> Option<PathBuf> {
     None
 }
 
+/// Returns candidate directories for bundled document converters
+///
+/// Searches in order:
+/// 1. `DBTERM_CONVERTER_DIR` environment variable
+/// 2. App data directory (`~/Library/Application Support/DBTerm/converters` on macOS)
+/// 3. Resource directory (`DBTerm.app/Contents/Resources/converters`)
+///
+/// # Arguments
+/// * `app` - Optional Tauri app handle for path resolution
+///
+/// # Returns
+/// List of potential converter installation directories
 fn bundled_converter_roots(app: Option<&tauri::AppHandle>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Ok(path) = std::env::var("DBTERM_CONVERTER_DIR") {
@@ -858,6 +941,9 @@ pub fn run() {
                 prod_dir
             };
             keychain::init(&data_dir);
+            if let Err(e) = logging::init_with_app_dir(&data_dir) {
+                log::warn!("初始化结构化日志失败，将继续使用应用日志插件: {e}");
+            }
             ssh::init_known_hosts(&data_dir);
             commands::redis::slowlog_store::init(&data_dir);
             let storage = Storage::new(data_dir.clone()).expect("无法初始化配置存储");
@@ -1145,6 +1231,7 @@ pub fn run() {
             commands::db_diff::db_diff_data,
             // 流式导出
             commands::db_export::db_stream_export,
+            commands::db_export::write_export_bytes,
             commands::db_export::db_create_export_workspace,
             commands::db_export::db_cleanup_export_workspace,
             commands::db_export::db_pack_export_archive,

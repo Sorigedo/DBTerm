@@ -35,9 +35,11 @@ export default function RoutinePanel({ connectionId, schema, name, routineType, 
   useEffect(() => {
     ;(async () => {
       setLoading(true)
+      setError('')
       try {
         const { invoke } = await import('@tauri-apps/api/core')
-        const raw = await invoke<string>('get_table_ddl', { id: connectionId, schema, table: name })
+        const kind = isProcedure ? 'procedure' : 'function'
+        const raw = await invoke<string>('get_routine_ddl', { id: connectionId, schema, name, kind })
         setDdl(raw)
       } catch (e) {
         setError(String(e))
@@ -45,7 +47,7 @@ export default function RoutinePanel({ connectionId, schema, name, routineType, 
         setLoading(false)
       }
     })()
-  }, [connectionId, schema, name])
+  }, [connectionId, schema, name, isProcedure])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }

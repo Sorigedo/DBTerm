@@ -51,6 +51,34 @@ fn validate_pub_key_path(pub_path: &PathBuf) -> Result<PathBuf, String> {
     validate_in_ssh_dir(pub_path)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_in_ssh_dir_traversal() {
+        let path = ssh_dir().join("../etc/passwd");
+        let result = validate_in_ssh_dir(&path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains(".."));
+    }
+
+    #[test]
+    fn test_validate_pub_key_path_nonexistent() {
+        let path = ssh_dir().join("nonexistent.pub");
+        let result = validate_pub_key_path(&path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("找不到"));
+    }
+
+    #[test]
+    fn test_list_ssh_keys() {
+        let result = list_ssh_keys();
+        assert!(result.is_ok());
+    }
+}
+
+
 /// 列出 ~/.ssh/ 下所有私钥（过滤 .pub 和非 PEM 文件）
 #[tauri::command]
 pub fn list_ssh_keys() -> Result<Vec<SshKeyInfo>, String> {

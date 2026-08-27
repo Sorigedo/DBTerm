@@ -15,7 +15,6 @@ pub fn spawn_local_shell(
 ) -> Result<(), String> {
     crate::pty::spawn_shell(id, shell, cols, rows, cwd, init_cmd, state.inner(), app)
 }
-
 /// 向本地终端写入数据（键盘输入）
 #[tauri::command]
 pub fn write_to_pty(
@@ -149,4 +148,31 @@ fn which_shell(name: &str) -> String {
         .ok()
         .and_then(|o| if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).trim().to_string()) } else { None })
         .unwrap_or_else(|| name.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_which_shell() {
+        let result = which_shell("sh");
+        #[cfg(unix)]
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_local_shell_nonexistent() {
+        let result = test_local_shell("/nonexistent/shell/path".to_string());
+        assert!(!result.success);
+        assert!(result.message.contains("未找到"));
+    }
+
+    #[test]
+    fn test_list_path_commands() {
+        let commands = list_path_commands();
+        // PATH 不为空时应至少有 1 个命令
+        #[cfg(unix)]
+        assert!(!commands.is_empty(), "PATH 应包含至少一个可执行文件");
+    }
 }

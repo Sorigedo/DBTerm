@@ -35,16 +35,17 @@ function SleepingSqlEditor({ tabId, connectionId, connType, active }: {
 }) {
   const [awake, setAwake] = useState(active)
   const [running, setRunning] = useState(false)
+  const [hasResult, setHasResult] = useState(false)
 
   useEffect(() => {
     if (active) {
       setAwake(true)
       return
     }
-    if (!awake || running) return
+    if (!awake || running || hasResult) return
     const timer = window.setTimeout(() => setAwake(false), QUERY_SLEEP_DELAY_MS)
     return () => window.clearTimeout(timer)
-  }, [active, awake, running])
+  }, [active, awake, running, hasResult])
 
   if (!active && !awake) return null
   return (
@@ -53,6 +54,7 @@ function SleepingSqlEditor({ tabId, connectionId, connType, active }: {
       connectionId={connectionId}
       connType={connType}
       onRunningChange={setRunning}
+      onResultPresenceChange={setHasResult}
     />
   )
 }

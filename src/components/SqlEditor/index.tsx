@@ -97,15 +97,16 @@ import { useAppStore } from '../../stores/appStore'
 import { useShortcuts } from '../../utils/useShortcuts'
 import { displayShortcutStr } from '../../utils/shortcuts'
 import { toast } from '../../stores/toastStore'
-import { isPgFamily } from '../../utils/sqlDialect'
+import { isPgFamily, qid } from '../../utils/sqlDialect'
 import { formatDuration } from '../../utils/formatDuration'
 import { appendAuditLog } from '../../utils/auditLog'
 import { markBatchCancelledFrom, markBatchSkippedFrom } from './queryBatchCancel'
-import { hasMysqlDelimiterDirective, hasMysqlUserPreparedStmt, hasMysqlUserVariable, splitSqlStatements, stripSqlComments } from './sqlSplit'
+import { hasMysqlDelimiterDirective, hasMysqlUserPreparedStmt, hasMysqlUserVariable, isMysqlOnlyScript, splitSqlStatements, stripSqlComments } from './sqlSplit'
 import { applySqlVariables, findSqlVariables, type SqlVariable } from './sqlVariables'
 import { columnsOfTable, memberColumnsForAlias, selectAliasColumnsBefore, stripQuoteIdent, tableForAlias } from './sqlCompletion'
 import { affectedRowsDisplay } from './affectedRowsDisplay'
 import { isMysqlTransactionPreamble, shouldBlockMixedAutoTransaction, transactionControlStatement } from './transactionControl'
+import { sqlFunctionsForDialect } from '../../utils/sqlFunctions'
 
 const QueryHistoryPanel = lazy(() => import('./QueryHistoryPanel'))
 const ExportDialog = lazy(() => import('./ExportDialog'))
@@ -160,13 +161,16 @@ interface Props {
   connectionId: string
   connType: ConnType
   onRunningChange?: (running: boolean) => void
+  onResultPresenceChange?: (present: boolean) => void
 }
 
 const DEFAULT_SQL = ''
 
 // 表名悬停下划线：StateField 持有当前悬停表名的装饰，由 mousemove 派发 effect 更新
 const setTableHover = StateEffect.define<{ from: number; to: number } | null>()
-const tableHoverMark = Decoration.mark({ class: 'cm-table-link' })
+const tableHoverMark = Decoration.mark({
+  class: 'cm-table-link',
+})
 const tableHoverField = StateField.define<DecorationSet>({
   create() { return Decoration.none },
   update(deco, tr) {
@@ -322,6 +326,7 @@ async function memberCompletion(
   connType: ConnType,
   connectionId: string,
   currentSchema: string,
+  schemas: string[],
   qualifiedCache: MutableRefObject<Record<string, string[]>>,
 ): Promise<CompletionResult | null> {
   const before = ctx.matchBefore(/[`"\[\]\w$]+\.[\w$]*$/)
@@ -329,6 +334,8 @@ async function memberCompletion(
   const dot = before.text.lastIndexOf('.')
   const alias = stripQuoteIdent(before.text.slice(0, dot))
   if (!alias) return null
+  // `schema.` 是表名上下文，不应被当作表别名返回字段；交给 schemaTableCompletion。
+  if (alias.toLowerCase() === currentSchema.toLowerCase() || schemas.some(s => s.toLowerCase() === alias.toLowerCase())) return null
   const doc = ctx.state.doc.toString()
   let cols = memberColumnsForAlias(doc, dbSchema, alias, connType)
   if (!cols.length && connectionId) {
@@ -349,9 +356,33 @@ async function memberCompletion(
     }
   }
   if (!cols.length) return null
+  const qualifiedAll = cols.map(c => `${alias}.${qid(connType, c)}`).join(', ')
   return {
     from: before.from + dot + 1,
-    options: cols.map(c => ({ label: c, type: 'property' })),
+    options: [
+      {
+        label: `全部字段（${cols.length}）`,
+        detail: '按表字段顺序插入',
+        type: 'keyword',
+        apply: (view: EditorView, _completion: unknown, _from: number, to: number) => {
+          // 整组字段替换完整的「别名.」前缀，避免生成 b.b.id。
+          view.dispatch({ changes: { from: before.from, to, insert: qualifiedAll } })
+        },
+      },
+      ...cols.map(c => ({ label: c, type: 'property' as const })),
+    ],
+    validFor: /^[\w$]*$/,
+  }
+}
+
+/** Schema/数据库名补全：独立于表/字段补全，避免用户只能从左侧树复制库名。 */
+function schemaNameCompletion(ctx: CompletionContext, schemas: string[]): CompletionResult | null {
+  if (!schemas.length) return null
+  const word = ctx.matchBefore(/[\w$]*$/)
+  if (!word || (!ctx.explicit && word.from === word.to)) return null
+  return {
+    from: word.from,
+    options: schemas.map(s => ({ label: s, type: 'namespace' as const, detail: 'schema / 数据库' })),
     validFor: /^[\w$]*$/,
   }
 }
@@ -500,7 +531,7 @@ function sqlParenFoldRange(doc: string, lineStart: number, lineEnd: number): { f
   return null
 }
 
-export default function SqlEditor({ tabId, connectionId, connType, onRunningChange }: Props) {
+export default function SqlEditor({ tabId, connectionId, connType, onRunningChange, onResultPresenceChange }: Props) {
   // SQL 草稿按顶层 tabId 存储（已扁平化，每个查询标签即一个独立编辑器，无内层子标签）
   const savedSql = useQueryStore((s) => s.sqls[tabId])
   const { setSql } = useQueryStore()
@@ -599,6 +630,7 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
   // 编辑器右键菜单 + 导出目标 SQL（区分是否选中）
   const [editorCtx,   setEditorCtx]       = useState<{ x: number; y: number; hasSel: boolean } | null>(null)
   const [exportSql,   setExportSql]       = useState('')
+  const [exportResultSets, setExportResultSets] = useState<Array<{ sql: string; result: QueryResult }>>([])
   const [variablePending, setVariablePending] = useState<{
     sql: string
     variables: SqlVariable[]
@@ -775,11 +807,22 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
 
   // 当前查询页使用的 schema/库（Navicat 风格切库；执行时作为 database 传给后端）
   const [schemas, setSchemas] = useState<string[]>([])
-  const [currentSchema, setCurrentSchema] = useState<string>(activeConn?.database ?? '')
+  // schema 属于查询标签，而不是编辑器实例：编辑器休眠卸载/重新挂载时仍需恢复用户选择。
+  const savedTabSchema = tab?.meta?.schema
+  const [currentSchema, setCurrentSchemaState] = useState<string>(savedTabSchema ?? activeConn?.database ?? '')
+  const setCurrentSchema = useCallback((schema: string) => {
+    setCurrentSchemaState(schema)
+    setTabMeta(tabId, { schema })
+  }, [setTabMeta, tabId])
   const currentSchemaRef = useRef(currentSchema)
   currentSchemaRef.current = currentSchema
   useEffect(() => {
-    if (isSqlite || !connectionId) return
+    if (!connectionId) return
+    if (isSqlite) {
+      setSchemas(['main'])
+      if (!currentSchemaRef.current) setCurrentSchema('main')
+      return
+    }
     let alive = true
     ;(async () => {
       try {
@@ -929,6 +972,9 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
   const [prodPending, setProdPending] = useState<{ sql: string; count: number } | null>(null)
   // K5 多结果 tab
   const [multiResults, setMultiResults] = useState<MultiResult[]>([])
+  useEffect(() => {
+    onResultPresenceChange?.(result !== null || multiResults.length > 0 || !!error)
+  }, [onResultPresenceChange, result, multiResults.length, error])
   // 结果区当前页签：'msg' 消息 | 'sum' 摘要 | number 第 N 个数据结果
   const [resultTab, setResultTab] = useState<'msg' | 'sum' | number>('msg')
   const [lastRunSql, setLastRunSql] = useState('')
@@ -1254,8 +1300,15 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
     setLastRunSql(trimmed)
     setResultClosed(false)   // 执行即重新打开结果区
 
+    const mysqlConn = ['mysql', 'mariadb', 'tidb', 'oceanBase'].includes(connType)
+    if (!mysqlConn && isMysqlOnlyScript(trimmed)) {
+      setMultiResults([]); setResult(null)
+      setError('当前脚本使用 MySQL 专属语法（用户变量、PREPARE 或 information_schema），当前连接不是 MySQL/MariaDB/TiDB/OceanBase；请切换到兼容连接，或按目标数据库重写迁移脚本')
+      return
+    }
+
     // 过滤掉“仅注释/空白”的语句，避免把纯注释当命令发给数据库（MySQL 1295）
-    const isMysqlFamilyConn = ['mysql', 'mariadb', 'tidb', 'oceanBase'].includes(connType)
+    const isMysqlFamilyConn = mysqlConn
     const splitStmts = splitSqlStatements(trimmed, connType).filter(s => stripSqlComments(s) !== '')
     const splitHasTxControl = splitStmts.some(s => transactionControlStatement(s, connType))
     const keepMysqlSessionScript = isMysqlFamilyConn
@@ -1635,18 +1688,29 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
     return view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to).trim()
   }, [])
 
-  // 导出：有选中导出选中，否则导出整页；多条语句给出提示并取第一条
+  // 导出：有选中导出选中，否则导出整页；多语句若已执行则支持 Excel 多 Sheet
   const handleExport = useCallback(() => {
     const sel = getSelectedSql()
     const target = (sel || sqlText).trim()
     if (!target) { toast.warning('没有可导出的 SQL'); return }
     const stmts = splitSqlStatements(target, connType)
     let sqlToExport = target
-    if (stmts.length > 1) {
-      toast.warning(sel
-        ? `选中含 ${stmts.length} 条语句，将导出第 1 条；如需指定请只选中单条`
-        : `当前共 ${stmts.length} 条语句，将导出第 1 条；选中某条可单独导出`)
-      sqlToExport = stmts[0]
+    const priorSets = multiResults
+      .filter(m => m.result && m.result.columns.length > 0)
+      .map(m => ({ sql: m.sql, result: m.result! }))
+    const priorMatches = multiResults.length === stmts.length
+      && multiResults.every((m, i) => m.sql.trim() === stmts[i].trim())
+    if (stmts.length > 1 && priorMatches && priorSets.length > 1) {
+      sqlToExport = target
+      setExportResultSets(priorSets)
+    } else {
+      setExportResultSets([])
+      if (stmts.length > 1) {
+        toast.warning(sel
+          ? `选中含 ${stmts.length} 条语句，请先执行后再导出多 Sheet Excel`
+          : `当前共 ${stmts.length} 条语句，请先执行后再导出多 Sheet Excel`)
+        sqlToExport = stmts[0]
+      }
     }
     const variables = findSqlVariables(sqlToExport)
     if (variables.length > 0) {
@@ -1655,7 +1719,7 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
     }
     setExportSql(sqlToExport)
     setExportOpen(true)
-  }, [getSelectedSql, sqlText, connType])
+  }, [getSelectedSql, sqlText, connType, multiResults])
 
   // 执行计划：把当前/选中 SQL 包成对应方言的 EXPLAIN 执行，结果走结果区
   const runExplain = useCallback(() => {
@@ -1790,6 +1854,9 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
       default:                                       return StandardSQL
     }
   }, [connType])
+  // CodeMirror 的方言关键字集并不包含各数据库完整的内置函数目录；补充常用函数，
+  // 同时保留 schema/table/column 等动态补全项。函数名统一使用大写，输入小写时同样可匹配。
+  const dialectFunctions = useMemo(() => sqlFunctionsForDialect(connType), [connType])
   // SQL 扩展：当前方言关键字补全 + 自定义 schema 补全。
   // 不把 schema 交给 sql()（其内置别名解析对子查询失效），改用自建补全源：
   //   成员访问 `别名.` → 全文扫描(含子查询)解析表后给列名；其余交回 schemaCompletionSource。
@@ -1797,12 +1864,23 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
     const langSupport = sql({ dialect: sqlDialect, upperCaseKeywords: true })  // 仅关键字补全
     const schemaSrc = schemaCompletionSource({ dialect: sqlDialect, schema: dbSchema })
     const combined: CompletionSource = async (ctx) => {
-      const member = await memberCompletion(ctx, dbSchema, connType, connectionId, currentSchema, qualifiedColumnsRef)
+      const member = await memberCompletion(ctx, dbSchema, connType, connectionId, currentSchema, schemas, qualifiedColumnsRef)
       const schemaTables = member ? null : await schemaTableCompletion(ctx, connectionId, schemas, schemaTablesRef)
-      return member ?? schemaTables ?? selectOutputCompletion(ctx, connType) ?? schemaSrc(ctx)
+      if (member || schemaTables) return member ?? schemaTables
+      const base = selectOutputCompletion(ctx, connType) ?? await schemaSrc(ctx)
+      const schemaNames = schemaNameCompletion(ctx, schemas)
+      const word = ctx.matchBefore(/[\w$]*$/)
+      if (word && (ctx.explicit || word.from !== word.to)) {
+        const funcs = dialectFunctions.map(label => ({ label, type: 'function' as const, detail: '内置函数' }))
+        const existing = [...(schemaNames?.options ?? []), ...(base?.options ?? [])]
+        const seen = new Set(existing.map(o => o.label.toLowerCase()))
+        return { from: word.from, options: [...funcs.filter(f => !seen.has(f.label.toLowerCase())), ...existing], validFor: /^[\w$]*$/ }
+      }
+      if (schemaNames && base) return { ...base, options: [...schemaNames.options, ...base.options] }
+      return schemaNames ?? base
     }
     return [langSupport, langSupport.language.data.of({ autocomplete: combined })]
-  }, [connectionId, connType, currentSchema, dbSchema, schemas, sqlDialect])
+  }, [connectionId, connType, currentSchema, dbSchema, schemas, sqlDialect, dialectFunctions])
   const foldExt = useMemo(() => codeFolding({
     preparePlaceholder: (state, range) => {
       const fromLine = state.doc.lineAt(range.from).number
@@ -2502,6 +2580,7 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
             sqlText={exportSql || sqlText}
             schema={currentSchema}
             connType={connType}
+            resultSets={exportResultSets}
             onClose={() => setExportOpen(false)}
           />
         </Suspense>

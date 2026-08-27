@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.1.21"
+version = "0.1.22"
 description = "DBTerm - SSH 和数据库管理工具"
 authors = ["DBTerm"]
 edition = "2021"
@@ -30,6 +30,10 @@ tauri-plugin-log = "2"
 serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
 log            = "0.4"
+tracing        = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-appender = "0.2"
+tracing-log = "0.2"
 tokio          = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
@@ -89,3 +93,6 @@ windows = { version = "0.61", features = [
 [target.'cfg(target_os = "macos")'.dependencies]
 # 覆写 applicationShouldTerminate: 拦截程序坞/Cmd+Q 退出（与 tauri 传递依赖同版本）
 objc2 = "0.6"
+
+[dev-dependencies]
+serial_test = "3"

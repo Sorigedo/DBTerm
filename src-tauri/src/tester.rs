@@ -18,7 +18,6 @@ struct DbExtraCfg {
     #[serde(rename = "sshPassword", default)] ssh_password:  String,
     #[serde(rename = "sshKeyPath",  default)] ssh_key_path:  String,
 }
-
 /// 展开路径中的 ~ (HOME)
 pub fn expand_home(p: &str) -> std::path::PathBuf {
     if let Some(rest) = p.strip_prefix("~/") {
@@ -388,4 +387,71 @@ fn friendly_err(e: impl std::fmt::Display) -> String {
         return format!("ProxySQL 无法路由到后端数据库（hostgroup 超时）：{s}");
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_expand_home_with_tilde() {
+        std::env::set_var("HOME", "/home/testuser");
+        let expanded = expand_home("~/documents/file.txt");
+        assert_eq!(expanded, std::path::PathBuf::from("/home/testuser/documents/file.txt"));
+    }
+
+    #[test]
+    fn test_expand_home_without_tilde() {
+        let path = "/absolute/path/file.txt";
+        let expanded = expand_home(path);
+        assert_eq!(expanded, std::path::PathBuf::from(path));
+    }
+
+    #[test]
+    fn test_expand_home_relative_path() {
+        let path = "relative/path/file.txt";
+        let expanded = expand_home(path);
+        assert_eq!(expanded, std::path::PathBuf::from(path));
+    }
+
+    #[test]
+    fn test_db_extra_cfg_defaults() {
+        let json = "{}";
+        let cfg: DbExtraCfg = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.ssl_mode, "");
+        assert_eq!(cfg.ssh_tunnel, false);
+        assert_eq!(cfg.ssh_port, 0);
+    }
+
+    #[test]
+    fn test_db_extra_cfg_ssh_tunnel() {
+        let json = r#"{
+            "sshTunnel": true,
+            "sshHost": "jump.example.com",
+            "sshPort": 22,
+            "sshUser": "admin",
+            "sshAuthType": "password"
+        }"#;
+        let cfg: DbExtraCfg = serde_json::from_str(json).unwrap();
+        assert!(cfg.ssh_tunnel);
+        assert_eq!(cfg.ssh_host, "jump.example.com");
+        assert_eq!(cfg.ssh_port, 22);
+        assert_eq!(cfg.ssh_user, "admin");
+        assert_eq!(cfg.ssh_auth_type, "password");
+    }
+
+    #[test]
+    fn test_db_extra_cfg_ssl_config() {
+        let json = r#"{
+            "sslMode": "require",
+            "sslCa": "/path/to/ca.pem",
+            "sslCert": "/path/to/cert.pem",
+            "sslKey": "/path/to/key.pem"
+        }"#;
+        let cfg: DbExtraCfg = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.ssl_mode, "require");
+        assert_eq!(cfg.ssl_ca, "/path/to/ca.pem");
+        assert_eq!(cfg.ssl_cert, "/path/to/cert.pem");
+        assert_eq!(cfg.ssl_key, "/path/to/key.pem");
+    }
 }

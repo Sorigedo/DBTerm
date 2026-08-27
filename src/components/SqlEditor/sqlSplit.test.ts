@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { hasMysqlUserVariable, splitSqlStatements } from './sqlSplit.ts'
+import { hasMysqlUserVariable, isMysqlOnlyScript, splitSqlStatements } from './sqlSplit.ts'
 
 test('mysql delimiter directives split routine body as one statement', () => {
   const sql = `DELIMITER //
@@ -61,4 +61,14 @@ test('mysql user variable detection ignores comments and strings', () => {
   assert.equal(hasMysqlUserVariable('SELECT @sql'), true)
   assert.equal(hasMysqlUserVariable("SELECT 'a@b'"), false)
   assert.equal(hasMysqlUserVariable('-- @sql\nSELECT 1'), false)
+})
+
+test('detects mysql-only migration syntax', () => {
+  assert.equal(isMysqlOnlyScript('SET @schema_name := DATABASE(); PREPARE stmt FROM @sql;'), true)
+  assert.equal(isMysqlOnlyScript('SELECT * FROM "users" WHERE id = 1'), false)
+  assert.equal(isMysqlOnlyScript("SELECT 'EXECUTE foo'"), false)
+  assert.equal(isMysqlOnlyScript('SELECT * FROM information_schema.columns'), false)
+  assert.equal(isMysqlOnlyScript('EXECUTE dbo.proc'), false)
+  assert.equal(isMysqlOnlyScript("SELECT data #>> '{path}' FROM t"), false)
+  assert.equal(isMysqlOnlyScript('SELECT * FROM `users`'), true)
 })

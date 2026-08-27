@@ -126,6 +126,39 @@ fn version_ge(major: u32, minor: u32, patch: u32, req_maj: u32, req_min: u32, re
     (major, minor, patch) >= (req_maj, req_min, req_pat)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_semver() {
+        assert_eq!(parse_semver("10.11.4-MariaDB"), (10, 11, 4));
+        assert_eq!(parse_semver("8.0.35"), (8, 0, 35));
+        assert_eq!(parse_semver("14.2"), (14, 2, 0));
+        assert_eq!(parse_semver("invalid"), (0, 0, 0));
+        assert_eq!(parse_semver("5.7.0-TiDB-v6.1.0"), (5, 7, 0));
+    }
+
+    #[test]
+    fn test_version_ge() {
+        assert!(version_ge(10, 11, 4, 10, 3, 0));
+        assert!(version_ge(8, 0, 35, 8, 0, 35));
+        assert!(!version_ge(8, 0, 34, 8, 0, 35));
+        assert!(!version_ge(7, 9, 99, 8, 0, 0));
+        assert!(version_ge(10, 0, 0, 9, 99, 99));
+    }
+
+    #[test]
+    fn test_db_capabilities_default() {
+        let caps = DbCapabilities::default();
+        assert_eq!(caps.version_str, "");
+        assert_eq!(caps.db_flavor, "");
+        assert_eq!(caps.version_major, 0);
+        assert!(!caps.is_maria_db);
+        assert!(!caps.has_sequences);
+    }
+}
+
 // ── 各方言探测函数 ────────────────────────────────────────────────────────────
 
 async fn detect_mysql_caps(config: &ConnConfig, password: Option<&str>) -> Result<DbCapabilities, String> {

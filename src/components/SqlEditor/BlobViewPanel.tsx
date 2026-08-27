@@ -1,12 +1,15 @@
 ﻿// R7 — BLOB/二进制查看：hex 视图、图片预览、文件下载
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import { createPortal } from 'react-dom'
-import { X, Download, Eye, Hash } from 'lucide-react'
+import { X, Download, Eye, Hash, Copy, Check, Pencil } from 'lucide-react'
+import { copyText } from '../../utils/clipboard'
 
 interface Props {
   value: string | null    // raw cell value (may be base64 for binary, or plain text)
   column: string
   onClose: () => void
+  editable?: boolean
+  onSave?: (value: string | null) => void
 }
 
 type View = 'auto' | 'hex' | 'text'
@@ -53,31 +56,40 @@ function guessIsText(val: string): boolean {
   return nonPrintable / sample.length < 0.1
 }
 
-export default function BlobViewPanel({ value, column, onClose }: Props) {
+export default function BlobViewPanel({ value, column, onClose, editable = false, onSave }: Props) {
   const [view, setView] = useState<View>('auto')
+  const [copied, setCopied] = useState(false)
+  const [content, setContent] = useState(value)
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(value ?? '')
+  useEffect(() => {
+    setContent(value)
+    setDraft(value ?? '')
+    setEditing(false)
+  }, [value])
 
-  const isImage = useMemo(() => value ? guessIsImage(value) : false, [value])
-  const isText = useMemo(() => value ? guessIsText(value) : false, [value])
+  const isImage = useMemo(() => content ? guessIsImage(content) : false, [content])
+  const isText = useMemo(() => content ? guessIsText(content) : false, [content])
 
   const imgDataUrl = useMemo(() => {
-    if (!value || !isImage) return null
+    if (!content || !isImage) return null
     try {
       // Convert raw string to base64
-      const bytes = Array.from(value).map(c => c.charCodeAt(0))
+      const bytes = Array.from(content).map(c => c.charCodeAt(0))
       const b64 = btoa(String.fromCharCode(...bytes))
       // Guess MIME
-      const b0 = value.charCodeAt(0), b1 = value.charCodeAt(1)
+      const b0 = content.charCodeAt(0), b1 = content.charCodeAt(1)
       const mime = b0 === 0xFF && b1 === 0xD8 ? 'image/jpeg'
         : b0 === 0x89 ? 'image/png'
         : b0 === 0x47 ? 'image/gif'
         : 'image/webp'
       return `data:${mime};base64,${b64}`
     } catch { return null }
-  }, [value, isImage])
+  }, [content, isImage])
 
   const handleDownload = () => {
-    if (!value) return
-    const bytes = new Uint8Array(Array.from(value).map(c => c.charCodeAt(0)))
+    if (!content) return
+    const bytes = new Uint8Array(Array.from(content).map(c => c.charCodeAt(0)))
     const blob = new Blob([bytes])
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -85,6 +97,21 @@ export default function BlobViewPanel({ value, column, onClose }: Props) {
     a.download = `${column}.bin`
     a.click()
     URL.revokeObjectURL(url)
+  }
+
+  const handleCopy = async () => {
+    if (content == null) return
+    if (await copyText(content)) {
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1400)
+    }
+  }
+
+  const handleSave = () => {
+    // 空字符串与 NULL 在数据库中语义不同；预览编辑应和表格内编辑保持一致。
+    onSave?.(draft)
+    setContent(draft)
+    setEditing(false)
   }
 
   const displayView = view === 'auto'
@@ -98,9 +125,15 @@ export default function BlobViewPanel({ value, column, onClose }: Props) {
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
           <Eye size={14} color="var(--accent)" />
-          <span style={{ fontWeight: 600, fontSize: 13 }}>BLOB 查看器 — {column}</span>
-          {value && <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 8 }}>{value.length.toLocaleString()} 字节</span>}
+          <span style={{ fontWeight: 600, fontSize: 13 }}>字段内容预览 — {column}</span>
+          {content && <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 8 }}>{content.length.toLocaleString()} 字节</span>}
           <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+            {editable && !editing && <button onClick={() => { setDraft(content ?? ''); setView('text'); setEditing(true) }} data-tip="编辑内容" aria-label="编辑内容" style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '4px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--text)', fontSize: 11, cursor: 'pointer' }}>
+              <Pencil size={11} />编辑
+            </button>}
+            <button onClick={handleCopy} data-tip="复制完整内容" aria-label="复制完整内容" style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '4px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--text)', fontSize: 11, cursor: content == null ? 'default' : 'pointer', opacity: content == null ? 0.5 : 1 }} disabled={content == null}>
+              {copied ? <Check size={11} /> : <Copy size={11} />}{copied ? '已复制' : '复制'}
+            </button>
             <button onClick={handleDownload} data-tip="下载为文件" style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '4px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--text)', fontSize: 11, cursor: 'pointer' }}>
               <Download size={11} />下载
             </button>
@@ -127,26 +160,39 @@ export default function BlobViewPanel({ value, column, onClose }: Props) {
         </div>
 
         <div style={{ flex: 1, overflow: 'auto', padding: 16 }}>
-          {!value && <div style={{ color: 'var(--text-muted)', fontSize: 12 }}>NULL / 空值</div>}
-          {value && displayView === 'image' && imgDataUrl && (
+          {editing ? (
+            <textarea
+              autoFocus
+              value={draft}
+              onChange={e => setDraft(e.target.value)}
+              style={{ width: '100%', minHeight: 360, boxSizing: 'border-box', resize: 'vertical', padding: 12, border: '1px solid var(--accent)', borderRadius: 8, background: 'var(--surface-2)', color: 'var(--text)', fontFamily: 'var(--font-mono)', fontSize: 12, lineHeight: 1.6, outline: 'none' }}
+            />
+          ) : <>
+          {!content && <div style={{ color: 'var(--text-muted)', fontSize: 12 }}>NULL / 空值</div>}
+          {content && displayView === 'image' && imgDataUrl && (
             <div style={{ display: 'flex', justifyContent: 'center' }}>
               <img src={imgDataUrl} alt={column} style={{ maxWidth: '100%', maxHeight: 400, objectFit: 'contain', borderRadius: 8 }} />
             </div>
           )}
-          {value && displayView === 'image' && !imgDataUrl && (
+          {content && displayView === 'image' && !imgDataUrl && (
             <div style={{ color: 'var(--error)', fontSize: 12 }}>无法渲染图片数据</div>
           )}
-          {value && (displayView === 'hex' || (displayView === 'image' && !imgDataUrl)) && (
+          {content && (displayView === 'hex' || (displayView === 'image' && !imgDataUrl)) && (
             <pre style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text)', whiteSpace: 'pre', overflow: 'auto', margin: 0, lineHeight: 1.6 }}>
-              {hexDump(value)}
+              {hexDump(content)}
             </pre>
           )}
-          {value && displayView === 'text' && (
+          {content && displayView === 'text' && (
             <pre style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text)', whiteSpace: 'pre-wrap', wordBreak: 'break-all', margin: 0 }}>
-              {value.slice(0, 100000)}{value.length > 100000 ? '\n... (截断)' : ''}
+              {content.slice(0, 100000)}{content.length > 100000 ? '\n... (截断)' : ''}
             </pre>
           )}
+          </>}
         </div>
+        {editing && <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '10px 16px', borderTop: '1px solid var(--border-subtle)' }}>
+          <button onClick={() => setEditing(false)} style={{ padding: '5px 12px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--text)', cursor: 'pointer', fontSize: 11 }}>取消</button>
+          <button onClick={handleSave} style={{ padding: '5px 12px', borderRadius: 6, border: '1px solid var(--accent)', background: 'var(--accent)', color: '#fff', cursor: 'pointer', fontSize: 11 }}>保存</button>
+        </div>}
       </div>
     </div>,
     document.body

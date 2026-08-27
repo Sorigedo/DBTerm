@@ -33,7 +33,7 @@ function tearOffTab(tab: WorkspaceTab, closeTab: (id: string, force?: boolean) =
   markDetaching(tab.id)
   openNewAppWindowWithTab(tab, snapshot, sqlDraft)
     .then(() => closeTab(tab.id, true))
-    .catch((e) => toast.error(`绉诲埌鏂扮獥鍙ｅけ璐ワ細${String(e)}`))
+    .catch((e) => toast.error(`移动到新窗口失败：${String(e)}`))
     .finally(() => setTimeout(() => clearDetaching(tab.id), 1500))
 }
 
@@ -78,9 +78,9 @@ function TabCtxMenu({
   }
 
   const items: Array<{ label: string; action: () => void; danger?: boolean; shortcut?: string } | 'divider'> = [
-    { label: '鍏抽棴鏍囩', action: () => { requestCloseTab(tabId); onClose() }, danger: true, shortcut: scStr('closeTab') },
-    { label: '鍏抽棴鍏朵粬鏍囩', action: () => { closeOtherTabs(tabId); onClose() } },
-    ...(hasRight ? [{ label: '鍏抽棴鍙充晶鏍囩', action: () => { closeTabsToRight(tabId); onClose() } } as const] : []),
+    { label: '关闭标签', action: () => { requestCloseTab(tabId); onClose() }, danger: true, shortcut: scStr('closeTab') },
+    { label: '关闭其他标签', action: () => { closeOtherTabs(tabId); onClose() } },
+    ...(hasRight ? [{ label: '关闭右侧标签', action: () => { closeTabsToRight(tabId); onClose() } } as const] : []),
     'divider',
     ...(canSplit
       ? [
@@ -88,7 +88,7 @@ function TabCtxMenu({
           { label: '在下方分屏显示', action: () => { openSplit('v'); moveTabToPane(tabId, 'b'); onClose() } } as const,
         ] : []),
     ...(inB
-      ? [{ label: '绉诲洖涓诲睆', action: () => { moveTabToPane(tabId, 'a'); onClose() } } as const] : []),
+      ? [{ label: '移回主屏', action: () => { moveTabToPane(tabId, 'a'); onClose() } } as const] : []),
     ...(canTearOff && tab
       ? [{ label: '移到新窗口', action: () => { tearOffTab(tab, closeTab); onClose() } } as const] : []),
     { label: '重命名', action: () => { onRename(); onClose() } },
@@ -489,7 +489,7 @@ export default function TabBar() {
                 <button
                   className="tab__close"
                   onClick={(e) => { e.stopPropagation(); requestCloseTab(tab.id) }}
-                  data-tip="鍏抽棴"
+                  data-tip="关闭"
                 >
                   <X size={11} strokeWidth={2} />
                 </button>
@@ -564,14 +564,14 @@ export default function TabBar() {
           <button
             className={`tab-split-btn${splitOn && splitDir === 'h' ? ' active' : ''}`}
             onClick={() => toggleSplit('h')}
-            data-tip={splitOn && splitDir === 'h' ? '鍙栨秷鍒嗗睆' : '宸﹀彸鍒嗗睆'}
+            data-tip={splitOn && splitDir === 'h' ? '取消分屏' : '左右分屏'}
           >
             <SquareSplitHorizontal size={14} strokeWidth={1.8} />
           </button>
           <button
             className={`tab-split-btn${splitOn && splitDir === 'v' ? ' active' : ''}`}
             onClick={() => toggleSplit('v')}
-            data-tip={splitOn && splitDir === 'v' ? '鍙栨秷鍒嗗睆' : '涓婁笅鍒嗗睆'}
+            data-tip={splitOn && splitDir === 'v' ? '取消分屏' : '上下分屏'}
           >
             <SquareSplitVertical size={14} strokeWidth={1.8} />
           </button>

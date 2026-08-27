@@ -1198,11 +1198,11 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
               {savedQueries.length === 0
                 ? <div className="dbt-empty">暂无保存的查询（在查询页保存后显示）</div>
                 : savedQueries.map(q => (
-                  <div key={q.id} className="dbt-table-row" title={`${q.name}\n\n${q.sql}`}
+                  <div key={q.id} className="dbt-table-row dbt-saved-query-row" title={`${q.name}\n\n${q.sql}`}
                     onDoubleClick={() => openSavedQuery(q)}
                     onContextMenu={e => { e.preventDefault(); e.stopPropagation(); setSavedRootCtx(null); setSavedCtx({ x: e.clientX, y: e.clientY, q }) }}>
                     <FileCode2 size={11} strokeWidth={1.7} style={{ color: q.connId === '' ? 'var(--text-muted)' : 'var(--accent)', flexShrink: 0 }} />
-                    <span className="dbt-item-name">{q.name}{q.connId === '' && <span style={{ color: 'var(--text-muted)', fontSize: 10, marginLeft: 4 }}>全局</span>}</span>
+                    <span className="dbt-item-name dbt-saved-query-name">{q.name}{q.connId === '' && <span style={{ color: 'var(--text-muted)', fontSize: 10, marginLeft: 6 }}>全局</span>}</span>
                     <button className="dbt-more-btn" onClick={e => { e.stopPropagation(); setSavedRootCtx(null); setSavedCtx({ x: e.clientX, y: e.clientY, q }) }}>
                       <MoreHorizontal size={11} strokeWidth={2} />
                     </button>

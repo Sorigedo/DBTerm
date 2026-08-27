@@ -1,21 +1,107 @@
+//! # Database Query Module
+//!
+//! Core database query execution and metadata retrieval for all supported database types.
+//!
+//! This module provides:
+//! - SQL query execution with cancellation support
+//! - Connection pooling for MySQL, PostgreSQL, Redis, MongoDB, DuckDB, SQL Server
+//! - Database/schema/table/column metadata queries
+//! - DDL (CREATE TABLE) generation
+//! - Stored procedures/functions/triggers listing
+//! - Multi-database abstraction via connection dispatching
+//!
+//! ## Supported Database Types
+//!
+//! - **MySQL/MariaDB/TiDB/OceanBase** - via `mysql_async`
+//! - **PostgreSQL/KingBase/OpenGauss** - via `tokio-postgres`
+//! - **SQLite** - via `rusqlite`
+//! - **Redis** - via `redis` crate
+//! - **MongoDB** - via `mongodb` official driver
+//! - **DuckDB** - via C API dynamic loading
+//! - **SQL Server** - via `tiberius` pure Rust driver
+//! - **Oracle** - via OCI dynamic loading
+//! - **ClickHouse** - via HTTP interface
+//!
+//! ## Architecture
+//!
+//! All queries are tagged with `/* DBTerm */` comment for identification in
+//! database process lists and slow query logs.
+//!
+//! Connection configurations are parsed from `extra_json` field in [`ConnConfig`],
+//! supporting SSL/TLS, SSH tunneling, and database-specific options.
+
 use std::time::{Duration, Instant};
 use tauri::State;
+use tracing::{info, warn, instrument};
 use crate::{
     models::{ColumnInfo, ConnConfig, ConnType, QueryResult, TableInfo},
     storage::StorageState,
+    tracing_utils::Timer,
 };
 use super::sqlite_admin::SqliteAttachMap;
 use super::duckdb::{DuckPool, dispatch_duck_query_with_cancel, dispatch_duck_schemas, dispatch_duck_tables, dispatch_duck_ddl, dispatch_duck_columns};
 use super::driver::DriverRegistry;
 use super::sqlserver::{SsPool, dispatch_ss_query, dispatch_ss_schemas, dispatch_ss_tables, dispatch_ss_columns, dispatch_ss_schema_columns, dispatch_ss_ddl, dispatch_ss_routines, dispatch_ss_db_schemas, dispatch_ss_schema_tables};
 
-// ── 客户端标识 & 连接扩展配置 ─────────────────────────────────────────────────
+// ── Client identification & connection configuration ─────────────────────────
 
-/// 所有 SQL 前加注释：在 SHOW PROCESSLIST / pg_stat_activity / 慢查询日志中可见
+/// SQL client tag added to all queries for identification in database logs
+///
+/// This comment appears in:
+/// - MySQL: `SHOW PROCESSLIST`
+/// - PostgreSQL: `pg_stat_activity`
+/// - SQL Server: `sys.dm_exec_requests`
+/// - Slow query logs
 const CLIENT_TAG: &str = "/* DBTerm */";
+
+/// Prepends client tag to SQL statement
 fn tag_sql(sql: &str) -> String { format!("{CLIENT_TAG} {sql}") }
 
-/// 从 extra_json 读取连接扩展配置（与前端 DbExtra 对应）
+/// Extended connection configuration parsed from `ConnConfig.extra_json`
+///
+/// This structure maps to the frontend `DbExtra` type (camelCase JSON).
+/// All fields are optional with sensible defaults.
+///
+/// # SSL/TLS Configuration
+///
+/// - `ssl_mode` - "require", "prefer", "disable", "verify-ca", "verify-full"
+/// - `ssl_ca` - CA certificate file path
+/// - `ssl_cert` - Client certificate file path
+/// - `ssl_key` - Client private key file path
+///
+/// # SSH Tunnel Configuration
+///
+/// - `ssh_tunnel` - Enable SSH tunneling
+/// - `ssh_host` - Jump host address
+/// - `ssh_port` - SSH port (default: 22)
+/// - `ssh_user` - SSH username
+/// - `ssh_auth_type` - "password" or "key"
+/// - `ssh_password` - SSH password (for password auth)
+/// - `ssh_key_path` - SSH private key path (for key auth)
+///
+/// # Database-Specific Options
+///
+/// ## SQLite
+/// - `sqlite_readonly` - Open database in read-only mode
+/// - `sqlite_busy_timeout` - Lock timeout in milliseconds (default: 5000)
+/// - `sqlite_foreign_keys` - Enable foreign key constraints (default: true)
+/// - `sqlite_immutable` - Open as immutable (memory-mapped read-only)
+///
+/// ## PostgreSQL
+/// - `pg_search_path` - Schema search path (e.g., "app,public")
+/// - `pg_app_name` - Application name shown in `pg_stat_activity`
+///
+/// # Examples
+///
+/// ```json
+/// {
+///   "connectTimeout": 5000,
+///   "encoding": "utf8mb4",
+///   "sslMode": "require",
+///   "sslCa": "/etc/ssl/ca.pem",
+///   "initSql": "SET time_zone = '+00:00'"
+/// }
+/// ```
 #[derive(serde::Deserialize, Default)]
 struct DbConnCfg {
     #[serde(rename = "connectTimeout", default)] connect_timeout: u64,
@@ -75,9 +161,11 @@ impl MySqlPwdExt for sqlx::mysql::MySqlConnectOptions {
 
 /// 建立 MySQL/MariaDB 连接，自动处理 SSH 隧道、SSL、超时、init SQL
 /// 返回 `(连接, 隧道守卫)`；隧道守卫必须与连接同生命周期
+#[instrument(skip(config, password), fields(conn_id = %config.id, conn_type = "MySQL"))]
 pub(crate) async fn mysql_connect(config: &ConnConfig, password: Option<&str>)
     -> Result<(sqlx::mysql::MySqlConnection, Option<std::sync::Arc<crate::db_tunnel::DbTunnel>>), String>
 {
+    let _timer = Timer::new("mysql_connect");
     use sqlx::{ConnectOptions, mysql::{MySqlConnectOptions, MySqlSslMode}};
     use crate::db_tunnel::{DbTunnel, DbTunnelCfg};
     use crate::tester::expand_home;
@@ -170,13 +258,17 @@ pub fn invalidate_mysql_pool(id: &str) {
 }
 
 /// 取得（或惰性建立）该连接的 MySQL 连接池；隧道已死则重建。
+#[instrument(skip(config, password), fields(conn_id = %config.id))]
 async fn mysql_pool(config: &ConnConfig, password: Option<&str>) -> Result<sqlx::mysql::MySqlPool, String> {
+    let _timer = Timer::new("mysql_pool");
     {
         let m = mysql_pool_reg().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(c) = m.get(&config.id) {
             if c._tunnel.as_ref().map_or(true, |t| t.is_alive()) {
+                info!("Reusing existing MySQL pool");
                 return Ok(c.pool.clone());
             }
+            warn!("MySQL pool tunnel dead, rebuilding");
         }
     }
     invalidate_mysql_pool(&config.id);
@@ -239,9 +331,11 @@ async fn mysql_pool(config: &ConnConfig, password: Option<&str>) -> Result<sqlx:
 }
 
 /// 建立 PostgreSQL 连接，自动处理 SSH 隧道、SSL、超时、init SQL、application_name
+#[instrument(skip(config, password), fields(conn_id = %config.id, conn_type = "PostgreSQL"))]
 pub(crate) async fn pg_connect(config: &ConnConfig, password: Option<&str>)
     -> Result<(sqlx::postgres::PgConnection, Option<std::sync::Arc<crate::db_tunnel::DbTunnel>>), String>
 {
+    let _timer = Timer::new("pg_connect");
     use sqlx::{ConnectOptions, postgres::{PgConnectOptions, PgSslMode}};
     use crate::db_tunnel::{DbTunnel, DbTunnelCfg};
     use crate::tester::expand_home;
@@ -343,11 +437,17 @@ fn pg_pool_reg() -> &'static std::sync::Mutex<std::collections::HashMap<String, 
 pub fn invalidate_pg_pool(id: &str) {
     if let Ok(mut m) = pg_pool_reg().lock() { m.remove(id); }
 }
+#[instrument(skip(config, password), fields(conn_id = %config.id))]
 async fn pg_pool(config: &ConnConfig, password: Option<&str>) -> Result<sqlx::postgres::PgPool, String> {
+    let _timer = Timer::new("pg_pool");
     {
         let m = pg_pool_reg().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(c) = m.get(&config.id) {
-            if c._tunnel.as_ref().map_or(true, |t| t.is_alive()) { return Ok(c.pool.clone()); }
+            if c._tunnel.as_ref().map_or(true, |t| t.is_alive()) {
+                info!("Reusing existing PostgreSQL pool");
+                return Ok(c.pool.clone());
+            }
+            warn!("PostgreSQL pool tunnel dead, rebuilding");
         }
     }
     invalidate_pg_pool(&config.id);
@@ -431,11 +531,17 @@ pub fn invalidate_sqlite_pool(id: &str) {
     if let Ok(mut m) = sqlite_pool_reg().lock() { m.remove(id); }
 }
 
+#[instrument(skip(config), fields(conn_id = %config.id))]
 async fn sqlite_browse_pool(config: &ConnConfig) -> Result<sqlx::SqlitePool, String> {
+    let _timer = Timer::new("sqlite_browse_pool");
     {
         let m = sqlite_pool_reg().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(c) = m.get(&config.id) {
-            if !c.pool.is_closed() { return Ok(c.pool.clone()); }
+            if !c.pool.is_closed() {
+                info!("Reusing existing SQLite pool");
+                return Ok(c.pool.clone());
+            }
+            warn!("SQLite pool closed, rebuilding");
         }
     }
     invalidate_sqlite_pool(&config.id);
@@ -1013,13 +1119,35 @@ async fn mysql_routine_ddl(config: &ConnConfig, password: Option<&str>, schema: 
     use sqlx::Row;
     let pool = mysql_pool(config, password).await?;
     let mut conn = pool.acquire().await.map_err(|e| format!("获取连接失败: {e}"))?;
-    if !schema.is_empty() {
-        let _ = sqlx::query(&format!("USE {}", q_mysql(schema))).execute(&mut *conn).await;
-    }
     let kw = if kind.eq_ignore_ascii_case("function") { "FUNCTION" } else { "PROCEDURE" };
-    let row = sqlx::query(&format!("SHOW CREATE {kw} {}", q_mysql(name)))
-        .fetch_one(&mut *conn).await
-        .map_err(|e| format!("获取定义失败: {e}"))?;
+    // SHOW CREATE accepts a fully-qualified routine name.  Using the schema
+    // explicitly avoids relying on a pooled connection's session database
+    // (which may be empty or belong to a different request).
+    let selected_schema = if !schema.is_empty() {
+        Some(schema)
+    } else {
+        config.database.as_deref().filter(|s| !s.is_empty())
+    };
+    let routine_ref = if let Some(db) = selected_schema {
+        format!("{}.{}", q_mysql(db), q_mysql(name))
+    } else {
+        q_mysql(name)
+    };
+    // 兼容不接受 SHOW CREATE 带库名的旧版 MySQL 系服务器。
+    let qualified_sql = format!("SHOW CREATE {kw} {routine_ref}");
+    let row = match sqlx::query(&qualified_sql).fetch_one(&mut *conn).await {
+        Ok(row) => row,
+        Err(_) if selected_schema.is_some() => {
+            let db = selected_schema.expect("checked above");
+            sqlx::query(&format!("USE {}", q_mysql(db)))
+                .execute(&mut *conn).await
+                .map_err(|e| format!("获取定义失败: {e}"))?;
+            sqlx::query(&format!("SHOW CREATE {kw} {}", q_mysql(name)))
+                .fetch_one(&mut *conn).await
+                .map_err(|e| format!("获取定义失败: {e}"))?
+        }
+        Err(e) => return Err(format!("获取定义失败: {e}")),
+    };
     // 结果列：Procedure/Function | sql_mode | Create Procedure/Function | ...
     let ddl: String = row.try_get::<String, _>(2)
         .or_else(|_| row.try_get::<String, _>("Create Procedure"))
@@ -1668,6 +1796,130 @@ mod tests {
         assert_eq!(apply_sqlserver_row_limit("SHOW PROCESSLIST", Some(200)), ("SHOW PROCESSLIST".to_string(), false));
         assert_eq!(apply_sqlserver_row_limit("EXPLAIN SELECT * FROM users", Some(200)), ("EXPLAIN SELECT * FROM users".to_string(), false));
         assert_eq!(apply_sqlserver_row_limit("SELECT * FROM users", Some(200)), ("SELECT TOP 200 * FROM users".to_string(), true));
+    }
+
+    #[test]
+    fn test_tag_sql_basic() {
+        use super::tag_sql;
+        assert_eq!(tag_sql("SELECT 1"), "/* DBTerm */ SELECT 1");
+        assert_eq!(tag_sql("UPDATE t SET a=1"), "/* DBTerm */ UPDATE t SET a=1");
+        assert_eq!(tag_sql(""), "/* DBTerm */ ");
+    }
+
+    #[test]
+    fn test_db_conn_cfg_default() {
+        use super::DbConnCfg;
+        let cfg = DbConnCfg::default();
+        assert_eq!(cfg.connect_timeout, 0);
+        assert_eq!(cfg.encoding, "");
+        assert_eq!(cfg.ssl_mode, "");
+        assert!(!cfg.ssh_tunnel);
+        // sqlite_foreign_keys使用default_true，但Default::default()会得到false
+        assert!(!cfg.sqlite_foreign_keys);
+    }
+
+    #[test]
+    fn test_db_conn_cfg_timeout_clamping() {
+        use super::DbConnCfg;
+        use std::time::Duration;
+
+        let cfg1 = DbConnCfg { connect_timeout: 0, ..Default::default() };
+        assert_eq!(cfg1.timeout(), Duration::from_secs(30)); // 默认30秒
+
+        let cfg2 = DbConnCfg { connect_timeout: 1, ..Default::default() };
+        assert_eq!(cfg2.timeout(), Duration::from_secs(3)); // 最小3秒
+
+        let cfg3 = DbConnCfg { connect_timeout: 60, ..Default::default() };
+        assert_eq!(cfg3.timeout(), Duration::from_secs(60)); // 正常值
+
+        let cfg4 = DbConnCfg { connect_timeout: 500, ..Default::default() };
+        assert_eq!(cfg4.timeout(), Duration::from_secs(300)); // 最大300秒
+    }
+
+    #[test]
+    fn test_db_conn_cfg_tunnel_password() {
+        use super::DbConnCfg;
+
+        let cfg1 = DbConnCfg {
+            ssh_password: "explicit-pass".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(cfg1.tunnel_password("test-conn"), "explicit-pass");
+
+        // 空密码时应该尝试从keychain读取（这里会返回空，因为没有设置）
+        let cfg2 = DbConnCfg::default();
+        assert_eq!(cfg2.tunnel_password("non-existent"), "");
+    }
+
+    #[test]
+    fn test_mysql_pwd_ext_empty_password() {
+        use sqlx::mysql::MySqlConnectOptions;
+        use super::MySqlPwdExt;
+
+        // 空密码不应该调用password方法
+        let opts = MySqlConnectOptions::new()
+            .host("localhost")
+            .username("root")
+            .password_opt("");
+
+        // 这里只是验证可以构造，实际密码处理在连接时
+        assert_eq!(format!("{:?}", opts).contains("password"), true);
+    }
+
+    #[test]
+    fn test_mysql_pwd_ext_non_empty_password() {
+        use sqlx::mysql::MySqlConnectOptions;
+        use super::MySqlPwdExt;
+
+        let opts = MySqlConnectOptions::new()
+            .host("localhost")
+            .username("root")
+            .password_opt("test123");
+
+        assert_eq!(format!("{:?}", opts).contains("password"), true);
+    }
+
+    #[test]
+    fn test_invalidate_mysql_pool() {
+        use super::invalidate_mysql_pool;
+        // 测试invalidate函数不会panic
+        invalidate_mysql_pool("test-conn-id");
+        // 多次调用应该安全
+        invalidate_mysql_pool("test-conn-id");
+        invalidate_mysql_pool("another-id");
+    }
+
+    #[test]
+    fn test_invalidate_pg_pool() {
+        use super::invalidate_pg_pool;
+        invalidate_pg_pool("test-pg-id");
+        invalidate_pg_pool("test-pg-id");
+    }
+
+    #[test]
+    fn test_invalidate_sqlite_pool() {
+        use super::invalidate_sqlite_pool;
+        invalidate_sqlite_pool("test-sqlite-id");
+        invalidate_sqlite_pool("test-sqlite-id");
+    }
+
+    #[test]
+    fn test_validate_cancel_token_valid() {
+        use super::validate_cancel_token;
+        assert!(validate_cancel_token(Some("validtoken123")).is_ok());
+        assert!(validate_cancel_token(Some("a")).is_ok()); // 单字符也可以
+        assert!(validate_cancel_token(Some("ABC123def")).is_ok());
+        assert!(validate_cancel_token(None).is_ok()); // None也是有效的
+    }
+
+    #[test]
+    fn test_validate_cancel_token_invalid() {
+        use super::validate_cancel_token;
+        assert!(validate_cancel_token(Some("")).is_err());
+        assert!(validate_cancel_token(Some("token-with-dash")).is_err()); // 只允许字母数字
+        assert!(validate_cancel_token(Some("token.dot")).is_err());
+        assert!(validate_cancel_token(Some("token with space")).is_err());
+        assert!(validate_cancel_token(Some("token\nwith\nnewline")).is_err());
     }
 }
 

@@ -578,3 +578,66 @@ pub async fn db_diff_data(
         sample_capped,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_q_mysql() {
+        assert_eq!(q("table", true), "`table`");
+        assert_eq!(q("col`name", true), "`col``name`");
+    }
+
+    #[test]
+    fn test_q_pg() {
+        assert_eq!(q("table", false), "\"table\"");
+        assert_eq!(q("col\"name", false), "\"col\"\"name\"");
+    }
+
+    #[test]
+    fn test_escape_val_null() {
+        assert_eq!(escape_val(&None, true), "NULL");
+        assert_eq!(escape_val(&None, false), "NULL");
+    }
+
+    #[test]
+    fn test_escape_val_mysql() {
+        assert_eq!(escape_val(&Some("hello".to_string()), true), "'hello'");
+        assert_eq!(escape_val(&Some("a\\b".to_string()), true), "'a\\\\b'");
+        assert_eq!(escape_val(&Some("a'b".to_string()), true), "'a''b'");
+    }
+
+    #[test]
+    fn test_escape_val_pg() {
+        assert_eq!(escape_val(&Some("hello".to_string()), false), "'hello'");
+        assert_eq!(escape_val(&Some("a\\b".to_string()), false), "'a\\b'");
+        assert_eq!(escape_val(&Some("a'b".to_string()), false), "'a''b'");
+    }
+
+    #[test]
+    fn test_chunk_needs_refill() {
+        let mut chunk = Chunk::new();
+        assert!(chunk.needs_refill());
+        chunk.rows.push(vec![Some("1".to_string())]);
+        chunk.idx = 0;
+        assert!(!chunk.needs_refill());
+        chunk.idx = 1;
+        assert!(chunk.needs_refill());
+        chunk.done = true;
+        assert!(!chunk.needs_refill());
+    }
+
+    #[test]
+    fn test_chunk_peek_advance() {
+        let mut chunk = Chunk::new();
+        chunk.rows.push(vec![Some("1".to_string())]);
+        chunk.rows.push(vec![Some("2".to_string())]);
+        chunk.idx = 0;
+        assert_eq!(chunk.peek_cloned(), Some(vec![Some("1".to_string())]));
+        chunk.advance();
+        assert_eq!(chunk.peek_cloned(), Some(vec![Some("2".to_string())]));
+        chunk.advance();
+        assert_eq!(chunk.peek_cloned(), None);
+    }
+}

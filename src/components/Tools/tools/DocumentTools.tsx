@@ -19,6 +19,45 @@ const TEXT_EXTS = ['md', 'markdown', 'txt']
 
 const markdown = new MarkdownIt({ html: false, linkify: true, typographer: true })
 
+// Mermaid blocks are rendered to inline SVG before the document is paginated.
+// Keeping the source in a <pre> gives us a readable fallback if Mermaid rejects
+// a diagram (for example, because the source contains a syntax error).
+markdown.renderer.rules.fence = (tokens, index) => {
+  const token = tokens[index]
+  const language = token.info.trim().split(/\s+/)[0]?.toLowerCase()
+  const code = markdown.utils.escapeHtml(token.content)
+  if (language === 'mermaid') {
+    return `<div class="mdpdf-mermaid"><pre>${code}</pre></div>\n`
+  }
+  const className = language ? ` class="language-${markdown.utils.escapeHtml(language)}"` : ''
+  return `<pre><code${className}>${code}</code></pre>\n`
+}
+
+let mermaidRenderId = 0
+
+async function renderMermaidBlocks(html: string) {
+  const holder = document.createElement('div')
+  holder.innerHTML = html
+  const blocks = Array.from(holder.querySelectorAll<HTMLElement>('.mdpdf-mermaid'))
+  if (blocks.length === 0) return html
+
+  const { default: mermaid } = await import('mermaid')
+  mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'base' })
+  for (const block of blocks) {
+    const source = block.querySelector('pre')?.textContent?.trim() || ''
+    if (!source) continue
+    try {
+      const result = await mermaid.render(`mdpdf-mermaid-${++mermaidRenderId}`, source)
+      block.innerHTML = result.svg
+      block.classList.add('is-rendered')
+    } catch {
+      // Leave the original source visible as a useful fallback.
+      block.classList.add('is-error')
+    }
+  }
+  return holder.innerHTML
+}
+
 type ConvertResult = {
   path: string
   engine: string
@@ -563,7 +602,8 @@ export function DocumentConvertTool() {
   const targetOptions = useMemo(() => targetOptionsForSource(inputExt), [inputExt])
   const hasSelectedSource = Boolean(inputPath || sourceName)
   const canUseTextPdf = targetFormat === 'pdf' && hasSelectedSource && TEXT_EXTS.includes(inputExt)
-  const renderedHtml = useMemo(() => styledSourceToHtml(source, sourceName), [source, sourceName])
+  const [renderedHtml, setRenderedHtml] = useState(() => styledSourceToHtml(source, sourceName))
+  const mermaidRenderPromise = useRef<Promise<void>>(Promise.resolve())
   const effectiveTitle = title.trim() || firstHeading(source) || stripExt(sourceName || inputPath) || '文档'
   const sourceDisplayName = hasSelectedSource ? baseName(inputPath || sourceName) : '选择文件'
   const sourceDisplayPath = hasSelectedSource ? (inputPath || sourceName) : 'Word、Excel、PPT、PDF、Markdown、TXT、CSV、HTML'
@@ -581,6 +621,22 @@ export function DocumentConvertTool() {
     angle: watermarkAngle,
     opacity: watermarkOpacity,
   }
+
+  useEffect(() => {
+    let cancelled = false
+    const render = async () => {
+      const html = styledSourceToHtml(source, sourceName)
+      const rendered = await renderMermaidBlocks(html)
+      if (!cancelled) setRenderedHtml(rendered)
+    }
+    const promise = render().catch(() => {
+      if (!cancelled) setRenderedHtml(styledSourceToHtml(source, sourceName))
+    })
+    mermaidRenderPromise.current = promise
+    return () => {
+      cancelled = true
+    }
+  }, [source, sourceName])
 
   useEffect(() => {
     if (!targetOptions.includes(targetFormat)) setTargetFormat(targetOptions[0] ?? 'pdf')
@@ -669,6 +725,9 @@ export function DocumentConvertTool() {
     setBusy(true)
     let paginatedDoc: HTMLElement | null = null
     try {
+      await mermaidRenderPromise.current
+      // Wait for React to commit the rendered SVG into the hidden export host.
+      await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
       const { jsPDF } = await import('jspdf')
       const html2canvas = (await import('html2canvas')).default
       const pdf = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait', compress: true })

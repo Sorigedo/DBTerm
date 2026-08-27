@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { THEMES, buildThemeVars, type ThemeKey } from '../themes'
-import { DEFAULT_SHORTCUTS } from '../utils/shortcuts'
+import { THEMES, buildThemeVars, type ThemeKey } from '../themes/index.ts'
+import { DEFAULT_SHORTCUTS } from '../utils/shortcuts.ts'
 
 // system 模式下随 OS 切换时使用的默认深/浅主题
 export const DEFAULT_DARK_THEME:  ThemeKey = 'jetbrainsGraphite'

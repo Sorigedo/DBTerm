@@ -11,9 +11,11 @@ use std::sync::Arc;
 use std::time::Instant;
 use tauri::State;
 use tokio::sync::Mutex as AsyncMutex;
+use tracing::{info, instrument};
 use crate::{
     models::{ConnConfig, ConnType, QueryResult},
     storage::StorageState,
+    tracing_utils::Timer,
 };
 use super::duckdb::{DuckPool, dispatch_duck_query};
 use super::sqlserver::{SsPool, dispatch_ss_query};
@@ -345,6 +347,7 @@ async fn run_on_sqlite(
 
 /// 开始事务：建立持久连接并执行 BEGIN
 #[tauri::command]
+#[instrument(skip(storage, tx_state, duck_pool, ss_pool, oracle_tx_pool, registry), fields(conn_id = %id))]
 pub async fn db_begin_tx(
     id: String,
     database: Option<String>,
@@ -356,6 +359,8 @@ pub async fn db_begin_tx(
     oracle_tx_pool: State<'_, OracleTxPool>,
     registry: State<'_, DriverRegistry>,
 ) -> Result<(), String> {
+    let _timer = Timer::new("db_begin_tx");
+    info!("Starting transaction");
     // 检查是否已有活跃事务
     {
         let guard = tx_state.lock().await;
@@ -461,6 +466,7 @@ pub async fn db_begin_tx(
 
 /// 在当前事务连接上执行 SQL（事务期间所有语句必须走此命令）
 #[tauri::command]
+#[instrument(skip(tx_state, storage, duck_pool, ss_pool, oracle_tx_pool, registry, sql), fields(conn_id = %id, sql_len = sql.len()))]
 pub async fn db_exec_in_tx(
     id: String,
     sql: String,
@@ -472,6 +478,7 @@ pub async fn db_exec_in_tx(
     oracle_tx_pool: State<'_, OracleTxPool>,
     registry: State<'_, DriverRegistry>,
 ) -> Result<QueryResult, String> {
+    let _timer = Timer::new("db_exec_in_tx");
     super::query::validate_cancel_token(cancel_token.as_deref())?;
     let abort_rx = cancel_token.as_ref().map(|token| super::query::abort_register(token));
 
@@ -552,6 +559,7 @@ pub async fn db_exec_in_tx(
 
 /// 提交事务
 #[tauri::command]
+#[instrument(skip(tx_state, storage, duck_pool, ss_pool, oracle_tx_pool, registry), fields(conn_id = %id))]
 pub async fn db_commit_tx(
     id: String,
     tx_state: State<'_, TxState>,
@@ -561,6 +569,8 @@ pub async fn db_commit_tx(
     oracle_tx_pool: State<'_, OracleTxPool>,
     registry: State<'_, DriverRegistry>,
 ) -> Result<(), String> {
+    let _timer = Timer::new("db_commit_tx");
+    info!("Committing transaction");
     // 先从 map 移除（后续无新语句可进），再持内层锁提交；连接随后 Drop
     let tx_arc = {
         let mut guard = tx_state.lock().await;
@@ -598,6 +608,7 @@ pub async fn db_commit_tx(
 
 /// 回滚事务
 #[tauri::command]
+#[instrument(skip(tx_state, storage, duck_pool, ss_pool, oracle_tx_pool, registry), fields(conn_id = %id))]
 pub async fn db_rollback_tx(
     id: String,
     tx_state: State<'_, TxState>,
@@ -607,6 +618,8 @@ pub async fn db_rollback_tx(
     oracle_tx_pool: State<'_, OracleTxPool>,
     registry: State<'_, DriverRegistry>,
 ) -> Result<(), String> {
+    let _timer = Timer::new("db_rollback_tx");
+    info!("Rolling back transaction");
     let tx_arc = {
         let mut guard = tx_state.lock().await;
         guard.remove(&id).ok_or("没有活跃事务")?
@@ -669,4 +682,292 @@ pub async fn cleanup_stale_txns(tx_state: &TxState) -> u32 {
 #[tauri::command]
 pub async fn db_cleanup_stale_tx(tx_state: State<'_, TxState>) -> Result<u32, String> {
     Ok(cleanup_stale_txns(&tx_state).await)
+}
+
+// ── 测试模块 ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn test_tag_sql() {
+        assert_eq!(tag("SELECT 1"), "/* DBTerm */ SELECT 1");
+        assert_eq!(tag("BEGIN"), "/* DBTerm */ BEGIN");
+        assert_eq!(tag(""), "/* DBTerm */ ");
+    }
+
+    #[test]
+    fn test_tx_conn_duckdb_variant() {
+        let conn = TxConn::Duckdb("test-id".to_string());
+        if let TxConn::Duckdb(id) = conn {
+            assert_eq!(id, "test-id");
+        } else {
+            panic!("Expected TxConn::Duckdb");
+        }
+    }
+
+    #[test]
+    fn test_tx_conn_sqlserver_variant() {
+        let conn = TxConn::SqlServer("server-id".to_string());
+        if let TxConn::SqlServer(id) = conn {
+            assert_eq!(id, "server-id");
+        } else {
+            panic!("Expected TxConn::SqlServer");
+        }
+    }
+
+    #[test]
+    fn test_tx_conn_oracle_variant() {
+        let conn = TxConn::Oracle("oracle-id".to_string());
+        if let TxConn::Oracle(id) = conn {
+            assert_eq!(id, "oracle-id");
+        } else {
+            panic!("Expected TxConn::Oracle");
+        }
+    }
+
+    #[test]
+    fn test_active_tx_structure() {
+        let now = Instant::now();
+        let tx = ActiveTx {
+            conn: TxConn::Duckdb("test-id".to_string()),
+            started_at: now,
+            last_used: now,
+            read_only: false,
+        };
+
+        assert!(!tx.read_only);
+        assert_eq!(tx.started_at, now);
+        assert_eq!(tx.last_used, now);
+    }
+
+    #[test]
+    fn test_active_tx_read_only() {
+        let now = Instant::now();
+        let tx = ActiveTx {
+            conn: TxConn::Duckdb("test-id".to_string()),
+            started_at: now,
+            last_used: now,
+            read_only: true,
+        };
+
+        assert!(tx.read_only);
+    }
+
+    #[tokio::test]
+    async fn test_tx_state_creation() {
+        let tx_state: TxState = Arc::new(AsyncMutex::new(HashMap::new()));
+        assert_eq!(tx_state.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_tx_state_insert_and_retrieve() {
+        let tx_state: TxState = Arc::new(AsyncMutex::new(HashMap::new()));
+        let conn_id = "test-conn-1".to_string();
+
+        let tx = Arc::new(AsyncMutex::new(ActiveTx {
+            conn: TxConn::Duckdb(conn_id.clone()),
+            started_at: Instant::now(),
+            last_used: Instant::now(),
+            read_only: false,
+        }));
+
+        tx_state.lock().await.insert(conn_id.clone(), tx);
+        assert_eq!(tx_state.lock().await.len(), 1);
+        assert!(tx_state.lock().await.contains_key(&conn_id));
+    }
+
+    #[tokio::test]
+    async fn test_tx_state_remove() {
+        let tx_state: TxState = Arc::new(AsyncMutex::new(HashMap::new()));
+        let conn_id = "test-conn-2".to_string();
+
+        let tx = Arc::new(AsyncMutex::new(ActiveTx {
+            conn: TxConn::Duckdb(conn_id.clone()),
+            started_at: Instant::now(),
+            last_used: Instant::now(),
+            read_only: false,
+        }));
+
+        tx_state.lock().await.insert(conn_id.clone(), tx);
+        assert_eq!(tx_state.lock().await.len(), 1);
+
+        tx_state.lock().await.remove(&conn_id);
+        assert_eq!(tx_state.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_tx_state_multiple_connections() {
+        let tx_state: TxState = Arc::new(AsyncMutex::new(HashMap::new()));
+
+        for i in 0..5 {
+            let conn_id = format!("test-conn-{}", i);
+            let tx = Arc::new(AsyncMutex::new(ActiveTx {
+                conn: TxConn::Duckdb(conn_id.clone()),
+                started_at: Instant::now(),
+                last_used: Instant::now(),
+                read_only: i % 2 == 0, // 交替设置只读
+            }));
+            tx_state.lock().await.insert(conn_id, tx);
+        }
+
+        assert_eq!(tx_state.lock().await.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stale_txns_no_stale() {
+        let tx_state: TxState = Arc::new(AsyncMutex::new(HashMap::new()));
+
+        // 添加一个刚刚活跃的事务
+        let conn_id = "fresh-conn".to_string();
+        let tx = Arc::new(AsyncMutex::new(ActiveTx {
+            conn: TxConn::Duckdb(conn_id.clone()),
+            started_at: Instant::now(),
+            last_used: Instant::now(), // 刚刚使用
+            read_only: false,
+        }));
+        tx_state.lock().await.insert(conn_id, tx);
+
+        // 清理应该不会删除任何东西
+        let cleaned = cleanup_stale_txns(&tx_state).await;
+        assert_eq!(cleaned, 0);
+        assert_eq!(tx_state.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stale_txns_with_stale() {
+        let tx_state: TxState = Arc::new(AsyncMutex::new(HashMap::new()));
+
+        // 添加一个老旧的事务（模拟超过30分钟）
+        let conn_id = "stale-conn".to_string();
+        let old_time = Instant::now() - Duration::from_secs(31 * 60);
+        let tx = Arc::new(AsyncMutex::new(ActiveTx {
+            conn: TxConn::Duckdb(conn_id.clone()),
+            started_at: old_time,
+            last_used: old_time, // 31分钟前最后使用
+            read_only: false,
+        }));
+        tx_state.lock().await.insert(conn_id, tx);
+
+        // 清理应该删除过期事务
+        let cleaned = cleanup_stale_txns(&tx_state).await;
+        assert_eq!(cleaned, 1);
+        assert_eq!(tx_state.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stale_txns_mixed() {
+        let tx_state: TxState = Arc::new(AsyncMutex::new(HashMap::new()));
+
+        // 添加2个新鲜的事务
+        for i in 0..2 {
+            let conn_id = format!("fresh-conn-{}", i);
+            let tx = Arc::new(AsyncMutex::new(ActiveTx {
+                conn: TxConn::Duckdb(conn_id.clone()),
+                started_at: Instant::now(),
+                last_used: Instant::now(),
+                read_only: false,
+            }));
+            tx_state.lock().await.insert(conn_id, tx);
+        }
+
+        // 添加3个过期的事务
+        let old_time = Instant::now() - Duration::from_secs(31 * 60);
+        for i in 0..3 {
+            let conn_id = format!("stale-conn-{}", i);
+            let tx = Arc::new(AsyncMutex::new(ActiveTx {
+                conn: TxConn::Duckdb(conn_id.clone()),
+                started_at: old_time,
+                last_used: old_time,
+                read_only: false,
+            }));
+            tx_state.lock().await.insert(conn_id, tx);
+        }
+
+        assert_eq!(tx_state.lock().await.len(), 5);
+
+        // 清理应该只删除过期的3个
+        let cleaned = cleanup_stale_txns(&tx_state).await;
+        assert_eq!(cleaned, 3);
+        assert_eq!(tx_state.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_long_running_active_tx() {
+        let tx_state: TxState = Arc::new(AsyncMutex::new(HashMap::new()));
+
+        // 模拟一个长时间运行的事务：started_at很早，但last_used是最近的
+        let conn_id = "long-running".to_string();
+        let old_start = Instant::now() - Duration::from_secs(60 * 60); // 1小时前开始
+        let recent_use = Instant::now() - Duration::from_secs(5 * 60); // 5分钟前使用
+
+        let tx = Arc::new(AsyncMutex::new(ActiveTx {
+            conn: TxConn::Duckdb(conn_id.clone()),
+            started_at: old_start,
+            last_used: recent_use,
+            read_only: false,
+        }));
+        tx_state.lock().await.insert(conn_id, tx);
+
+        // 清理不应该删除这个事务（因为last_used是最近的）
+        let cleaned = cleanup_stale_txns(&tx_state).await;
+        assert_eq!(cleaned, 0);
+        assert_eq!(tx_state.lock().await.len(), 1);
+    }
+
+    #[test]
+    fn test_mysql_cfg_deserialization() {
+        let json = r#"{
+            "connectTimeout": 45,
+            "sslMode": "require",
+            "sslCa": "/path/to/ca.pem",
+            "sshTunnel": true,
+            "sshHost": "jump.example.com",
+            "sshPort": 2222,
+            "sshUser": "tunneluser"
+        }"#;
+
+        #[derive(serde::Deserialize, Default)]
+        struct Cfg {
+            #[serde(rename = "connectTimeout", default)] connect_timeout: u64,
+            #[serde(rename = "sslMode",  default)] ssl_mode: String,
+            #[serde(rename = "sslCa",   default)] ssl_ca:   String,
+            #[serde(rename = "sshTunnel",   default)] ssh_tunnel:  bool,
+            #[serde(rename = "sshHost",     default)] ssh_host:    String,
+            #[serde(rename = "sshPort",     default)] ssh_port:    u16,
+            #[serde(rename = "sshUser",     default)] ssh_user:    String,
+        }
+
+        let cfg: Cfg = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.connect_timeout, 45);
+        assert_eq!(cfg.ssl_mode, "require");
+        assert_eq!(cfg.ssl_ca, "/path/to/ca.pem");
+        assert!(cfg.ssh_tunnel);
+        assert_eq!(cfg.ssh_host, "jump.example.com");
+        assert_eq!(cfg.ssh_port, 2222);
+        assert_eq!(cfg.ssh_user, "tunneluser");
+    }
+
+    #[test]
+    fn test_pg_cfg_deserialization() {
+        let json = r#"{
+            "connectTimeout": 60,
+            "sslMode": "verify-full",
+            "pgSearchPath": "app,public"
+        }"#;
+
+        #[derive(serde::Deserialize, Default)]
+        struct Cfg {
+            #[serde(rename = "connectTimeout", default)] connect_timeout: u64,
+            #[serde(rename = "sslMode",  default)] ssl_mode: String,
+            #[serde(rename = "pgSearchPath", default)] pg_search_path: String,
+        }
+
+        let cfg: Cfg = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.connect_timeout, 60);
+        assert_eq!(cfg.ssl_mode, "verify-full");
+        assert_eq!(cfg.pg_search_path, "app,public");
+    }
 }

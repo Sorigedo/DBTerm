@@ -73,12 +73,15 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
   const [sortCol, setSortCol]         = useState<string | null>(null)
   const [sortDir, setSortDir]         = useState<SortDir>('asc')
   const [filters, setFilters]         = useState<Record<string, ColFilter>>({})
+  const [filterDrafts, setFilterDrafts] = useState<Record<string, string>>({})
   const [filterOpen, setFilterOpen]   = useState<string | null>(null)
+  const [filterSummaryOpen, setFilterSummaryOpen] = useState(false)
   const [execMs, setExecMs]           = useState<number>(0)
   const [colMeta, setColMeta]         = useState<Record<string, {
     type: string; key: string; comment: string; nullable: string; def: string | null; extra: string
   }>>({})
   const filterInputRef                = useRef<HTMLInputElement>(null)
+  const filterDebounceRef             = useRef<Map<string, number>>(new Map())
   // 新增行（Navicat 式手动添加数据）
   const [draftRows, setDraftRows]     = useState<Record<string, string>[]>([])
   const [committing, setCommitting]   = useState(false)
@@ -143,6 +146,8 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
   const [detailRow, setDetailRow]     = useState<number | null>(null)
   const [detailView, setDetailView]   = useState<RowDetailView>('table')
   const [cellDetail, setCellDetail]   = useState<{ ri: number; ci: number } | null>(null)
+  const [cellDetailEditing, setCellDetailEditing] = useState(false)
+  const [cellDetailDraft, setCellDetailDraft] = useState('')
   const cellDetailTimerRef = useRef<number | null>(null)
   const rowCtxRef = useRef<HTMLDivElement>(null)
 
@@ -228,8 +233,27 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
 
   useEffect(() => {
     fetchCount()
+  }, [fetchCount])
+  useEffect(() => {
     fetchData()
-  }, [fetchCount, fetchData])
+  }, [fetchData])
+
+  useEffect(() => () => {
+    filterDebounceRef.current.forEach(timer => window.clearTimeout(timer))
+    filterDebounceRef.current.clear()
+  }, [])
+
+  useEffect(() => {
+    filterDebounceRef.current.forEach(timer => window.clearTimeout(timer))
+    filterDebounceRef.current.clear()
+    setFilters({})
+    setFilterDrafts({})
+    setFilterOpen(null)
+    setFilterSummaryOpen(false)
+    setSortCol(null)
+    setSortDir('asc')
+    setPage(0)
+  }, [connectionId, schema, table])
 
   // 列类型 / 主键信息（用于 Navicat 式双行表头：列名 + 类型）
   // 拉取列元数据（类型 / 主键 / 注释），各方言走不同数据字典
@@ -498,6 +522,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
     } else {
       setSortCol(null); setSortDir('asc')
     }
+    setPage(0)
   }
 
   useEffect(() => {
@@ -527,10 +552,31 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
   }
 
   function setFilterValue(col: string, value: string) {
-    setFilters((prev) => ({ ...prev, [col]: { value } }))
+    setFilterDrafts(prev => ({ ...prev, [col]: value }))
+    const previous = filterDebounceRef.current.get(col)
+    if (previous) window.clearTimeout(previous)
+    const timer = window.setTimeout(() => {
+      setFilters(prev => {
+        const next = { ...prev }
+        if (value.trim()) next[col] = { value }
+        else delete next[col]
+        return next
+      })
+      setPage(0)
+      filterDebounceRef.current.delete(col)
+    }, 250)
+    filterDebounceRef.current.set(col, timer)
   }
 
   function clearFilter(col: string) {
+    const previous = filterDebounceRef.current.get(col)
+    if (previous) window.clearTimeout(previous)
+    filterDebounceRef.current.delete(col)
+    setFilterDrafts(prev => {
+      const next = { ...prev }
+      delete next[col]
+      return next
+    })
     setFilters((prev) => {
       const next = { ...prev }
       delete next[col]
@@ -982,7 +1028,28 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
       cellDetailTimerRef.current = null
       if (editCell) return
       setCellDetail({ ri, ci })
+      setCellDetailEditing(false)
+      setCellDetailDraft(rows[ri]?.[ci] ?? '')
     }, 180)
+  }
+  async function saveCellDetail() {
+    if (!cellDetail || readOnly || savingCell) return
+    const { ri, ci } = cellDetail
+    const col = columns[ci]
+    const orig = rows[ri]?.[ci] ?? null
+    const next = cellDetailDraft === '' && isTemporalColumn(col) ? null : cellDetailDraft
+    if ((orig ?? '') === (next ?? '')) { setCellDetailEditing(false); return }
+    setSavingCell(true)
+    try {
+      const { invoke } = await import('@tauri-apps/api/core')
+      if (!(await requireProdConfirm(envConn, `修改 ${schema}.${table} 的单元格`))) return
+      const pkValues = pkCols.map(pc => rows[ri][columns.indexOf(pc)])
+      await invoke('update_cell', { id: connectionId, schema, table, column: col, newValue: next, pkColumns: pkCols, pkValues })
+      setRows(prev => prev.map((r, i) => i === ri ? r.map((v, j) => j === ci ? next : v) : r))
+      setCellDetailEditing(false)
+      toast.success('已更新单元格')
+    } catch (e) { toast.error(`更新失败：${String(e)}`) }
+    finally { setSavingCell(false) }
   }
   function openCellDetailIfTruncated(e: React.MouseEvent<HTMLTableCellElement>, ri: number, ci: number) {
     if (editCell) return
@@ -999,12 +1066,6 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
     setActiveCell({ ri, ci })
     setSelectedRows(prev => prev.has(ri) ? prev : new Set([ri]))
     setRowCtx({ x: e.clientX, y: e.clientY, ri, ci })
-  }
-  function isSingleCellSelection(ri: number, ci: number): boolean {
-    return !cellSel || (
-      cellSel.a.ri === ri && cellSel.a.ci === ci &&
-      cellSel.f.ri === ri && cellSel.f.ci === ci
-    )
   }
   function rowObject(ri: number): Record<string, string | null> {
     const row = rows[ri] ?? []
@@ -1092,7 +1153,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
         className={`tb-card${embedded ? ' tb-card--embedded' : ''}`}
         style={{ position: 'relative' }}
         onMouseDown={embedded ? undefined : (e) => e.stopPropagation()}
-        onClick={() => { if (filterOpen) setFilterOpen(null); if (exportOpen) setExportOpen(false); if (copyOpen) setCopyOpen(false); if (tblMenuOpen) setTblMenuOpen(false) }}
+        onClick={() => { if (filterOpen) setFilterOpen(null); if (filterSummaryOpen) setFilterSummaryOpen(false); if (exportOpen) setExportOpen(false); if (copyOpen) setCopyOpen(false); if (tblMenuOpen) setTblMenuOpen(false) }}
       >
         <EnvWatermark envLabel={envConn?.envLabel} readonly={envConn?.readonly ?? envConn?.readOnly} />
         {/* Header（紧凑：表名 + 图标操作） */}
@@ -1114,7 +1175,42 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
               <PanelBottomOpen size={15} strokeWidth={1.8} />
             </button>
             {activeFilters.length > 0 && (
-              <span className="tb-filter-badge">{activeFilters.length} 个筛选</span>
+              <div className="tb-filter-summary-wrap" onClick={(e) => e.stopPropagation()}>
+                <button
+                  className="tb-filter-badge"
+                  onClick={() => setFilterSummaryOpen(v => !v)}
+                  aria-expanded={filterSummaryOpen}
+                  data-tip="查看、修改或清除已应用筛选"
+                >
+                  {activeFilters.length} 个筛选
+                </button>
+                {filterSummaryOpen && (
+                  <div className="tb-filter-summary-menu">
+                    <div className="tb-filter-summary-title">已应用筛选</div>
+                    {activeFilters.map(col => (
+                      <div className="tb-filter-summary-row" key={col}>
+                        <span className="tb-filter-summary-col" title={col}>{col}</span>
+                        <input
+                          className="tb-filter-summary-input"
+                          value={filterDrafts[col] ?? filters[col]?.value ?? ''}
+                          onChange={e => setFilterValue(col, e.target.value)}
+                          onKeyDown={e => { if (e.key === 'Enter') setFilterSummaryOpen(false) }}
+                          aria-label={`筛选条件：${col}`}
+                        />
+                        <button className="tb-filter-summary-clear" onClick={() => clearFilter(col)} aria-label={`清除 ${col} 筛选`}>清除</button>
+                      </div>
+                    ))}
+                    <button className="tb-filter-summary-clear-all" onClick={() => {
+                      filterDebounceRef.current.forEach(timer => window.clearTimeout(timer))
+                      filterDebounceRef.current.clear()
+                      setFilterDrafts({})
+                      setFilters({})
+                      setPage(0)
+                      setFilterSummaryOpen(false)
+                    }}>清除全部筛选</button>
+                  </div>
+                )}
+              </div>
             )}
             {/* 新增行 / 提交 / 取消（ClickHouse 只读：隐藏写操作，仅保留复制） */}
             {!readOnly && draftRows.length > 0 ? (
@@ -1370,7 +1466,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
                                   ref={filterInputRef}
                                   className="tb-filter-input"
                                   placeholder={`筛选 ${col}…`}
-                                  value={filters[col]?.value ?? ''}
+                                  value={filterDrafts[col] ?? filters[col]?.value ?? ''}
                                   onChange={(e) => setFilterValue(col, e.target.value)}
                                   onKeyDown={(e) => {
                                     if (e.key === 'Enter' || e.key === 'Escape') setFilterOpen(null)
@@ -1434,8 +1530,11 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
 	                          className={`tb-td ${cell === null ? 'tb-td--null' : ''}${isEditing ? ' tb-td--editing' : ''}${activeCell?.ri === ri && activeCell?.ci === ci ? ' tb-td--active' : ''}${cellInSel(ri, ci) ? ' tb-td--cellsel' : ''}`}
 	                          onMouseDown={(e) => onCellMouseDown(e, ri, ci)}
 	                          onMouseEnter={() => onCellMouseEnter(ri, ci)}
-	                          onClick={(e) => { if (!isEditing && isSingleCellSelection(ri, ci)) openCellDetailIfTruncated(e, ri, ci) }}
-	                          onDoubleClick={() => startEdit(ri, ci)}
+	                          onClick={(e) => { if (!isEditing) openCellDetailIfTruncated(e, ri, ci) }}
+                          onDoubleClick={() => {
+                            clearCellDetailTimer()
+                            startEdit(ri, ci)
+                          }}
 	                          onContextMenu={(e) => openRowContext(e, ri, ci)}
                         >
                           {isEditing ? (
@@ -1535,7 +1634,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
           <div className="tb-footer__left">
             <SearchableSelect
               value={String(pageSize)}
-              onChange={(v) => setPageSize(Number(v) as PageSize)}
+              onChange={(v) => { setPageSize(Number(v) as PageSize); setPage(0) }}
               items={PAGE_SIZES.map((s) => ({ value: String(s), label: `${s} 行/页` }))}
               mono={false}
               width={110}
@@ -1706,14 +1805,25 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
 	                    }}>
 	                    <Copy size={14} />
 	                  </button>
+	                  {!readOnly && !cellDetailEditing && (
+	                    <button className="tb-icon-btn" data-tip="编辑完整值" onClick={() => {
+	                      setCellDetailDraft(rows[cellDetail.ri][cellDetail.ci] ?? '')
+	                      setCellDetailEditing(true)
+	                    }}><FileCode2 size={14} /></button>
+	                  )}
 	                  <button className="tb-icon-btn" data-tip="关闭" onClick={() => setCellDetail(null)}><X size={14} /></button>
 	                </div>
 	              </div>
 	              <div className="tb-cell-detail__content">
-	                <textarea className="tb-cell-detail__text" readOnly spellCheck={false}
-	                  value={rows[cellDetail.ri][cellDetail.ci] ?? 'NULL'}
+	                <textarea className="tb-cell-detail__text" readOnly={!cellDetailEditing} spellCheck={false}
+	                  value={cellDetailEditing ? cellDetailDraft : (rows[cellDetail.ri][cellDetail.ci] ?? 'NULL')}
+	                  onChange={(e) => setCellDetailDraft(e.target.value)}
 	                  onFocus={(e) => e.currentTarget.select()} />
 	              </div>
+	              {cellDetailEditing && <div className="tb-confirm__actions">
+	                <button className="tb-text-btn" disabled={savingCell} onClick={() => setCellDetailEditing(false)}>取消</button>
+	                <button className="tb-text-btn tb-text-btn--primary" disabled={savingCell} onClick={saveCellDetail}>{savingCell ? '保存中…' : '保存'}</button>
+	              </div>}
 	            </div>
 	          </div>
 	        )}
@@ -1884,6 +1994,27 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
           font-size: 11px; padding: 2px 7px; border-radius: 10px;
           background: var(--accent-bg); color: var(--accent);
           border: 1px solid rgba(92,110,248,0.3);
+          cursor: pointer;
+        }
+        .tb-filter-badge:hover { background: var(--surface-hover); }
+        .tb-filter-summary-wrap { position: relative; }
+        .tb-filter-summary-menu {
+          position: absolute; top: calc(100% + 6px); right: 0; z-index: 40;
+          min-width: 300px; max-width: min(420px, calc(100vw - 32px));
+          padding: 8px; background: var(--surface); border: 1px solid var(--border);
+          border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.28);
+        }
+        .tb-filter-summary-title {
+          padding: 3px 6px 7px; color: var(--text-muted); font-size: 11px;
+          border-bottom: 1px solid var(--border-subtle);
+        }
+        .tb-filter-summary-row { display: flex; align-items: center; gap: 6px; padding: 6px 2px; }
+        .tb-filter-summary-col { width: 92px; flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-size: 11px; }
+        .tb-filter-summary-input { flex: 1; min-width: 0; height: 25px; padding: 0 7px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg); color: var(--text); font-size: 11px; }
+        .tb-filter-summary-input:focus { outline: none; border-color: var(--accent); }
+        .tb-filter-summary-clear, .tb-filter-summary-clear-all { border: none; background: transparent; color: var(--error); cursor: pointer; font-size: 11px; white-space: nowrap; }
+        .tb-filter-summary-clear:hover, .tb-filter-summary-clear-all:hover { text-decoration: underline; }
+        .tb-filter-summary-clear-all { width: 100%; padding: 6px 4px 2px; text-align: right; border-top: 1px solid var(--border-subtle); margin-top: 2px;
         }
         .tb-icon-btn {
           padding: 5px; border-radius: 6px;

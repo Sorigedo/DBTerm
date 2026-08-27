@@ -2756,3 +2756,100 @@ pub async fn oracle_explain_plan_impl(
             .collect())
     }).await.map_err(|e| format!("任务执行失败: {e}"))?
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_oracle_query_result_creation() {
+        let result = OracleQueryResult {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![Some("1".to_string()), Some("test".to_string())]],
+            row_count: Some(1),
+        };
+        assert_eq!(result.columns.len(), 2);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.row_count, Some(1));
+    }
+
+    #[test]
+    fn test_oracle_exec_result_creation() {
+        let result = OracleExecResult {
+            columns: vec![],
+            rows: vec![],
+            affected_rows: Some(5),
+            is_query: false,
+        };
+        assert_eq!(result.affected_rows, Some(5));
+        assert!(!result.is_query);
+    }
+
+    #[test]
+    fn test_oracle_table_info_creation() {
+        let table = OracleTableInfo {
+            name: "test_table".to_string(),
+            object_type: "TABLE".to_string(),
+            comment: Some("test comment".to_string()),
+        };
+        assert_eq!(table.name, "test_table");
+        assert_eq!(table.object_type, "TABLE");
+        assert_eq!(table.comment, Some("test comment".to_string()));
+    }
+
+    #[test]
+    fn test_oracle_column_info_creation() {
+        let column = OracleColumnInfo {
+            name: "id".to_string(),
+            data_type: "NUMBER".to_string(),
+            data_length: Some("10".to_string()),
+            nullable: false,
+            default_value: Some("0".to_string()),
+            comment: Some("primary key".to_string()),
+        };
+        assert_eq!(column.name, "id");
+        assert_eq!(column.data_type, "NUMBER");
+        assert_eq!(column.data_length, Some("10".to_string()));
+        assert!(!column.nullable);
+    }
+
+    #[test]
+    fn test_index_info_creation() {
+        let index = IndexInfo {
+            name: "idx_test".to_string(),
+            columns: "id,name".to_string(),
+            unique: true,
+            index_type: "NORMAL".to_string(),
+        };
+        assert_eq!(index.name, "idx_test");
+        assert_eq!(index.columns, "id,name");
+        assert!(index.unique);
+        assert_eq!(index.index_type, "NORMAL");
+    }
+
+    #[test]
+    fn test_oracle_extra_default() {
+        let extra = OracleExtra::default();
+        assert!(extra.conn_mode.is_empty());
+        assert!(extra.service_name.is_empty());
+        assert!(extra.sid.is_empty());
+    }
+
+    #[test]
+    fn test_oracle_extra_connect_string_default() {
+        let extra = OracleExtra::default();
+        let conn_str = extra.connect_string("localhost", 1521);
+        assert_eq!(conn_str, "localhost:1521/orcl");
+    }
+
+    #[test]
+    fn test_oracle_extra_connect_string_sid() {
+        let extra = OracleExtra {
+            conn_mode: "sid".to_string(),
+            sid: "testdb".to_string(),
+            ..Default::default()
+        };
+        let conn_str = extra.connect_string("localhost", 1521);
+        assert!(conn_str.contains("SID=testdb"));
+    }
+}

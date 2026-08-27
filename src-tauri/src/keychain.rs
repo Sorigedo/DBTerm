@@ -201,3 +201,218 @@ mod dpapi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    static TEST_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+    fn get_test_dir() -> PathBuf {
+        TEST_DIR
+            .get_or_init(|| {
+                let test_dir = std::env::temp_dir().join(format!("dbterm-test-keychain-shared"));
+                std::fs::create_dir_all(&test_dir).unwrap();
+                init(&test_dir);
+                test_dir
+            })
+            .clone()
+    }
+
+    fn cleanup_test_data() {
+        // 清空所有密码数据
+        let _ = clear_all();
+    }
+
+    #[test]
+    #[serial]
+    fn test_password_set_and_get() {
+        let _test_dir = get_test_dir();
+
+        let result = set_password("test-conn-1", "my_secret_password");
+        assert!(result.is_ok(), "设置密码应该成功");
+
+        let retrieved = get_password("test-conn-1").unwrap();
+        assert_eq!(retrieved, Some("my_secret_password".to_string()));
+
+        cleanup_test_data();
+    }
+
+    #[test]
+    #[serial]
+    fn test_password_update() {
+        let _test_dir = get_test_dir();
+
+        set_password("test-conn-2", "password1").unwrap();
+        set_password("test-conn-2", "password2").unwrap();
+
+        let retrieved = get_password("test-conn-2").unwrap();
+        assert_eq!(retrieved, Some("password2".to_string()));
+
+        cleanup_test_data();
+    }
+
+    #[test]
+    #[serial]
+    fn test_password_delete() {
+        let _test_dir = get_test_dir();
+
+        set_password("test-conn-3", "to_be_deleted").unwrap();
+
+        let before_delete = get_password("test-conn-3").unwrap();
+        assert!(before_delete.is_some());
+
+        delete_password("test-conn-3").unwrap();
+
+        let after_delete = get_password("test-conn-3").unwrap();
+        assert_eq!(after_delete, None);
+
+        cleanup_test_data();
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_nonexistent_password() {
+        let _test_dir = get_test_dir();
+
+        let result = get_password("nonexistent-conn").unwrap();
+        assert_eq!(result, None);
+
+        cleanup_test_data();
+    }
+
+    #[test]
+    #[serial]
+    fn test_delete_nonexistent_password() {
+        let _test_dir = get_test_dir();
+
+        let result = delete_password("nonexistent-conn");
+        assert!(result.is_ok(), "删除不存在的密码应该成功（幂等）");
+
+        cleanup_test_data();
+    }
+
+    #[test]
+    #[serial]
+    fn test_multiple_connections() {
+        let _test_dir = get_test_dir();
+
+        set_password("conn-a", "password-a").unwrap();
+        set_password("conn-b", "password-b").unwrap();
+        set_password("conn-c", "password-c").unwrap();
+
+        assert_eq!(get_password("conn-a").unwrap(), Some("password-a".to_string()));
+        assert_eq!(get_password("conn-b").unwrap(), Some("password-b".to_string()));
+        assert_eq!(get_password("conn-c").unwrap(), Some("password-c".to_string()));
+
+        delete_password("conn-b").unwrap();
+
+        assert_eq!(get_password("conn-a").unwrap(), Some("password-a".to_string()));
+        assert_eq!(get_password("conn-b").unwrap(), None);
+        assert_eq!(get_password("conn-c").unwrap(), Some("password-c".to_string()));
+
+        cleanup_test_data();
+    }
+
+    #[test]
+    #[serial]
+    fn test_ssh_tunnel_password() {
+        let _test_dir = get_test_dir();
+
+        let conn_id = "test-conn-4";
+        let tunnel_key = format!("{}::ssh-tunnel", conn_id);
+
+        set_password(&tunnel_key, "tunnel_password").unwrap();
+
+        let retrieved = get_password(&tunnel_key).unwrap();
+        assert_eq!(retrieved, Some("tunnel_password".to_string()));
+
+        cleanup_test_data();
+    }
+
+    #[test]
+    #[serial]
+    fn test_clear_all() {
+        let _test_dir = get_test_dir();
+
+        set_password("conn-1", "pwd1").unwrap();
+        set_password("conn-2", "pwd2").unwrap();
+
+        clear_all().unwrap();
+
+        assert_eq!(get_password("conn-1").unwrap(), None);
+        assert_eq!(get_password("conn-2").unwrap(), None);
+
+        cleanup_test_data();
+    }
+
+    #[test]
+    #[serial]
+    fn test_empty_password() {
+        let _test_dir = get_test_dir();
+
+        set_password("conn-empty", "").unwrap();
+
+        let retrieved = get_password("conn-empty").unwrap();
+        assert_eq!(retrieved, Some("".to_string()));
+
+        cleanup_test_data();
+    }
+
+    #[test]
+    #[serial]
+    fn test_special_characters_in_password() {
+        let _test_dir = get_test_dir();
+
+        let special_pwd = r#"p@ssw0rd!#$%^&*()_+-=[]{}|;':",.<>?/\`~"#;
+        set_password("conn-special", special_pwd).unwrap();
+
+        let retrieved = get_password("conn-special").unwrap();
+        assert_eq!(retrieved, Some(special_pwd.to_string()));
+
+        cleanup_test_data();
+    }
+
+    #[test]
+    #[serial]
+    fn test_unicode_password() {
+        let _test_dir = get_test_dir();
+
+        let unicode_pwd = "密码🔐测试中文";
+        set_password("conn-unicode", unicode_pwd).unwrap();
+
+        let retrieved = get_password("conn-unicode").unwrap();
+        assert_eq!(retrieved, Some(unicode_pwd.to_string()));
+
+        cleanup_test_data();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn test_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _test_dir = get_test_dir();
+
+        // 设置密码会创建文件
+        set_password("conn-perm", "test").unwrap();
+
+        // 获取密码文件路径
+        let pwd_file = PWD_FILE.get().expect("密码文件路径应该已初始化");
+
+        // 验证文件存在并检查权限
+        if pwd_file.exists() {
+            let metadata = std::fs::metadata(pwd_file).unwrap();
+            let permissions = metadata.permissions();
+
+            // 验证文件权限是 0600
+            assert_eq!(permissions.mode() & 0o777, 0o600, "密码文件权限应该是 0600");
+        }
+
+        cleanup_test_data();
+    }
+}

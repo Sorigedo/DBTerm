@@ -1,10 +1,10 @@
 import { create } from 'zustand'
 import type { ActiveView, ConnConfig, ConnStatus, ConnType, WorkspaceTab } from '../types'
-import { useQueryStore } from './queryStore'
-import { useSettingsStore } from './settingsStore'
-import { wid } from '../utils/windowTag'
-import { broadcastConnectionsChanged } from '../utils/multiWindow'
-import { applyLegacyDbEnv } from '../utils/connectionEnv'
+import { useQueryStore } from './queryStore.ts'
+import { useSettingsStore } from './settingsStore.ts'
+import { wid } from '../utils/windowTag.ts'
+import { broadcastConnectionsChanged } from '../utils/multiWindow.ts'
+import { applyLegacyDbEnv } from '../utils/connectionEnv.ts'
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 

@@ -38,7 +38,6 @@ impl DbConnCfg {
         )
     }
 }
-
 fn load_conn(id: &str, storage: &State<'_, StorageState>) -> Result<(ConnConfig, Option<String>), String> {
     let configs = storage.lock().map_err(|_| "存储锁失败".to_string())?.load()?;
     let config  = configs.into_iter().find(|c| c.id == id)
@@ -549,4 +548,45 @@ pub async fn mariadb_maxscale_detect(
     };
 
     Ok(MaxScaleInfo { is_maxscale, version, version_comment: comment, note })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dbconncfg_timeout() {
+        let mut cfg = DbConnCfg::default();
+        assert_eq!(cfg.timeout(), std::time::Duration::from_secs(15));
+        cfg.connect_timeout = 30;
+        assert_eq!(cfg.timeout(), std::time::Duration::from_secs(30));
+        cfg.connect_timeout = 1;
+        assert_eq!(cfg.timeout(), std::time::Duration::from_secs(3));
+        cfg.connect_timeout = 100;
+        assert_eq!(cfg.timeout(), std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_dbconncfg_from_config() {
+        let config = ConnConfig {
+            id: "test".to_string(),
+            name: "test".to_string(),
+            conn_type: ConnType::Mariadb,
+            host: None,
+            port: None,
+            database: None,
+            username: None,
+            file_path: None,
+            ssh_key_path: None,
+            use_ssl: false,
+            created_at: 0,
+            updated_at: 0,
+            color: None,
+            extra_json: Some(r#"{"connectTimeout": 20}"#.to_string()),
+            read_only: None,
+            env_label: None,
+        };
+        let cfg = DbConnCfg::from_config(&config);
+        assert_eq!(cfg.connect_timeout, 20);
+    }
 }

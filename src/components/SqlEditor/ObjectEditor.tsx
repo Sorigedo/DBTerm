@@ -1,7 +1,8 @@
 import { useState, useMemo, useRef, useCallback, useEffect } from 'react'
 import CodeMirror from '@uiw/react-codemirror'
-import { sql, StandardSQL, MySQL, MariaSQL, PostgreSQL, SQLite, MSSQL } from '@codemirror/lang-sql'
+import { sql, schemaCompletionSource, StandardSQL, MySQL, MariaSQL, PostgreSQL, SQLite, MSSQL } from '@codemirror/lang-sql'
 import { EditorView } from '@codemirror/view'
+import { type CompletionContext, type CompletionSource } from '@codemirror/autocomplete'
 import { createPortal } from 'react-dom'
 
 const _editorDark = EditorView.theme({
@@ -73,6 +74,7 @@ import TablePeekModal from './TablePeekModal'
 import { useWheelScroll, cmScroller } from '../../utils/wheelScroll'
 import { makeTableLinkExtensions } from '../../utils/cmTableLink'
 import { cmSearchPhrases } from '../../utils/cmSearchPhrases'
+import { sqlFunctionsForDialect } from '../../utils/sqlFunctions'
 
 interface Props {
   tabId: string
@@ -100,6 +102,28 @@ function friendlyDbError(raw: string): string {
 const OBJ_LABEL: Record<ObjType, string> = { view: '视图', function: '函数', procedure: '存储过程' }
 const CANCELABLE_TYPES = new Set(['mysql', 'mariadb', 'tidb', 'oceanBase', 'postgres', 'kingBase', 'openGauss', 'sqlite', 'duckdb'])
 
+/** 从函数/存储过程 DDL 中提取签名参数和 DECLARE 变量，供编辑区上下文补全。 */
+function routineVariableCompletionNames(text: string): Array<{ name: string; detail: string }> {
+  const found = new Map<string, string>()
+  const add = (name: string, detail: string) => {
+    const clean = name.replace(/^[`"\[]|[`"\]]$/g, '')
+    if (/^[A-Za-z_$][\w$]*$/.test(clean) && !found.has(clean.toLowerCase())) found.set(clean.toLowerCase(), detail + '|' + clean)
+  }
+  // CREATE FUNCTION/PROCEDURE 的参数区；仅取第一个定义括号，避免误读函数体中的括号。
+  const header = /CREATE\s+(?:OR\s+REPLACE\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:FUNCTION|PROCEDURE)\s+(?:[`"\[][^`"\]]+[`"\]]|[\w$]+)(?:\s*\.\s*(?:[`"\[][^`"\]]+[`"\]]|[\w$]+))?\s*\(([^)]*)\)/is.exec(text)
+  if (header) {
+    const parts = header[1].split(',').map(p => p.trim()).filter(Boolean)
+    for (const part of parts) {
+      const m = /^(?:INOUT|IN|OUT|VARIADIC)\s+([`"\[][^`"\]]+[`"\]]|[A-Za-z_$][\w$]*)|^([`"\[][^`"\]]+[`"\]]|[A-Za-z_$][\w$]*)/i.exec(part)
+      if (m) add(m[1] ?? m[2], '过程参数')
+    }
+  }
+  const decl = /\bDECLARE\s+([`"\[][^`"\]]+[`"\]]|[A-Za-z_$][\w$]*)\b/gi
+  let match: RegExpExecArray | null
+  while ((match = decl.exec(text))) add(match[1], '局部变量')
+  return Array.from(found.values()).map(v => { const [detail, name] = v.split('|'); return { name, detail } })
+}
+
 export default function ObjectEditor({ tabId, connectionId, connType }: Props) {
   const draft = useObjectDraftStore((s) => s.drafts[tabId])
   const appColorScheme = useSettingsStore((s) => s.appColorScheme)
@@ -114,6 +138,9 @@ export default function ObjectEditor({ tabId, connectionId, connType }: Props) {
   const [ddl, setDdl] = useState(draft?.ddl ?? '')
   const [saving, setSaving] = useState(false)
   const [schemas, setSchemas] = useState<string[]>([])
+  const [dbSchema, setDbSchema] = useState<Record<string, string[]>>({})
+  const schemaTableCacheRef = useRef<Record<string, string[]>>({})
+  const qualifiedColumnCacheRef = useRef<Record<string, string[]>>({})
   const [currentSchema, setCurrentSchema] = useState(draft?.schema ?? '')
   const preFormatRef = useRef<string | null>(null)
   // 代码区滚轮驱动横向滚动条：统一规则（见 utils/wheelScroll）；getScroller 取 CodeMirror 的 .cm-scroller
@@ -178,6 +205,36 @@ export default function ObjectEditor({ tabId, connectionId, connType }: Props) {
     return () => { alive = false }
   }, [connectionId])
 
+  // 对象编辑器也提供 schema / 表别名字段补全（与查询编辑器保持一致）。
+  useEffect(() => {
+    if (!connectionId || !currentSchema) { setDbSchema({}); return }
+    schemaTableCacheRef.current = {}
+    qualifiedColumnCacheRef.current = {}
+    let alive = true
+    ;(async () => {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core')
+        try {
+          const full = await invoke<Record<string, string[]>>('schema_columns', { id: connectionId, schema: currentSchema })
+          if (alive && full && Object.keys(full).length) { setDbSchema(full); return }
+        } catch { /* 非批量方言走逐表回退 */ }
+        const tables = await invoke<{ name: string }[]>('list_tables', { id: connectionId, schema: currentSchema })
+        const map: Record<string, string[]> = {}
+        for (const t of tables) map[t.name] = []
+        if (alive) setDbSchema({ ...map })
+        for (const t of tables.slice(0, 300)) {
+          try {
+            const cols = await invoke<{ name: string }[]>('table_columns', { id: connectionId, schema: currentSchema, table: t.name })
+            map[t.name] = cols.map(c => c.name)
+          } catch { /* 单表权限不足时保留表名 */ }
+          if (!alive) return
+        }
+        if (alive) setDbSchema({ ...map })
+      } catch { if (alive) setDbSchema({}) }
+    })()
+    return () => { alive = false }
+  }, [connectionId, currentSchema])
+
   // 表名集合（用于编辑器内悬停下划线 + Mod 点击预览，与查询页一致）
   const [tableSet, setTableSet] = useState<Set<string>>(new Set())
   useEffect(() => {
@@ -210,7 +267,79 @@ export default function ObjectEditor({ tabId, connectionId, connType }: Props) {
       default: return StandardSQL
     }
   }, [connType])
-  const sqlExt = useMemo(() => sql({ dialect: sqlDialect, upperCaseKeywords: true }), [sqlDialect])
+  const sqlExt = useMemo(() => {
+    const lang = sql({ dialect: sqlDialect, upperCaseKeywords: true })
+    const fallback = schemaCompletionSource({ dialect: sqlDialect, schema: dbSchema })
+    const localVars = routineVariableCompletionNames(ddl)
+    const dialectFunctions = sqlFunctionsForDialect(connType)
+    const source: CompletionSource = async (ctx: CompletionContext) => {
+      const qualified = ctx.matchBefore(/[`"\[\]\w$]+\.[`"\[\]\w$]+\.[\w$]*$/)
+      if (qualified) {
+        const parts = qualified.text.split('.')
+        const schema = parts[0].replace(/^[`"\[]|[`"\]]$/g, '')
+        const table = parts[1].replace(/^[`"\[]|[`"\]]$/g, '')
+        const schemaName = schemas.find(s => s.toLowerCase() === schema.toLowerCase())
+        if (schemaName) {
+          const key = `${schemaName}.${table}`.toLowerCase()
+          let cols = qualifiedColumnCacheRef.current[key]
+          if (!cols) {
+            try {
+              const { invoke } = await import('@tauri-apps/api/core')
+              const list = await invoke<{ name: string }[]>('table_columns', { id: connectionId, schema: schemaName, table })
+              cols = list.map(c => c.name)
+              qualifiedColumnCacheRef.current[key] = cols
+            } catch { cols = [] }
+          }
+          if (cols.length) return { from: qualified.from + qualified.text.lastIndexOf('.') + 1, options: cols.map(c => ({ label: c, type: 'property' as const })), validFor: /^[\w$]*$/ }
+        }
+      }
+      const member = ctx.matchBefore(/[\w$]+\.[\w$]*$/)
+      if (member) {
+        const dot = member.text.lastIndexOf('.')
+        const alias = member.text.slice(0, dot)
+        const schemaName = schemas.find(s => s.toLowerCase() === alias.toLowerCase())
+        if (schemaName) {
+          const cacheKey = schemaName.toLowerCase()
+          let tables = schemaTableCacheRef.current[cacheKey]
+          if (!tables) {
+            try {
+              const { invoke } = await import('@tauri-apps/api/core')
+              const list = await invoke<{ name: string }[]>('list_tables', { id: connectionId, schema: schemaName })
+              tables = list.map(t => t.name)
+              schemaTableCacheRef.current[cacheKey] = tables
+            } catch { tables = [] }
+          }
+          if (tables.length) return { from: member.from + dot + 1, options: tables.map(t => ({ label: t, type: 'table' as const })), validFor: /^[\w$]*$/ }
+        }
+        const doc = ctx.state.doc.toString()
+        const ident = '(?:\\[[^\\]]+\\]|`[^`]+`|"[^"]+"|[\\w$]+)'
+        const aliasEsc = alias.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')
+        const m = new RegExp(`(?:from|join)\\s+((?:${ident}\\.)*${ident})(?:\\s+(?:as\\s+)?${aliasEsc})?\\b`, 'i').exec(doc)
+        const table = m?.[1]?.split('.').pop()?.replace(/^[`"\[]|[`"\]]$/g, '')
+          ?? Object.keys(dbSchema).find(t => t.toLowerCase() === alias.toLowerCase())
+        const cols = table ? (dbSchema[table] ?? Object.entries(dbSchema).find(([k]) => k.toLowerCase() === table.toLowerCase())?.[1] ?? []) : []
+        if (cols.length) {
+          return { from: member.from + dot + 1, options: [
+            { label: `全部字段（${cols.length}）`, detail: '按表字段顺序插入', type: 'keyword', apply: (view: EditorView, _c: unknown, _from: number, to: number) => view.dispatch({ changes: { from: member.from, to, insert: cols.map(c => `${alias}.${qid(connType, c)}`).join(', ') } }) },
+            ...cols.map(c => ({ label: c, type: 'property' as const })),
+          ], validFor: /^[\w$]*$/ }
+        }
+      }
+      const word = ctx.matchBefore(/[\w$]*$/)
+      const base = await fallback(ctx)
+      if (word && (ctx.explicit || word.from !== word.to)) {
+        const names = schemas.map(s => ({ label: s, type: 'namespace' as const, detail: 'schema / 数据库' }))
+        const vars = localVars.map(v => ({ label: v.name, type: 'variable' as const, detail: v.detail }))
+        const funcs = dialectFunctions.map(label => ({ label, type: 'function' as const, detail: `${connType} 内置函数` }))
+        const existing = [...vars, ...funcs, ...names, ...(base?.options ?? [])]
+        const seen = new Set<string>()
+        const options = existing.filter(o => { const key = o.label.toLowerCase(); if (seen.has(key)) return false; seen.add(key); return true })
+        return base ? { ...base, options } : { from: word.from, options, validFor: /^[\w$]*$/ }
+      }
+      return base
+    }
+    return [lang, lang.language.data.of({ autocomplete: source })]
+  }, [sqlDialect, dbSchema, schemas, ddl, connType, connectionId])
 
   const formatSql = useCallback(async () => {
     if (preFormatRef.current !== null) {

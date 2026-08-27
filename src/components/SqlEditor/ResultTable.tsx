@@ -18,6 +18,7 @@ import { useAppStore } from '../../stores/appStore'
 import { requireProdConfirm } from '../../stores/confirmStore'
 import { formatDuration } from '../../utils/formatDuration'
 import { queueBackgroundExport } from '../../utils/exportTasks'
+import { copyText } from '../../utils/clipboard'
 
 interface QueryResult {
   columns: string[]
@@ -43,6 +44,12 @@ const GRID_ROW_HEIGHT = 28
 const GRID_OVERSCAN = 12
 const GRID_DEFAULT_COL_WIDTH = 180
 const TEXT_PREVIEW_ROW_LIMIT = 2000
+export const CELL_PREVIEW_THRESHOLD = 160
+
+/** 只有确实会被网格截断的文本才启用单击预览。 */
+export function shouldPreviewCell(value: string | null | undefined): value is string {
+  return typeof value === 'string' && value.length > CELL_PREVIEW_THRESHOLD
+}
 
 function RowLimitSelector({ limit, onChange }: { limit: number | null; onChange: (v: number | null) => void }) {
   const [open, setOpen] = useState(false)
@@ -115,6 +122,12 @@ interface CtxMenu {
   col: number
   isStaged: boolean
   tempId?: string
+}
+
+interface BlobViewState {
+  value: string | null
+  column: string
+  onSave?: (value: string | null) => void
 }
 
 const VIEW_LABELS: Record<'grid' | 'json' | 'text' | 'form', string> = { grid: '表格', json: 'JSON', text: '文本', form: '表单' }
@@ -271,7 +284,29 @@ export default function ResultTable({
   const [formIdx, setFormIdx] = useState(0)
   const showForm = useCallback((absRow: number) => { setFormIdx(absRow); setViewMode('form') }, [])
   // R7 — BLOB 查看器
-  const [blobView, setBlobView] = useState<{ value: string | null; column: string } | null>(null)
+  const [blobView, setBlobView] = useState<BlobViewState | null>(null)
+  const cellPreviewTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => {
+    if (cellPreviewTimer.current) clearTimeout(cellPreviewTimer.current)
+  }, [])
+  const scheduleCellPreview = useCallback((e: React.MouseEvent, value: string | null | undefined, column: string, onSave?: (nextValue: string | null) => void) => {
+    if (cellPreviewTimer.current) clearTimeout(cellPreviewTimer.current)
+    cellPreviewTimer.current = null
+    const actuallyTruncated = typeof value === 'string'
+      && e.currentTarget instanceof HTMLElement
+      && e.currentTarget.scrollWidth > e.currentTarget.clientWidth + 1
+    if (e.detail !== 1 || (!shouldPreviewCell(value) && !actuallyTruncated)) return
+    cellPreviewTimer.current = setTimeout(() => {
+      setBlobView({ value: value ?? null, column, onSave })
+      cellPreviewTimer.current = null
+    }, 250)
+  }, [])
+  const cancelCellPreview = useCallback(() => {
+    if (cellPreviewTimer.current) {
+      clearTimeout(cellPreviewTimer.current)
+      cellPreviewTimer.current = null
+    }
+  }, [])
   // M3 — 图表
   const [chartOpen, setChartOpen] = useState(false)
 
@@ -606,6 +641,23 @@ export default function ResultTable({
     [editCtx]
   )
 
+  // 统一处理网格与内容预览弹窗提交的单元格更新。
+  const saveCellValue = useCallback((absRow: number, col: number, val: string | null) => {
+    if (!result || !editCtx || !result.rows[absRow]) return
+    const oldVal = result.rows[absRow][col]
+    if ((oldVal ?? '') === (val ?? '')) return
+    setStagedChanges((prev) => {
+      const existIdx = prev.findIndex(c => c.type === 'update' && c.absRow === absRow && c.col === col)
+      if (existIdx !== -1) {
+        const next = [...prev]
+        next[existIdx] = { ...(next[existIdx] as Extract<StagedChange, { type: 'update' }>), newVal: val }
+        return next
+      }
+      return [...prev, { type: 'update', absRow, col, oldVal, newVal: val, pkValues: getPkValues(absRow) }]
+    })
+    onCellUpdate?.(absRow, col, val)
+  }, [result, editCtx, getPkValues, onCellUpdate])
+
   const commitCellEdit = useCallback(() => {
     if (!editing || !result || !editCtx) return
     const { absRow, col, val } = editing
@@ -617,34 +669,9 @@ export default function ResultTable({
     if (oldVal === null && val === '') { setEditing(null); return }
 
     const newVal = val === '' ? null : val
-    setStagedChanges((prev) => {
-      // 合并同行同列的 update
-      const existIdx = prev.findIndex(
-        (c) => c.type === 'update' && c.absRow === absRow && c.col === col
-      )
-      if (existIdx !== -1) {
-        const existing = prev[existIdx] as Extract<StagedChange, { type: 'update' }>
-        const updated = { ...existing, newVal }
-        const next = [...prev]
-        next[existIdx] = updated
-        return next
-      }
-      return [
-        ...prev,
-        {
-          type: 'update',
-          absRow,
-          col,
-          oldVal,
-          newVal,
-          pkValues: getPkValues(absRow),
-        },
-      ]
-    })
-    // 乐观更新本地视图
-    onCellUpdate?.(absRow, col, newVal)
+    saveCellValue(absRow, col, newVal)
     setEditing(null)
-  }, [editing, result, editCtx, getPkValues, onCellUpdate])
+  }, [editing, result, editCtx, saveCellValue])
 
   // Insert 行单元格编辑
   const commitInsertEdit = useCallback(() => {
@@ -812,6 +839,21 @@ export default function ResultTable({
     if (!text) return
     navigator.clipboard.writeText(text).then(() => toast.success(`已复制 ${selectedRows.size} 行`)).catch(() => {})
   }, [buildRowsText, selectedRows])
+
+  // 复制当前结果集（包含列名）。过滤/排序后按当前可见结果复制，避免用户
+  // 误以为工具栏按钮只复制当前虚拟滚动窗口中的几行。
+  const copyAllResults = useCallback(async () => {
+    if (!result || !filteredRows.length) return
+    const tsvCell = (value: string) => /[\t\n\r"]/.test(value)
+      ? `"${value.replace(/"/g, '""')}"`
+      : value
+    const text = [
+      result.columns.map(tsvCell).join('\t'),
+      ...filteredRows.map(row => row.map(v => tsvCell(v ?? '')).join('\t')),
+    ].join('\n')
+    if (await copyText(text)) toast.success(`已复制全部 ${filteredRows.length} 行`)
+    else toast.error('复制失败，请检查剪贴板权限')
+  }, [result, filteredRows])
 
   // 原生复制事件：Ctrl+C / 右键复制。有文本选区或在编辑器/输入框 → 交给浏览器原生复制（静默）；
   // 仅当"选了行 / 聚焦单元格但无文本选区"时由我们接管，避免"选中即复制 + 到处弹提示"。
@@ -1236,6 +1278,10 @@ export default function ResultTable({
                 <BarChart2 size={14} />
               </button>
             )}
+            <button className="result-tbtn result-tbtn--icon" onClick={copyAllResults}
+              disabled={!filteredRows.length} data-tip="复制全部结果（含列名，Tab 分隔）">
+              <Copy size={14} />
+            </button>
             {/* 结果区下载按钮已移除：与工具栏「导出」重复，统一用工具栏导出（无 LIMIT 全量、流式） */}
           </div>
         )
@@ -1419,6 +1465,7 @@ export default function ResultTable({
                         className={[
                           'result-td',
                           displayVal === null ? 'result-td--null' : '',
+                          shouldPreviewCell(displayVal) ? 'result-td--previewable' : '',
                           hasEditable && !isDeleted ? 'result-td--editable' : '',
                           hasUpdate ? 'result-td--updated' : '',
                           cellInSel(absRow, vi) ? 'result-td--cellsel' : '',
@@ -1426,7 +1473,17 @@ export default function ResultTable({
                         style={{ width: w, maxWidth: w }}
                         onMouseDown={(e) => onCellMouseDown(e, absRow, vi)}
                         onMouseEnter={() => onCellMouseEnter(absRow, vi)}
+                        onClick={(e) => {
+                          if (isEditing) return
+                          scheduleCellPreview(
+                            e,
+                            displayVal,
+                            result.columns[ci] ?? '',
+                            hasEditable && !isDeleted ? (nextValue) => saveCellValue(absRow, ci, nextValue) : undefined,
+                          )
+                        }}
                         onDoubleClick={() => {
+                          cancelCellPreview()
                           if (!hasEditable || isDeleted) return
                           startCellEdit(absRow, ci, displayVal ?? null)
                         }}
@@ -1476,9 +1533,21 @@ export default function ResultTable({
                     return (
                       <td
                         key={ci}
-                        className={`result-td result-td--editable${cell === null ? ' result-td--null' : ''}`}
+                        className={`result-td result-td--editable${cell === null ? ' result-td--null' : ''}${shouldPreviewCell(cell) ? ' result-td--previewable' : ''}`}
                         style={{ width: w, maxWidth: w }}
+                        onClick={(e) => {
+                          if (isEditingInsert) return
+                          scheduleCellPreview(e, cell, result.columns[ci] ?? '', (nextValue) => {
+                            setStagedChanges(prev => prev.map(change => {
+                              if (change.type !== 'insert' || change.tempId !== ins.tempId) return change
+                              const row = [...change.row]
+                              row[ci] = nextValue
+                              return { ...change, row }
+                            }))
+                          })
+                        }}
                         onDoubleClick={() => {
+                          cancelCellPreview()
                           setInsertEditing({ tempId: ins.tempId, col: ci, val: cell ?? '' })
                           setTimeout(() => insertInputRef.current?.select(), 30)
                         }}
@@ -1682,6 +1751,8 @@ export default function ResultTable({
         <BlobViewPanel
           value={blobView.value}
           column={blobView.column}
+          editable={Boolean(blobView.onSave)}
+          onSave={blobView.onSave}
           onClose={() => setBlobView(null)}
         />
       )}

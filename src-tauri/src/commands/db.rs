@@ -13,7 +13,6 @@ use crate::{
 pub fn list_connections(storage: State<'_, StorageState>) -> Result<Vec<ConnConfig>, String> {
     storage.lock().unwrap_or_else(std::sync::PoisonError::into_inner).load()
 }
-
 #[tauri::command]
 pub fn save_connection(
     mut config: ConnConfig,
@@ -103,4 +102,22 @@ pub async fn test_connection(
         return Ok(crate::commands::oracle::test_connection(&config, effective.as_deref(), &registry).await);
     }
     Ok(tester::test(&config, effective.as_deref()).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_connection_password_empty_id() {
+        let result = get_connection_password("".to_string());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("不能为空"));
+    }
+
+    #[test]
+    fn test_get_connection_password_whitespace_id() {
+        let result = get_connection_password("   ".to_string());
+        assert!(result.is_err());
+    }
 }

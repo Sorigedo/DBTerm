@@ -3254,6 +3254,27 @@ body.tab-dragging .tab.active:hover {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+.mdpdf-mermaid {
+  width: 100%;
+  margin: 16px 0 22px;
+  text-align: center;
+  break-inside: avoid;
+  overflow: hidden;
+}
+.mdpdf-mermaid svg {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  max-height: 920px;
+  height: auto;
+  margin: 0 auto;
+}
+.mdpdf-mermaid.is-rendered pre {
+  display: none;
+}
+.mdpdf-mermaid.is-error {
+  text-align: left;
+}
 .mdpdf-body-content code {
   font-family: Menlo, Monaco, Consolas, monospace;
   font-size: 0.92em;
@@ -6332,6 +6353,26 @@ body.tab-dragging .tab.active:hover {
 }
 .dbt-more-btn:hover { color: var(--accent); background: var(--surface-2); }
 
+/* 保存的查询名称通常比表名长：允许两行展示并增加上下留白，便于连续浏览。 */
+.dbt-saved-query-row {
+  align-items: flex-start;
+  gap: 6px;
+  min-height: 30px;
+  padding: 4px 5px 4px 0;
+}
+.dbt-saved-query-row > svg { margin-top: 3px; }
+.dbt-saved-query-row .dbt-more-btn { margin-top: 1px; }
+.dbt-saved-query-name {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  white-space: normal;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.45;
+  padding: 1px 0;
+}
+
 /* Column rows */
 .dbt-columns { padding-left: 18px; padding-bottom: 3px; }
 .dbt-col-row {
@@ -6511,26 +6552,34 @@ body.column-dragging .table-peek__table th:hover { background: var(--surface-2);
   cursor: pointer;
   position: relative;
 }
-/* 提示浮窗：仅在「悬停下划线」装饰存在时显示（装饰由 JS 在移出/点击/滚动/失焦时清除，
-   不依赖 CSS :hover，避免 CodeMirror 复用 DOM 时 :hover 卡住导致浮窗残留） */
+/* 只在真实悬停一段时间后显示；移出文字时立即隐藏，即使 CodeMirror 暂时复用了装饰节点也不会残留。 */
 .cm-table-link::after {
-  content: 'Ctrl + Click 预览';
+  content: 'Ctrl + 单击预览';
   position: absolute;
-  left: 0; top: calc(100% + 3px);
+  left: 0;
+  top: calc(100% + 3px);
+  z-index: 100;
   padding: 3px 8px;
-  background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 5px;
-  font-size: 10px;
+  background: var(--surface);
   color: var(--text-muted);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.18);
+  font-family: var(--font-sans);
+  font-size: 10px;
+  font-style: normal;
   white-space: nowrap;
   pointer-events: none;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.18);
-  z-index: 100;
-  font-family: var(--font-sans);
-  font-style: normal;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.08s ease, visibility 0s linear;
 }
-.is-mac .cm-table-link::after { content: '⌘ + Click 预览'; }
+.cm-table-link:hover::after {
+  opacity: 1;
+  visibility: visible;
+  transition-delay: 500ms, 500ms;
+}
+.is-mac .cm-table-link::after { content: '⌘ + 单击预览'; }
 .cm-sql-cjk-punct {
   background: rgba(220, 38, 38, 0.26);
   color: var(--text-bright);
@@ -9584,6 +9633,7 @@ body.column-dragging .result-th:hover { background: var(--surface); }
 
 /* ── 结果集行内编辑 ─────────────────────────────────────────── */
 .result-td--editable { cursor: cell; }
+.result-td--previewable { cursor: zoom-in; }
 .result-cell-input {
   width: 100%;
   min-width: 80px;

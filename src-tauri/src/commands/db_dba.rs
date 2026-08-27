@@ -23,7 +23,6 @@ pub struct DbaResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
 }
-
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 async fn load_conn(
@@ -377,5 +376,34 @@ pub async fn db_dba_kill_session(
             Ok("已发送终止查询请求".into())
         }
         _ => Err("该数据库类型不支持终止会话".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_from_qr() {
+        let qr = QueryResult {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![Some("1".to_string()), Some("test".to_string())]],
+            rows_affected: 0,
+            is_select: true,
+            execution_time_ms: 0,
+            truncated: false,
+        };
+        let dba = from_qr(qr);
+        assert_eq!(dba.columns.len(), 2);
+        assert_eq!(dba.rows.len(), 1);
+        assert_eq!(dba.columns[0], "id");
+    }
+
+    #[test]
+    fn test_note() {
+        let result = note("test message");
+        assert_eq!(result.columns, vec!["说明".to_string()]);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Some("test message".to_string()));
     }
 }

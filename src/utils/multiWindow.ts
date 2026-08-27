@@ -1,6 +1,6 @@
 // 软件多开 = 同进程内开多个原生窗口（WebviewWindow）。各窗口独立 JS 上下文/Zustand store，
 // 但共享同一份后端（StorageState Mutex、SSH/PTY 会话、事件总线），既隔离又零数据竞争。
-import { WIN_TAG } from './windowTag'
+import { WIN_TAG } from './windowTag.ts'
 import type { WorkspaceTab } from '../types'
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window

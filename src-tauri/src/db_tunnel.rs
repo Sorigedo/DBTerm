@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tracing::{info, warn, instrument};
+use crate::tracing_utils::Timer;
 
 /// 全局隧道池：key = 连接 ID。复用已建立的 SSH 连接，避免每次查询都重新登录跳板机
 static POOL: OnceLock<Mutex<HashMap<String, Arc<DbTunnel>>>> = OnceLock::new();
@@ -57,14 +59,17 @@ impl DbTunnel {
 
     /// 按 key（连接 ID）复用隧道：已存在且存活则直接返回，否则新建并入池。
     /// 每个 key 持有独立建连锁，防止并发首次建连时重复握手。
+    #[instrument(skip(cfg), fields(key = %key, db_host = %db_host, db_port = db_port))]
     pub async fn open_shared(key: &str, cfg: &DbTunnelCfg, db_host: &str, db_port: u16)
         -> Result<Arc<Self>, String>
     {
+        let _timer = Timer::new("open_shared_tunnel");
         // 快速路径：池中已有活跃隧道直接返回
         {
             let p = pool().lock().await;
             if let Some(t) = p.get(key) {
                 if t.is_alive() {
+                    info!("Reusing existing SSH tunnel");
                     return Ok(t.clone());
                 }
             }
@@ -82,21 +87,25 @@ impl DbTunnel {
             let mut p = pool().lock().await;
             if let Some(t) = p.get(key) {
                 if t.is_alive() {
+                    info!("SSH tunnel built by concurrent request");
                     return Ok(t.clone());
                 }
                 p.remove(key);
-                log::info!("DB SSH 隧道已断开，重建 (key={key})");
+                warn!("DB SSH tunnel disconnected, rebuilding");
             }
         }
 
         // 耗时的 SSH 握手在池锁外执行（但在 build_lock 内，保证唯一性）
         let t = Arc::new(Self::open(cfg, db_host, db_port).await?);
+        info!(local_port = t.local_port, "SSH tunnel established");
         pool().lock().await.insert(key.to_string(), t.clone());
         Ok(t)
     }
 
     /// 建立 SSH 连接，绑定本地随机端口，代理到 db_host:db_port
+    #[instrument(skip(cfg), fields(ssh_host = %cfg.host, ssh_port = cfg.effective_port(), db_host = %db_host, db_port = db_port))]
     pub async fn open(cfg: &DbTunnelCfg, db_host: &str, db_port: u16) -> Result<Self, String> {
+        let _timer = Timer::new("open_tunnel");
         // 统一展开私钥路径中的 ~（覆盖所有调用方：query/db_tx/redis/mongo/sqlserver…）
         let owned;
         let cfg = if cfg.key_path.starts_with("~/") {
@@ -176,4 +185,191 @@ impl Drop for DbTunnel {
         self._task.abort();
         log::debug!("DB SSH 隧道已关闭 (local_port={})", self.local_port);
     }
+}
+
+// ── 测试模块 ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_db_tunnel_cfg_default() {
+        let cfg = DbTunnelCfg::default();
+        assert_eq!(cfg.host, "");
+        assert_eq!(cfg.port, 0);
+        assert_eq!(cfg.user, "");
+        assert_eq!(cfg.auth_type, "");
+        assert_eq!(cfg.password, "");
+        assert_eq!(cfg.key_path, "");
+    }
+
+    #[test]
+    fn test_db_tunnel_cfg_effective_port_default() {
+        let cfg = DbTunnelCfg {
+            port: 0,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_port(), 22);
+    }
+
+    #[test]
+    fn test_db_tunnel_cfg_effective_port_custom() {
+        let cfg = DbTunnelCfg {
+            port: 2222,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_port(), 2222);
+    }
+
+    #[test]
+    fn test_db_tunnel_cfg_clone() {
+        let cfg1 = DbTunnelCfg {
+            host: "jump.example.com".to_string(),
+            port: 22,
+            user: "admin".to_string(),
+            auth_type: "key".to_string(),
+            password: "".to_string(),
+            key_path: "~/.ssh/id_rsa".to_string(),
+        };
+
+        let cfg2 = cfg1.clone();
+        assert_eq!(cfg2.host, "jump.example.com");
+        assert_eq!(cfg2.port, 22);
+        assert_eq!(cfg2.user, "admin");
+        assert_eq!(cfg2.auth_type, "key");
+        assert_eq!(cfg2.key_path, "~/.ssh/id_rsa");
+    }
+
+    #[test]
+    fn test_db_tunnel_cfg_various_auth_types() {
+        let auth_types = vec!["password", "key", "mfa", "agent", "none"];
+
+        for auth_type in auth_types {
+            let cfg = DbTunnelCfg {
+                auth_type: auth_type.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(cfg.auth_type, auth_type);
+        }
+    }
+
+    #[test]
+    fn test_db_tunnel_cfg_construction() {
+        let cfg = DbTunnelCfg {
+            host: "192.168.1.100".to_string(),
+            port: 2222,
+            user: "dbuser".to_string(),
+            auth_type: "password".to_string(),
+            password: "secret123".to_string(),
+            key_path: "".to_string(),
+        };
+
+        assert_eq!(cfg.host, "192.168.1.100");
+        assert_eq!(cfg.port, 2222);
+        assert_eq!(cfg.user, "dbuser");
+        assert_eq!(cfg.auth_type, "password");
+        assert_eq!(cfg.password, "secret123");
+        assert_eq!(cfg.key_path, "");
+        assert_eq!(cfg.effective_port(), 2222);
+    }
+
+    #[test]
+    fn test_db_tunnel_cfg_key_auth() {
+        let cfg = DbTunnelCfg {
+            host: "jump.internal".to_string(),
+            port: 22,
+            user: "automation".to_string(),
+            auth_type: "key".to_string(),
+            password: "".to_string(),
+            key_path: "/home/user/.ssh/automation_key".to_string(),
+        };
+
+        assert_eq!(cfg.auth_type, "key");
+        assert_eq!(cfg.key_path, "/home/user/.ssh/automation_key");
+        assert_eq!(cfg.password, "");
+    }
+
+    #[test]
+    fn test_db_tunnel_cfg_mfa_auth() {
+        let cfg = DbTunnelCfg {
+            host: "secure.example.com".to_string(),
+            port: 22,
+            user: "adminuser".to_string(),
+            auth_type: "mfa".to_string(),
+            password: "pass123".to_string(),
+            key_path: "".to_string(),
+        };
+
+        assert_eq!(cfg.auth_type, "mfa");
+        assert_eq!(cfg.password, "pass123");
+    }
+
+    #[test]
+    fn test_db_tunnel_cfg_agent_auth() {
+        let cfg = DbTunnelCfg {
+            host: "dev.example.com".to_string(),
+            port: 22,
+            user: "developer".to_string(),
+            auth_type: "agent".to_string(),
+            password: "".to_string(),
+            key_path: "".to_string(),
+        };
+
+        assert_eq!(cfg.auth_type, "agent");
+        assert_eq!(cfg.password, "");
+        assert_eq!(cfg.key_path, "");
+    }
+
+    #[test]
+    fn test_pool_initialization() {
+        // 测试pool可以初始化
+        let _p = pool();
+        // 多次调用应该返回同一个实例
+        let p1 = pool();
+        let p2 = pool();
+        assert!(std::ptr::eq(p1, p2));
+    }
+
+    #[test]
+    fn test_build_locks_initialization() {
+        // 测试build_locks可以初始化
+        let _locks = build_locks();
+        // 多次调用应该返回同一个实例
+        let l1 = build_locks();
+        let l2 = build_locks();
+        assert!(std::ptr::eq(l1, l2));
+    }
+
+    #[test]
+    fn test_db_tunnel_cfg_standard_port() {
+        let cfg = DbTunnelCfg {
+            host: "ssh.example.com".to_string(),
+            port: 22,
+            user: "user".to_string(),
+            auth_type: "password".to_string(),
+            password: "pass".to_string(),
+            key_path: "".to_string(),
+        };
+
+        assert_eq!(cfg.effective_port(), 22);
+    }
+
+    #[test]
+    fn test_db_tunnel_cfg_high_port() {
+        let cfg = DbTunnelCfg {
+            host: "custom.example.com".to_string(),
+            port: 9999,
+            user: "user".to_string(),
+            auth_type: "key".to_string(),
+            password: "".to_string(),
+            key_path: "~/.ssh/custom".to_string(),
+        };
+
+        assert_eq!(cfg.effective_port(), 9999);
+    }
+
+    // 注意：实际的DbTunnel::open和open_shared需要真实SSH连接，
+    // 在单元测试中无法测试。这些测试应该在集成测试中进行。
+    // 这里我们只测试配置和初始化相关的逻辑。
 }

@@ -405,3 +405,93 @@ pub async fn ch_mv_lineage(
 
     Ok(ChLineage { nodes, edges })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_base_url_http() {
+        let config = ConnConfig {
+            id: String::new(),
+            name: String::new(),
+            conn_type: ConnType::ClickHouse,
+            host: Some("localhost".to_string()),
+            port: Some(8123),
+            database: None,
+            username: None,
+            file_path: None,
+            ssh_key_path: None,
+            use_ssl: false,
+            created_at: 0,
+            updated_at: 0,
+            color: None,
+            extra_json: None,
+            read_only: None,
+            env_label: None,
+        };
+        assert_eq!(base_url(&config), "http://localhost:8123/");
+    }
+
+    #[test]
+    fn test_base_url_https() {
+        let config = ConnConfig {
+            id: String::new(),
+            name: String::new(),
+            conn_type: ConnType::ClickHouse,
+            host: Some("example.com".to_string()),
+            port: Some(8443),
+            database: None,
+            username: None,
+            file_path: None,
+            ssh_key_path: None,
+            use_ssl: true,
+            created_at: 0,
+            updated_at: 0,
+            color: None,
+            extra_json: None,
+            read_only: None,
+            env_label: None,
+        };
+        assert_eq!(base_url(&config), "https://example.com:8443/");
+    }
+
+    #[test]
+    fn test_base_url_defaults() {
+        let config = ConnConfig {
+            id: String::new(),
+            name: String::new(),
+            conn_type: ConnType::ClickHouse,
+            host: None,
+            port: None,
+            database: None,
+            username: None,
+            file_path: None,
+            ssh_key_path: None,
+            use_ssl: false,
+            created_at: 0,
+            updated_at: 0,
+            color: None,
+            extra_json: None,
+            read_only: None,
+            env_label: None,
+        };
+        assert_eq!(base_url(&config), "http://127.0.0.1:8123/");
+    }
+
+    #[test]
+    fn test_cell_to_string() {
+        assert_eq!(cell_to_string(&serde_json::json!(null)), None);
+        assert_eq!(cell_to_string(&serde_json::json!("hello")), Some("hello".to_string()));
+        assert_eq!(cell_to_string(&serde_json::json!(42)), Some("42".to_string()));
+        assert_eq!(cell_to_string(&serde_json::json!(true)), Some("true".to_string()));
+    }
+
+    #[test]
+    fn test_client_shared() {
+        let c1 = client();
+        let c2 = client();
+        assert!(c1.is_ok());
+        assert!(c2.is_ok());
+    }
+}

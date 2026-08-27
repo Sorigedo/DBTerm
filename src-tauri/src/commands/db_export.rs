@@ -21,6 +21,18 @@ use crate::commands::driver::DriverRegistry;
 
 pub type ExportCancelMap = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 
+/// 写入前端生成的二进制导出文件（例如多结果集 Excel）。路径仍经过
+/// 与流式导出相同的绝对路径/目录校验，避免任意路径写入。
+#[tauri::command]
+pub fn write_export_bytes(file_path: String, data: Vec<u8>) -> Result<(), String> {
+    super::db_extra::validate_path(&file_path)?;
+    let path = std::path::Path::new(&file_path);
+    if let Some(dir) = path.parent() {
+        if !dir.exists() { return Err(format!("目录不存在: {}", dir.display())); }
+    }
+    std::fs::write(path, data).map_err(|e| format!("写入导出文件失败: {e}"))
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArchiveEntry {
@@ -1955,6 +1967,170 @@ mod archive_tests {
         let mut mysql_sql = String::new();
         mysql.write_row_to(&mut mysql_sql, &cols, &vals);
         assert!(mysql_sql.contains("'O\\'Reilly\\\\docs'"));
+    }
+
+    #[test]
+    fn test_safe_archive_name_valid_paths() {
+        assert!(safe_archive_name("data.sql").is_ok());
+        assert!(safe_archive_name("tables/users.sql").is_ok());
+        assert!(safe_archive_name("schemas/public/tables/customers.sql").is_ok());
+        assert!(safe_archive_name("exports/2024/backup.sql").is_ok());
+    }
+
+    #[test]
+    fn test_safe_archive_name_absolute_paths() {
+        assert!(safe_archive_name("/etc/passwd").is_err());
+        assert!(safe_archive_name("/Users/test/file.sql").is_err());
+        // Windows风格的绝对路径在非Windows系统上可能不被识别为绝对路径
+        #[cfg(target_os = "windows")]
+        assert!(safe_archive_name("C:\\Windows\\System32\\file.sql").is_err());
+    }
+
+    #[test]
+    fn test_safe_archive_name_parent_traversal() {
+        assert!(safe_archive_name("../passwords.sql").is_err());
+        assert!(safe_archive_name("tables/../../secrets.sql").is_err());
+        assert!(safe_archive_name("a/../b/../../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_archive_entry_construction() {
+        let entry = ArchiveEntry {
+            name: "test.sql".to_string(),
+            header: "CREATE TABLE test;".to_string(),
+            source_path: Some("/tmp/test.sql".to_string()),
+            binary: false,
+        };
+
+        assert_eq!(entry.name, "test.sql");
+        assert_eq!(entry.header, "CREATE TABLE test;");
+        assert_eq!(entry.source_path, Some("/tmp/test.sql".to_string()));
+        assert!(!entry.binary);
+    }
+
+    #[test]
+    fn test_archive_entry_binary() {
+        let entry = ArchiveEntry {
+            name: "image.jpg".to_string(),
+            header: String::new(),
+            source_path: Some("/tmp/image.jpg".to_string()),
+            binary: true,
+        };
+
+        assert!(entry.binary);
+        assert_eq!(entry.header, "");
+    }
+
+    #[test]
+    fn test_ident_quote_double() {
+        let quote = IdentQuote::Double;
+        assert_eq!(quote.quote("tablename"), "\"tablename\"");
+        assert_eq!(quote.quote("column"), "\"column\"");
+        assert_eq!(quote.quote("test\"name"), "\"test\"\"name\""); // 双引号转义
+    }
+
+    #[test]
+    fn test_ident_quote_backtick() {
+        let quote = IdentQuote::Backtick;
+        assert_eq!(quote.quote("tablename"), "`tablename`");
+        assert_eq!(quote.quote("column"), "`column`");
+        assert_eq!(quote.quote("test`name"), "`test``name`"); // 反引号转义
+    }
+
+    #[test]
+    fn test_ident_quote_bracket() {
+        let quote = IdentQuote::Bracket;
+        assert_eq!(quote.quote("tablename"), "[tablename]");
+        assert_eq!(quote.quote("column"), "[column]");
+        assert_eq!(quote.quote("test]name"), "[test]]name]"); // 方括号转义
+    }
+
+    #[test]
+    fn test_row_writer_csv_variant() {
+        let csv_writer = RowWriter::Csv { sep: b',' };
+        let tsv_writer = RowWriter::Csv { sep: b'\t' };
+
+        match csv_writer {
+            RowWriter::Csv { sep } => assert_eq!(sep, b','),
+            _ => panic!("Expected CSV variant"),
+        }
+
+        match tsv_writer {
+            RowWriter::Csv { sep } => assert_eq!(sep, b'\t'),
+            _ => panic!("Expected CSV variant with tab separator"),
+        }
+    }
+
+    #[test]
+    fn test_row_writer_json_variant() {
+        let json_writer = RowWriter::Json { wrote_any: false };
+
+        match json_writer {
+            RowWriter::Json { wrote_any } => assert!(!wrote_any),
+            _ => panic!("Expected JSON variant"),
+        }
+    }
+
+    #[test]
+    fn test_row_writer_jsonl_variant() {
+        let jsonl_writer = RowWriter::Jsonl;
+
+        match jsonl_writer {
+            RowWriter::Jsonl => {},
+            _ => panic!("Expected JSONL variant"),
+        }
+    }
+
+    #[test]
+    fn test_row_writer_md_variant() {
+        let md_writer = RowWriter::Md;
+
+        match md_writer {
+            RowWriter::Md => {},
+            _ => panic!("Expected Md variant"),
+        }
+    }
+
+    #[test]
+    fn test_row_writer_sql_pg() {
+        let pg_writer = RowWriter::Sql {
+            table: "users",
+            quote: IdentQuote::Double,
+            mysql_escape: false,
+        };
+
+        match pg_writer {
+            RowWriter::Sql { table, quote, mysql_escape } => {
+                assert_eq!(table, "users");
+                assert!(!mysql_escape);
+                match quote {
+                    IdentQuote::Double => {},
+                    _ => panic!("Expected Double quote"),
+                }
+            }
+            _ => panic!("Expected SQL variant"),
+        }
+    }
+
+    #[test]
+    fn test_row_writer_sql_mysql() {
+        let mysql_writer = RowWriter::Sql {
+            table: "products",
+            quote: IdentQuote::Backtick,
+            mysql_escape: true,
+        };
+
+        match mysql_writer {
+            RowWriter::Sql { table, quote, mysql_escape } => {
+                assert_eq!(table, "products");
+                assert!(mysql_escape);
+                match quote {
+                    IdentQuote::Backtick => {},
+                    _ => panic!("Expected Backtick quote"),
+                }
+            }
+            _ => panic!("Expected SQL variant"),
+        }
     }
 }
 
