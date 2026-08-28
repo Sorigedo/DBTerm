@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.1.22"
+version = "0.1.23"
 description = "DBTerm - SSH 和数据库管理工具"
 authors = ["DBTerm"]
 edition = "2021"

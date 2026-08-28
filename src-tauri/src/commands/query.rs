@@ -1681,6 +1681,60 @@ fn has_mysql_user_prepared_stmt_command(sql: &str) -> bool {
     })
 }
 
+/// Split a MySQL session-state script without splitting semicolons inside
+/// strings or comments. This is intentionally limited to scripts containing
+/// user variables / PREPARE; routine bodies use the single raw_sql path below.
+fn split_mysql_session_script(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut start = 0usize;
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if line_comment {
+            if ch == b'\n' { line_comment = false; }
+            i += 1;
+            continue;
+        }
+        if block_comment {
+            if ch == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                block_comment = false;
+                i += 2;
+            } else { i += 1; }
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == b'\\' { i = (i + 2).min(bytes.len()); continue; }
+            if ch == q {
+                if bytes.get(i + 1) == Some(&q) { i += 2; continue; }
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            line_comment = true; i += 2; continue;
+        }
+        if ch == b'#' { line_comment = true; i += 1; continue; }
+        if ch == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            block_comment = true; i += 2; continue;
+        }
+        if matches!(ch, b'\'' | b'"' | b'`') { quote = Some(ch); i += 1; continue; }
+        if ch == b';' {
+            let part = sql[start..i].trim();
+            if !part.is_empty() { statements.push(part.to_string()); }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    let tail = sql[start..].trim();
+    if !tail.is_empty() { statements.push(tail.to_string()); }
+    statements
+}
+
 fn has_mysql_user_variable(sql: &str) -> bool {
     let mut chars = sql.char_indices().peekable();
     let mut quote: Option<char> = None;
@@ -1748,8 +1802,29 @@ mod tests {
         has_mysql_user_variable,
         is_query_stmt,
         needs_text_protocol,
+        split_mysql_session_script,
         supports_auto_row_limit,
     };
+
+    #[test]
+    fn mysql_session_script_split_keeps_quoted_semicolons() {
+        let sql = "SET @x := 'a;b'; PREPARE s FROM @x; EXECUTE s; DEALLOCATE PREPARE s;";
+        assert_eq!(split_mysql_session_script(sql), vec![
+            "SET @x := 'a;b'",
+            "PREPARE s FROM @x",
+            "EXECUTE s",
+            "DEALLOCATE PREPARE s",
+        ]);
+    }
+
+    #[test]
+    fn mysql_session_script_split_ignores_comment_semicolons() {
+        let sql = "SET @x := 1 /* ; */; -- ;\n EXECUTE s;";
+        assert_eq!(split_mysql_session_script(sql), vec![
+            "SET @x := 1 /* ; */",
+            "-- ;\n EXECUTE s",
+        ]);
+    }
 
     #[test]
     fn mysql_user_prepared_statement_commands_use_text_protocol() {
@@ -1951,22 +2026,60 @@ fn mysql_admin_query(
             }
         }
         let run = async {
-            let rows = (&mut conn)
-                .fetch_all(sqlx::raw_sql(&tagged_sql))
-                .await
-                .map_err(|e| format!("执行失败: {e}"))?;
-            let columns = rows
-                .first()
-                .map(|r| r.columns().iter().map(|c| c.name().to_string()).collect())
-                .unwrap_or_default();
-            let data = rows.iter()
-                .map(|r| (0..r.columns().len()).map(|i| mysql_cell(r, i)).collect())
-                .collect();
+            // User variables and server-side prepared statements are connection
+            // scoped. Execute each statement sequentially on this detached
+            // connection so a pool checkout can never lose the session state.
+            let script_head = strip_leading_comments(&tagged_sql).trim_start().to_uppercase();
+            let routine_statement = (script_head.starts_with("CREATE ")
+                || script_head.starts_with("DROP ")
+                || script_head.starts_with("ALTER "))
+                && (script_head.contains(" FUNCTION")
+                    || script_head.contains(" PROCEDURE")
+                    || script_head.contains(" TRIGGER")
+                    || script_head.contains(" EVENT"));
+            let session_script = !routine_statement
+                && (has_mysql_user_variable(&tagged_sql)
+                    || has_mysql_user_prepared_stmt_command(&tagged_sql));
+            let statements = if session_script {
+                split_mysql_session_script(&tagged_sql)
+            } else {
+                vec![tagged_sql.clone()]
+            };
+            let mut columns = Vec::new();
+            let mut data = Vec::new();
+            let mut affected = 0u64;
+            let mut saw_result = false;
+            for statement in statements {
+                let head = strip_leading_comments(&statement).trim_start().to_uppercase();
+                let returns_rows = is_query_stmt(&statement)
+                    || head.starts_with("EXECUTE ")
+                    || head.starts_with("CALL ");
+                if returns_rows {
+                    let rows = (&mut conn)
+                        .fetch_all(sqlx::raw_sql(&statement))
+                        .await
+                        .map_err(|e| format!("执行失败: {e}"))?;
+                    if !rows.is_empty() {
+                        if columns.is_empty() {
+                            columns = rows[0].columns().iter().map(|c| c.name().to_string()).collect();
+                        }
+                        data.extend(rows.iter().map(|r| (0..r.columns().len()).map(|i| mysql_cell(r, i)).collect::<Vec<_>>()));
+                        saw_result = true;
+                    }
+                } else {
+                    let result = (&mut conn)
+                        .execute(sqlx::raw_sql(&statement))
+                        .await
+                        .map_err(|e| format!("执行失败: {e}"))?;
+                    affected = affected.saturating_add(result.rows_affected());
+                }
+            }
+            let row_count = data.len() as u64;
             Ok(QueryResult {
                 columns, rows: data,
-                rows_affected: rows.len() as u64,
+                rows_affected: if saw_result { row_count } else { affected },
                 execution_time_ms: start.elapsed().as_millis() as u64,
-                truncated: false, is_select: true,
+                truncated: false, is_select: saw_result,
             })
         };
         let result = if let Some(rx) = abort_rx {

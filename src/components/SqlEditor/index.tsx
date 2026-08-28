@@ -1311,10 +1311,15 @@ export default function SqlEditor({ tabId, connectionId, connType, onRunningChan
     const isMysqlFamilyConn = mysqlConn
     const splitStmts = splitSqlStatements(trimmed, connType).filter(s => stripSqlComments(s) !== '')
     const splitHasTxControl = splitStmts.some(s => transactionControlStatement(s, connType))
-    const keepMysqlSessionScript = isMysqlFamilyConn
+    const hasMysqlSessionState = isMysqlFamilyConn
       && (hasMysqlUserPreparedStmt(trimmed) || hasMysqlUserVariable(trimmed))
+    // 服务端 PREPARE/EXECUTE 依赖同一条 MySQL 会话。事务控制语句不能成为
+    // 拆分依据，否则连接池可能为 SET、PREPARE、EXECUTE 分配不同连接，导致
+    // PREPARE ... FROM @变量收到 NULL。带 DELIMITER 的存储程序仍按方言规则拆分。
+    // 仅保留没有 PREPARE 命令的普通用户变量事务脚本走事务编排路径。
+    const keepMysqlSessionScript = hasMysqlSessionState
       && !hasMysqlDelimiterDirective(trimmed)
-      && !splitHasTxControl
+      && (!splitHasTxControl || hasMysqlUserPreparedStmt(trimmed))
     const stmts = keepMysqlSessionScript
       ? [trimmed]
       : splitStmts
