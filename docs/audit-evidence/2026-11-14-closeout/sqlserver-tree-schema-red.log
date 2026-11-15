@@ -1,0 +1,58 @@
+node:internal/modules/run_main:107
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: rename, truncate and drop must retain exact selected database and schema
++ actual - expected
+
+  [
+    {
+      id: 'fixture',
++     sql: "EXEC [fixture_db].sys.sp_rename N'[same''.]]table]', N'renamed', N'OBJECT';"
+-     sql: "EXEC [fixture_db].sys.sp_rename N'[ops''.]]中文].[same''.]]table]', N'renamed', N'OBJECT';"
+    },
+    {
+      id: 'fixture',
++     sql: "TRUNCATE TABLE [fixture_db]..[same'.]]table]"
+-     sql: "TRUNCATE TABLE [fixture_db].[ops'.]]中文].[same'.]]table]"
+    },
+    {
+      id: 'fixture',
++     sql: "DROP TABLE [fixture_db]..[same'.]]table]"
+-     sql: "DROP TABLE [fixture_db].[ops'.]]中文].[same'.]]table]"
+    }
+  ]
+
+    at file:///Users/Nico/workSpace/claude/DBterm/scripts/acceptance/sqlserver-tree-target.mjs:57:9 {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: [
+    {
+      id: 'fixture',
+      sql: "EXEC [fixture_db].sys.sp_rename N'[same''.]]table]', N'renamed', N'OBJECT';"
+    },
+    {
+      id: 'fixture',
+      sql: "TRUNCATE TABLE [fixture_db]..[same'.]]table]"
+    },
+    { id: 'fixture', sql: "DROP TABLE [fixture_db]..[same'.]]table]" }
+  ],
+  expected: [
+    {
+      id: 'fixture',
+      sql: "EXEC [fixture_db].sys.sp_rename N'[ops''.]]中文].[same''.]]table]', N'renamed', N'OBJECT';"
+    },
+    {
+      id: 'fixture',
+      sql: "TRUNCATE TABLE [fixture_db].[ops'.]]中文].[same'.]]table]"
+    },
+    {
+      id: 'fixture',
+      sql: "DROP TABLE [fixture_db].[ops'.]]中文].[same'.]]table]"
+    }
+  ],
+  operator: 'deepStrictEqual',
+  diff: 'simple'
+}
+
+Node.js v26.8.2

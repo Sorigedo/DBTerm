@@ -1,0 +1,105 @@
+// Actual asset tree/tab creation and grid; synthetic IPC, temporary local browser.
+import assert from 'node:assert/strict';
+import {fileURLToPath} from 'node:url';
+import {mkdtemp,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {createServer} from 'vite';
+import react from '@vitejs/plugin-react';
+const {chromium}=await import(process.env.DBTERM_PLAYWRIGHT_MODULE||'playwright');
+const root=fileURLToPath(new URL('../../',import.meta.url));
+const fixture=await mkdtemp(join(tmpdir(),'dbterm-preview-target-'));
+const entry="import React from 'react';import {createRoot} from 'react-dom/client';import AssetPanel from '/src/components/AssetPanel/index.tsx';import Grid from '/src/components/DbTools/TableBrowser.tsx';import {useAppStore} from '/src/stores/appStore.ts';import '/src/index.css';useAppStore.setState({activeView:'db',connections:[{id:'fixture',name:'fixture',type:'sqlServer',createdAt:0,updatedAt:0}],connectedDbConns:new Set(['fixture']),tabs:[]});window.getTabs=()=>useAppStore.getState().tabs;const ui=createRoot(document.getElementById('root'));window.showGrid=()=>{const t=useAppStore.getState().tabs.at(-1);ui.render(React.createElement(Grid,{connectionId:t.connectionId,connType:'sqlServer',schema:t.meta.schema,table:t.meta.table,ssSchema:t.meta.ssSchema,embedded:true}));};ui.render(React.createElement(AssetPanel,{open:true}));";
+const html='<html><body><div id=root></div><script type=module src=/__preview.tsx></script></body></html>';
+const server=await createServer({root,configFile:false,cacheDir:join(fixture,'cache'),plugins:[react(),{name:'isolated-preview-target',configureServer(s){s.middlewares.use(async(req,res,next)=>{if(req.url==='/__preview'){res.setHeader('Content-Type','text/html');res.end(await s.transformIndexHtml('/__preview',html));}else next();});},resolveId(id){if(id==='/__preview.tsx')return '\0isolated-preview-target.tsx';},load(id){if(id==='\0isolated-preview-target.tsx')return entry;}}],server:{host:'127.0.0.1',port:0}});
+let browser;
+try {
+ await server.listen();browser=await chromium.launch({executablePath:process.env.DBTERM_TEST_CHROME||'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',headless:true});
+ const page=await browser.newPage();const errors=[];page.on('pageerror',e=>errors.push(e.message));
+ await page.addInitScript(()=>{
+  window.calls=[];window.unexpected=[];
+  const result=(columns,rows)=>({columns,rows,rowsAffected:0,executionTimeMs:0});
+  window.__TAURI_INTERNALS__={metadata:{currentWindow:{label:'fixture'},currentWebview:{label:'fixture'}},invoke:async(command,args={})=>{
+   window.calls.push({command,args});
+   if(command==='plugin:window|set_theme')return;
+   if(command==='list_schemas')return ['fixture_db'];
+   if(command==='list_ss_db_schemas')return ['dbo',"ops'.]中文"];
+   if(command==='list_ss_schema_tables')return [{name:'same',isView:false}];
+   if(command==='get_table_ddl')return '-- isolated DDL';
+   if(command==='table_columns')return [{name:'id',dataType:'int',nullable:false,key:'PRI',defaultValue:null}];
+   if(command==='db_data_dictionary')return [];
+   if(command==='execute_query'){
+    if(args.sql.includes('INFORMATION_SCHEMA.COLUMNS'))return result(['name','type','key','comment','nullable','default'],[['id','int','PRI','fixture comment','NO',null]]);
+    if(args.sql.startsWith('SELECT COUNT'))return result(['count'],[[window.withRows?'1':'0']]);
+    if(args.sql.startsWith('SELECT *'))return window.withRows?result(['id'],[['1']]):result([],[]);
+    if(args.sql.includes('sys.indexes'))return result(['index'],[]);
+   }
+   if(command==='plugin:event|listen')return 1;if(command==='plugin:event|unlisten')return;
+   if(command==='update_cell')return;
+   if(command==='db_delete_rows'||command==='db_insert_drafts')return 1;
+   window.unexpected.push(command);throw Error('unexpected isolated IPC '+command);
+  }};
+ });
+ await page.goto('http://127.0.0.1:'+server.httpServer.address().port+'/__preview');
+ await page.getByRole('button',{name:'fixture_db',exact:true}).click();
+ for(const schema of ['dbo',"ops'.]中文"]){
+  await page.getByRole('button',{name:schema,exact:true}).click();
+  const branch=page.locator('.dbt-cat-node').filter({has:page.locator('.dbt-cat-label',{hasText:schema})});
+  await branch.locator('.dbt-table-row').dblclick();
+ }
+ const tabs=await page.evaluate(()=>window.getTabs().filter(t=>t.type==='table-data'));
+ assert.equal(tabs.length,2,'same-name tables in two schemas must open separate preview tabs');
+ assert.deepEqual(tabs.map(t=>t.meta),[{schema:'fixture_db',table:'same',connType:'sqlServer',ssSchema:'dbo'},{schema:'fixture_db',table:'same',connType:'sqlServer',ssSchema:"ops'.]中文"}]);
+ await page.evaluate(()=>window.showGrid());
+ await page.waitForFunction(()=>window.calls.some(c=>c.command==='table_columns'));
+ const calls=await page.evaluate(()=>window.calls);
+ assert.deepEqual(calls.find(c=>c.command==='table_columns').args,{id:'fixture',schema:'fixture_db',table:'same',ssSchema:"ops'.]中文"},'empty preview metadata must target selected schema');
+ const reads=calls.filter(c=>c.command==='execute_query'&&/^SELECT (\*|COUNT)/.test(c.args.sql));
+ assert.ok(reads.length>=2);for(const call of reads)assert.ok(call.args.sql.includes("[fixture_db].[ops'.]]中文].[same]"),call.args.sql);
+ const header=calls.find(c=>c.command==='execute_query'&&c.args.sql.includes('INFORMATION_SCHEMA.COLUMNS'));
+ assert.ok(header.args.sql.includes('[fixture_db].INFORMATION_SCHEMA.COLUMNS'));
+ assert.ok(header.args.sql.includes("c.TABLE_SCHEMA=N'ops''. ]中文'".replace('. ','.')),'header must filter the selected object schema');
+ await page.locator('.tb-table thead').waitFor();
+ await page.locator('[data-tip=表操作]').click();
+ await page.getByRole('button',{name:'表属性（属性 / 索引 / DDL）',exact:false}).click();
+ await page.getByRole('button',{name:'索引',exact:true}).click();
+ await page.waitForFunction(()=>window.calls.some(c=>c.command==='execute_query'&&c.args.sql.includes('sys.indexes')));
+ const indexes=await page.evaluate(()=>window.calls.find(c=>c.command==='execute_query'&&c.args.sql.includes('sys.indexes')).args.sql);
+ assert.ok(indexes.includes("s.name=N'ops''. ]中文'".replace('. ','.')),'index detail must target selected schema');
+ await page.getByRole('button',{name:'DDL',exact:true}).click();
+ await page.waitForFunction(()=>window.calls.some(c=>c.command==='get_table_ddl'));
+ assert.deepEqual(await page.evaluate(()=>window.calls.find(c=>c.command==='get_table_ddl').args),{id:'fixture',schema:'fixture_db',table:'same',ssSchema:"ops'.]中文"});
+ await page.evaluate(()=>window.withRows=true);
+ await page.locator('[data-tip=刷新]').click();
+ const cell=page.locator('.tb-table tbody tr[data-ri]').first().locator('td').nth(1);
+ await cell.dblclick();await page.locator('.tb-td--editing input').fill('2');await page.locator('.tb-td--editing input').press('Enter');
+ await page.waitForFunction(()=>window.calls.some(c=>c.command==='update_cell'));
+ assert.equal(await page.evaluate(()=>window.calls.find(c=>c.command==='update_cell').args.ssSchema),"ops'.]中文",'cell save must retain selected schema');
+ await cell.click({button:'right'});await page.getByRole('button',{name:'删除行',exact:false}).click();
+ await page.getByRole('button',{name:'确认删除',exact:true}).click();
+ await page.waitForFunction(()=>window.calls.some(c=>c.command==='db_delete_rows'));
+ assert.equal(await page.evaluate(()=>window.calls.find(c=>c.command==='db_delete_rows').args.ssSchema),"ops'.]中文",'row delete snapshot must retain selected schema');
+ await page.locator('[data-tip=新增行]').click();
+ await page.locator('.tb-tr--draft input').fill('3');await page.locator('[data-tip=提交新增]').click();
+ await page.waitForFunction(()=>window.calls.some(c=>c.command==='db_insert_drafts'));
+ assert.equal(await page.evaluate(()=>window.calls.find(c=>c.command==='db_insert_drafts').args.ssSchema),"ops'.]中文",'draft insert must retain selected schema');
+ await page.waitForFunction(()=>!document.querySelector('.tb-tr--draft'));
+ await page.locator('[data-tip=表操作]').click();
+ await page.getByRole('button',{name:'修改表结构…',exact:false}).click();
+ await page.locator('.ctw-name-inp').waitFor();
+ await page.waitForFunction(()=>window.calls.filter(c=>c.command==='table_columns').length>=2);
+ assert.equal(await page.evaluate(()=>window.calls.filter(c=>c.command==='table_columns').at(-1).args.ssSchema),"ops'.]中文",'structure editor metadata must retain selected schema');
+ await page.waitForFunction(()=>window.calls.some(c=>c.command==='db_data_dictionary'));
+ assert.equal(await page.evaluate(()=>window.calls.find(c=>c.command==='db_data_dictionary').args.ssSchema),"ops'.]中文",'structure index dictionary must retain selected schema');
+ await page.locator('input[data-col-name]').fill('renamed');
+ await page.getByRole('button',{name:'SQL 预览',exact:false}).click();
+ assert.ok((await page.locator('.ctw-body').innerText()).includes("EXEC [fixture_db].sys.sp_rename N'[ops''.]]中文].[same].[id]', N'renamed', N'COLUMN';"),'actual structure dialog preview must retain selected schema');
+ await page.getByRole('button',{name:'字段',exact:false}).first().click();
+ await page.locator('input[data-col-name]').fill('id');
+ await page.locator('.ctw-field-scroll input[placeholder=—]').first().fill('64');
+ await page.getByRole('button',{name:'SQL 预览',exact:false}).click();
+ assert.ok((await page.locator('.ctw-body').innerText()).includes('完整定义'),'lossy existing attribute edit must show an explicit reason');
+ assert.equal(await page.getByRole('button',{name:'保存修改',exact:true}).isDisabled(),true,'lossy edit must not submit SQL');
+ assert.deepEqual(errors,[]);assert.deepEqual(await page.evaluate(()=>window.unexpected),[]);
+ console.log('PASS actual AssetPanel creates distinct same-name schema tabs; actual grid SELECT/count/header, empty-result metadata, field/index/DDL properties and update/delete/draft-insert requests retain target. Synthetic IPC; Workspace rendering and native service execution are not exercised.');
+}finally{await browser?.close();await server.close();await rm(fixture,{recursive:true,force:true});}

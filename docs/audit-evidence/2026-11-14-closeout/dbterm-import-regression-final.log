@@ -1,0 +1,74 @@
+warning: use of deprecated method `futures_channel::mpsc::UnboundedReceiver::<T>::try_next`: please use `try_recv` instead
+   --> vendor/sqlx-postgres/src/listener.rs:335:56
+    |
+335 |         if let Ok(Some(notification)) = self.buffer_rx.try_next() {
+    |                                                        ^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: variant `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/mod.rs:78:5
+   |
+70 | pub enum FrontendMessageFormat {
+   |          --------------------- variant in this enum
+...
+78 |     Flush = b'H',
+   |     ^^^^^
+   |
+   = note: `FrontendMessageFormat` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/flush.rs:11:12
+   |
+11 | pub struct Flush;
+   |            ^^^^^
+
+warning: `sqlx-postgres` (lib) generated 3 warnings
+   Compiling app v0.1.23 (/Users/Nico/workSpace/claude/DBterm/src-tauri)
+warning: unused import: `open_workbook_auto`
+    --> src/commands/db_extra.rs:3135:32
+     |
+3135 |         use calamine::{Reader, open_workbook_auto};
+     |                                ^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `app` (lib test) generated 1 warning (run `cargo fix --lib -p app --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 27.29s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/app_lib-7e7498dbb7195ac5)
+
+running 30 tests
+test commands::db_extra::import_skip_tests::json_pg_import_keeps_exact_numeric_precision_and_literal_null_text ... ignored, requires disposable local DBTERM_TEST_PG_PORT
+test commands::db_extra::import_skip_tests::mysql_skip_retains_valid_rows_and_rejects_nontransactional_target ... ignored, requires disposable local DBTERM_TEST_MYSQL_PORT
+test commands::db_extra::import_skip_tests::pg_skip_handles_typed_columns_and_bad_rows_without_aborting_valid_records ... ignored, requires disposable local DBTERM_TEST_PG_PORT
+test commands::db_extra::import_file_limit_tests::bounded_reader_accepts_limit_and_rejects_the_first_byte_over_it ... ok
+test commands::import_excel::tests::headerless_width_mismatch_must_not_drop_data ... ok
+test commands::import_excel::tests::missing_or_duplicate_header_must_fail_before_writes ... ok
+test commands::import_excel::tests::spreadsheet_errors_must_not_be_inserted_as_text ... ok
+test commands::import_excel::fidelity_tests::reordered_header_maps_null_empty_unicode_and_integer_values_exactly ... ok
+test commands::import_json::tests::exact_numbers_and_explicit_json_null_are_preserved ... ok
+test commands::import_excel::tests::truncated_ole_directory_returns_error_instead_of_panicking ... ok
+test commands::import_json::tests::non_object_rows_and_duplicate_fields_fail_before_writes ... ok
+test commands::import_json::tests::strings_boolean_missing_and_structured_values_keep_their_types ... ok
+test commands::import_records::tests::mismatched_width_fails_before_any_row_is_returned ... ok
+test commands::import_records::tests::preview_and_import_agree_on_quoted_header_and_bom ... ok
+test commands::import_records::tests::quoted_newlines_delimiters_quotes_and_crlf_stay_in_one_value ... ok
+test commands::import_records::tests::tsv_empty_string_null_and_no_header_preserve_existing_null_marker_policy ... ok
+test commands::import_xml::tests::damaged_or_ambiguous_xml_never_returns_partial_records ... ok
+test commands::import_xml::tests::exported_empty_root_rows_whitespace_and_reordered_fields_are_readable ... ok
+test commands::import_xml::tests::xml_values_keep_entities_cdata_empty_text_and_explicit_null ... ok
+test commands::mongo::transfer::import_file_limit_tests::bounded_reader_accepts_limit_and_rejects_the_first_byte_over_it ... ok
+test commands::import_excel::fidelity_tests::actual_xlsx_first_sheet_header_and_error_cell_are_validated ... ok
+test commands::import_records::sqlite_fidelity_tests::decoded_records_keep_exact_multiline_unicode_empty_and_null_values_in_sqlite ... ok
+test commands::db_extra::import_transaction_tests::excel_mapped_records_preserve_values_through_sqlite_transaction ... ok
+test commands::db_extra::import_transaction_tests::xml_import_keeps_text_empty_and_null_values_in_sqlite ... ok
+test commands::db_extra::import_transaction_tests::stop_import_commits_exact_null_empty_and_multiline_values ... ok
+test commands::db_extra::import_transaction_tests::sqlite_stop_import_late_error_preserves_only_original_rows ... ok
+test commands::db_extra::import_transaction_tests::json_import_preserves_exact_values_through_sqlite_transaction ... ok
+test commands::db_extra::import_transaction_tests::sqlite_explicit_skip_still_keeps_valid_rows_and_reports_rejected_row ... ok
+test commands::db_extra::import_transaction_tests::sqlite_skip_fatal_trigger_aborts_import_and_preserves_original_rows ... ok
+test commands::import_records::tests::preview_rejects_oversized_record_with_bounded_read ... ok
+
+test result: ok. 27 passed; 0 failed; 3 ignored; 0 measured; 495 filtered out; finished in 0.02s
+

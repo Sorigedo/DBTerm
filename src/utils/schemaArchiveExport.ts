@@ -1,7 +1,8 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type { ConnType } from '../types'
-import { qid, tableRef } from './sqlDialect'
+import { qid } from './sqlDialect'
+import { terminateExportDdl } from './schemaExportSql'
 
 export interface ArchiveObjectLists {
   tables: string[]
@@ -45,11 +46,16 @@ export async function exportSchemaArchive(options: {
   content: 'structure' | 'data' | 'both'
   path: string
   taskId: string
+  ssSchema?: string
   keepWorkspace?: boolean
   workspace?: string
   onProgress?: (table: string, done: number, total: number, rows: number) => void
 }): Promise<SchemaArchiveResult & { workspace: string }> {
   const { connectionId, connType, schema, objects, content, path, taskId, onProgress } = options
+  if (content !== 'data' && ['mysql', 'mariadb', 'tidb', 'oceanBase'].includes(connType)
+      && ((objects.funcs?.length ?? 0) > 0 || (objects.procs?.length ?? 0) > 0)) {
+    throw new Error('例程归档暂不支持可靠重放创建时数据库排序规则，已停止导出；源定义未修改')
+  }
   // SQL Server 的通用表导出会缓冲整张结果集；大表必须走专用 Tiberius 流式 ZIP 后端。
   if (connType === 'sqlServer') {
     const result = await invoke<SchemaArchiveResult>('db_logical_backup', {
@@ -62,6 +68,7 @@ export async function exportSchemaArchive(options: {
       path,
       content,
       taskId,
+      ssSchema: options.ssSchema,
     })
     return { ...result, workspace: options.workspace ?? '' }
   }
@@ -73,35 +80,35 @@ export async function exportSchemaArchive(options: {
   try {
     for (let i = 0; i < objects.tables.length; i++) {
       const table = objects.tables[i]
+      const mysql = ['mysql', 'mariadb', 'tidb', 'oceanBase'].includes(connType)
       let ddl = ''
-      if (content !== 'data') {
+      if (content !== 'data' && !mysql) {
         ddl = await invoke<string>('get_table_ddl', { id: connectionId, schema, table })
       }
       let sourcePath: string | undefined
       let rows = 0
-      if (content !== 'structure') {
+      if (content !== 'structure' || mysql) {
         sourcePath = pathJoin(workspace, `table_${i}.sql`)
         const unlisten = await listen<{ rows: number }>(`export_progress_${taskId}`, event => {
           onProgress?.(table, i, objects.tables.length, event.payload.rows)
         })
         try {
-          rows = await invoke<number>('db_stream_export', {
+          rows = await invoke<number>('db_export_table', {
             id: connectionId,
-            sql: `SELECT * FROM ${tableRef(connType, schema, table)}`,
-            filePath: sourcePath,
+            schema,
+            table,
             format: 'sql',
-            encoding: 'utf8',
-            insertTable: table,
+            whereClause: null,
+            path: sourcePath,
+            structure: mysql ? (content === 'structure' ? 'only' : content === 'both' ? 'with' : null) : null,
             taskId,
-            database: null,
           })
         } finally {
           unlisten()
         }
         totalRows += rows
       }
-      const ddlSeparator = connType === 'sqlServer' ? '\nGO' : ''
-      const header = `${context}-- DBTerm Schema 导出\n-- Schema: ${schema || '(默认)'}\n-- Table: ${table}\n${ddl ? `${ddl.trimEnd()}${ddlSeparator}\n` : ''}`
+      const header = `${context}-- DBTerm Schema 导出\n-- Schema: ${schema || '(默认)'}\n-- Table: ${table}\n${terminateExportDdl(ddl, connType)}`
       entries.push({ name: `tables/${safeName(table)}.sql`, header, sourcePath })
       onProgress?.(table, i + 1, objects.tables.length, rows)
     }
@@ -113,6 +120,12 @@ export async function exportSchemaArchive(options: {
         ['procedures', objects.procs ?? [], 'procedure'],
       ] as const) {
         for (const name of names) {
+          const mysql = ['mysql', 'mariadb', 'tidb', 'oceanBase'].includes(connType)
+          if (mysql) {
+            const ddl = await invoke<string>('get_mysql_archive_object_sql', { id: connectionId, schema, name, kind })
+            entries.push({ name: `${dir}/${safeName(name)}.sql`, header: `${context}${ddl}` })
+            continue
+          }
           const ddl = kind === 'view'
             ? await invoke<string>('get_table_ddl', { id: connectionId, schema, table: name })
             : await invoke<string>('get_routine_ddl', { id: connectionId, schema, name, kind })

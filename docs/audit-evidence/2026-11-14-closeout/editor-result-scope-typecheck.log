@@ -1,0 +1,4 @@
+
+> dbterm@0.1.23 typecheck
+> tsc --noEmit
+

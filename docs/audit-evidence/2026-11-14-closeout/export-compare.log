@@ -1,0 +1,149 @@
+warning: use of deprecated method `futures_channel::mpsc::UnboundedReceiver::<T>::try_next`: please use `try_recv` instead
+   --> vendor/sqlx-postgres/src/listener.rs:335:56
+    |
+335 |         if let Ok(Some(notification)) = self.buffer_rx.try_next() {
+    |                                                        ^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: variant `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/mod.rs:78:5
+   |
+70 | pub enum FrontendMessageFormat {
+   |          --------------------- variant in this enum
+...
+78 |     Flush = b'H',
+   |     ^^^^^
+   |
+   = note: `FrontendMessageFormat` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/flush.rs:11:12
+   |
+11 | pub struct Flush;
+   |            ^^^^^
+
+warning: `sqlx-postgres` (lib) generated 3 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/app_lib-bccc94f7de71602a)
+
+running 4 tests
+test commands::db_export::archive_tests::mysql_sql_export_preserves_enum_and_set_internal_members ... ok
+test commands::db_export::archive_tests::mysql_sql_export_round_trips_typed_values ... ok
+test commands::db_export::archive_tests::mysql_tabular_exports_never_silently_turn_decode_errors_into_null ... ok
+test commands::db_export::archive_tests::mysql_xlsx_large_ids_and_decimals_are_text_with_exact_digits ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 449 filtered out; finished in 0.02s
+
+warning: use of deprecated method `futures_channel::mpsc::UnboundedReceiver::<T>::try_next`: please use `try_recv` instead
+   --> vendor/sqlx-postgres/src/listener.rs:335:56
+    |
+335 |         if let Ok(Some(notification)) = self.buffer_rx.try_next() {
+    |                                                        ^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: variant `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/mod.rs:78:5
+   |
+70 | pub enum FrontendMessageFormat {
+   |          --------------------- variant in this enum
+...
+78 |     Flush = b'H',
+   |     ^^^^^
+   |
+   = note: `FrontendMessageFormat` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/flush.rs:11:12
+   |
+11 | pub struct Flush;
+   |            ^^^^^
+
+warning: `sqlx-postgres` (lib) generated 3 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.25s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/app_lib-bccc94f7de71602a)
+
+running 7 tests
+test commands::db_diff::tests::mysql_comparison_decodes_numbers_dates_and_nulls_without_loss ... ok
+test commands::db_diff::tests::real_mysql_comparison_distinguishes_adjacent_floats ... ok
+test commands::db_diff::tests::real_mysql_comparison_distinguishes_empty_set_and_enum_members ... ok
+test commands::db_diff::tests::real_mysql_comparison_preserves_unicode_despite_connection_encoding ... ok
+test commands::db_diff::tests::real_mysql_comparison_snapshots_pagination_and_exact_values ... ok
+test commands::db_diff::tests::real_mysql_full_merge_counts_composite_keys_and_capped_samples ... ok
+test commands::db_diff::tests::real_mysql_keyset_keeps_adjacent_i64_u64_limits_across_pages ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 446 filtered out; finished in 0.24s
+
+warning: use of deprecated method `futures_channel::mpsc::UnboundedReceiver::<T>::try_next`: please use `try_recv` instead
+   --> vendor/sqlx-postgres/src/listener.rs:335:56
+    |
+335 |         if let Ok(Some(notification)) = self.buffer_rx.try_next() {
+    |                                                        ^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: variant `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/mod.rs:78:5
+   |
+70 | pub enum FrontendMessageFormat {
+   |          --------------------- variant in this enum
+...
+78 |     Flush = b'H',
+   |     ^^^^^
+   |
+   = note: `FrontendMessageFormat` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/flush.rs:11:12
+   |
+11 | pub struct Flush;
+   |            ^^^^^
+
+warning: `sqlx-postgres` (lib) generated 3 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/app_lib-bccc94f7de71602a)
+
+running 1 test
+test commands::db_extra::schema_compare_safety_tests::mysql_backspace_default_requires_same_escape_mode_for_raw_alter ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 452 filtered out; finished in 0.01s
+
+warning: use of deprecated method `futures_channel::mpsc::UnboundedReceiver::<T>::try_next`: please use `try_recv` instead
+   --> vendor/sqlx-postgres/src/listener.rs:335:56
+    |
+335 |         if let Ok(Some(notification)) = self.buffer_rx.try_next() {
+    |                                                        ^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: variant `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/mod.rs:78:5
+   |
+70 | pub enum FrontendMessageFormat {
+   |          --------------------- variant in this enum
+...
+78 |     Flush = b'H',
+   |     ^^^^^
+   |
+   = note: `FrontendMessageFormat` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/flush.rs:11:12
+   |
+11 | pub struct Flush;
+   |            ^^^^^
+
+warning: `sqlx-postgres` (lib) generated 3 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/app_lib-bccc94f7de71602a)
+
+running 1 test
+test commands::db_extra::schema_compare_safety_tests::mysql_full_definition_capture_includes_hidden_generated_and_rejects_triggers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 452 filtered out; finished in 0.01s
+

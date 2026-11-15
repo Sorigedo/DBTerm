@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/Users/Nico/workSpace/claude/DBterm/scripts/acceptance/sqlserver-backup-phases.py", line 4, in <module>
+    assert 'dispatch_ss_archive_ddl' in s,'archive currently embeds FK/index statements inside per-table DDL before other tables/data exist'
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: archive currently embeds FK/index statements inside per-table DDL before other tables/data exist

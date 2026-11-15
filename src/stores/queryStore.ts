@@ -1,5 +1,6 @@
 import { create } from 'zustand'
-import { persist } from 'zustand/middleware'
+import { persist, type StateStorage } from 'zustand/middleware'
+import { createDebouncedJSONStorage } from './queryStorePersistence.ts'
 
 const MAX_PERSISTED_SQL_CHARS = 300_000
 const MAX_TOTAL_PERSISTED_SQL_CHARS = 1_500_000
@@ -11,15 +12,37 @@ interface QueryStoreState {
 }
 
 function trimDrafts(sqls: Record<string, string>): Record<string, string> {
-  const entries = Object.entries(sqls).filter(([, sql]) => sql.length <= MAX_PERSISTED_SQL_CHARS)
+  const entries = Object.entries(sqls).filter(([, sql]) => typeof sql === 'string' && sql.length <= MAX_PERSISTED_SQL_CHARS)
   let total = 0
-  const kept: Record<string, string> = {}
+  const kept: Array<[string, string]> = []
   for (let i = entries.length - 1; i >= 0; i--) {
     const [tabId, sql] = entries[i]
+    if (total + sql.length > MAX_TOTAL_PERSISTED_SQL_CHARS) continue
     total += sql.length
-    if (total <= MAX_TOTAL_PERSISTED_SQL_CHARS) kept[tabId] = sql
+    kept.push([tabId, sql])
   }
-  return kept
+  return Object.fromEntries(kept.reverse())
+}
+
+const browserStorage: StateStorage = {
+  getItem: (name) => {
+    if (typeof window === 'undefined') return null
+    try { return window.localStorage.getItem(name) } catch { return null }
+  },
+  setItem: (name, value) => {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem(name, value)
+  },
+  removeItem: (name) => {
+    if (typeof window === 'undefined') return
+    try { window.localStorage.removeItem(name) } catch { /* ignore unavailable storage */ }
+  },
+}
+
+const queryStorage = createDebouncedJSONStorage<{ sqls: Record<string, string> }>(browserStorage)
+
+export function flushQueryStorePersistence(): void {
+  queryStorage.flush()
 }
 
 export const useQueryStore = create<QueryStoreState>()(
@@ -27,7 +50,12 @@ export const useQueryStore = create<QueryStoreState>()(
     (set) => ({
       sqls: {},
       setSql: (tabId, sql) =>
-        set((s) => ({ sqls: trimDrafts({ ...s.sqls, [tabId]: sql }) })),
+        set((s) => {
+          if (s.sqls[tabId] === sql) return s
+          const next = { ...s.sqls }
+          delete next[tabId]
+          return { sqls: { ...next, [tabId]: sql } }
+        }),
       removeSql: (tabId) =>
         set((s) => {
           const next = { ...s.sqls }
@@ -37,6 +65,7 @@ export const useQueryStore = create<QueryStoreState>()(
     }),
     {
       name: 'dbterm-query-sqls',
+      storage: queryStorage,
       // v1：清理旧逻辑自动注入的「纯 USE xxx;」草稿（现已不再注入 USE）
       version: 1,
       migrate: (persisted, version) => {
@@ -52,6 +81,10 @@ export const useQueryStore = create<QueryStoreState>()(
         return s as QueryStoreState
       },
       partialize: (s) => ({ sqls: trimDrafts(s.sqls) }),
+      merge: (persisted, current) => ({
+        ...current,
+        sqls: trimDrafts((persisted as Partial<QueryStoreState> | undefined)?.sqls ?? {}),
+      }),
     }
   )
 )

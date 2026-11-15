@@ -542,7 +542,7 @@ export default function SchemaBrowser({ connectionId, connType, schema, category
     setDialogLoading(true); setDialogError('')
     try {
       const { invoke } = await import('@tauri-apps/api/core')
-      await invoke('db_copy_table', { id: connectionId, schema, table: copyTarget, newName: copyInput.trim(), withData: copyWithData })
+      await invoke('db_copy_table', { id: connectionId, schema, srcTable: copyTarget, dstTable: copyInput.trim(), copyData: copyWithData })
       load()
       notifySchemaChanged(connectionId, schema)
       setCopyTarget(null); setCopyInput(''); setCopyWithData(false)
@@ -1083,7 +1083,7 @@ export default function SchemaBrowser({ connectionId, connType, schema, category
                 <div className="sb-ctx-menu" ref={(el) => clampIntoViewport(el)}
                   style={{ position: 'fixed', top: toolsDropPos.top, left: toolsDropPos.left, zIndex: 8500, maxHeight: '70vh', overflowY: 'auto' }}
                   onMouseLeave={() => setToolsDropOpen(false)}>
-                  {/* 迁移：MySQL/PG 族 + SQLite/DuckDB 互迁；Oracle/SQLServer/ClickHouse 同引擎迁移（单一真源见 sqlDialect.MIGRATABLE_DB_TYPES）*/}
+                  {/* 迁移入口仅开放已支持完整源表定义复制与校验的 MySQL 系。 */}
                   {(MIGRATABLE_DB_TYPES as string[]).includes(connType) && (
                     <button className="sb-ctx-item" onClick={() => { setToolsDropOpen(false); setMigrationOpen(true) }}>
                       <ArrowRightLeft size={12} /> 数据迁移向导
@@ -1395,8 +1395,8 @@ export default function SchemaBrowser({ connectionId, connType, schema, category
               {sc('dbObjStructure') && <span className="ctx-item__shortcut">{sc('dbObjStructure')}</span>}
             </button>
           )}
-          {/* 复制表：后端 db_copy_table 仅支持 MySQL 族 / PG 族 → 仅这两族显示 */}
-          {!isView && ['mysql', 'mariadb', 'tidb', 'oceanBase', 'postgres', 'kingBase', 'openGauss'].includes(connType) && (
+          {/* 复制表仅在后端能保留并校验完整 SHOW CREATE TABLE 定义时开放。 */}
+          {!isView && ['mysql', 'mariadb', 'tidb', 'oceanBase'].includes(connType) && (
             <button onMouseEnter={() => setSbSub(null)} onClick={() => {
               setCopyTarget(name); setCopyInput(name + '_copy'); setCopyWithData(false); setDialogError(''); closeMenu()
             }}>

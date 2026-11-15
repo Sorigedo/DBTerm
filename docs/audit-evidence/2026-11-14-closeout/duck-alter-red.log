@@ -1,0 +1,136 @@
+✖ DuckDB ALTER sends original statements through one dedicated transaction (1.151458ms)
+✖ DuckDB later ALTER failure rolls back and never commits or replays (0.259125ms)
+✖ DuckDB failed BEGIN never rolls back a preexisting user transaction (0.1595ms)
+✖ DuckDB lost COMMIT acknowledgement is unknown and never rolled back or replayed (0.077917ms)
+✖ DuckDB failed rollback reports both errors and unknown state (0.077ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 0
+ℹ fail 5
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 79.195333
+
+✖ failing tests:
+
+test at src/components/DbTools/duckAlterExecution.test.ts:7:1
+✖ DuckDB ALTER sends original statements through one dedicated transaction (1.151458ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    [
+      [
+  +     'execute_query',
+  -     'db_begin_tx',
+        {
+          id: 'fixture',
+  -     }
+  -   ],
+  -   [
+  -     'db_exec_in_tx',
+  -     {
+  -       id: 'fixture',
+          sql: 'ALTER TABLE "main"."t" RENAME COLUMN "v" TO "name";'
+        }
+      ],
+      [
+  +     'execute_query',
+  -     'db_exec_in_tx',
+        {
+          id: 'fixture',
+          sql: 'ALTER TABLE "main"."t" ALTER COLUMN "name" SET NOT NULL;'
+        }
+      ],
+  -   [
+  -     'db_commit_tx',
+  -     {
+  -       id: 'fixture'
+  -     }
+  -   ]
+    ]
+  
+      at TestContext.<anonymous> (file:///Users/Nico/workSpace/claude/DBterm/src/components/DbTools/duckAlterExecution.test.ts:10:10)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:387:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ [ 'execute_query', [Object] ], [ 'execute_query', [Object] ] ],
+    expected: [ [ 'db_begin_tx', [Object] ], [ 'db_exec_in_tx', [Object] ], [ 'db_exec_in_tx', [Object] ], [ 'db_commit_tx', [Object] ] ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at src/components/DbTools/duckAlterExecution.test.ts:17:1
+✖ DuckDB later ALTER failure rolls back and never commits or replays (0.259125ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    [
+  +   'execute_query',
+  +   'execute_query'
+  -   'db_begin_tx',
+  -   'db_exec_in_tx',
+  -   'db_exec_in_tx',
+  -   'db_rollback_tx'
+    ]
+  
+      at TestContext.<anonymous> (file:///Users/Nico/workSpace/claude/DBterm/src/components/DbTools/duckAlterExecution.test.ts:23:10)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ 'execute_query', 'execute_query' ],
+    expected: [ 'db_begin_tx', 'db_exec_in_tx', 'db_exec_in_tx', 'db_rollback_tx' ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at src/components/DbTools/duckAlterExecution.test.ts:26:1
+✖ DuckDB failed BEGIN never rolls back a preexisting user transaction (0.1595ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    [
+  +   'execute_query'
+  -   'db_begin_tx'
+    ]
+  
+      at TestContext.<anonymous> (file:///Users/Nico/workSpace/claude/DBterm/src/components/DbTools/duckAlterExecution.test.ts:29:10)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ 'execute_query' ],
+    expected: [ 'db_begin_tx' ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at src/components/DbTools/duckAlterExecution.test.ts:32:1
+✖ DuckDB lost COMMIT acknowledgement is unknown and never rolled back or replayed (0.077917ms)
+  AssertionError [ERR_ASSERTION]: Missing expected rejection.
+      at async TestContext.<anonymous> (file:///Users/Nico/workSpace/claude/DBterm/src/components/DbTools/duckAlterExecution.test.ts:34:3)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /结果不确定/,
+    operator: 'rejects',
+    diff: 'simple'
+  }
+
+test at src/components/DbTools/duckAlterExecution.test.ts:38:1
+✖ DuckDB failed rollback reports both errors and unknown state (0.077ms)
+  AssertionError [ERR_ASSERTION]: Missing expected rejection.
+      at async TestContext.<anonymous> (file:///Users/Nico/workSpace/claude/DBterm/src/components/DbTools/duckAlterExecution.test.ts:39:3)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /alter rejected.*rollback receipt lost.*结果不确定/,
+    operator: 'rejects',
+    diff: 'simple'
+  }

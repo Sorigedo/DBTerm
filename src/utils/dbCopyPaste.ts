@@ -6,6 +6,7 @@ import { toast } from '../stores/toastStore'
 import { notifySchemaChanged } from './schemaRefresh'
 import { useDbClipboard, type DbObjRef, type DbObjType } from '../stores/dbClipboardStore'
 import { qid, isMysqlFamily } from './sqlDialect'
+import { relocateMysqlObjectDdl } from './mysqlObjectDdl'
 import type { ConnType } from '../types'
 
 export const OBJ_LABEL: Record<DbObjType, string> = {
@@ -112,8 +113,7 @@ async function fetchObjectNames(connId: string, schema: string, objType: DbObjTy
 }
 
 /**
- * 跨 schema / 跨连接 迁移视图/函数/存储过程：取源 SHOW CREATE 定义 → 去 DEFINER、
- * 重定向到目标 schema.name → 在目标连接重建（execute_query 对例程会走文本协议）。
+ * 跨 schema / 跨连接迁移对象：仅重定向 SHOW CREATE 定义的声明名，其余内容原样保留。
  * 注意：视图/例程体内对源库表的引用不会改写，跨连接时被引用对象需自行保证存在。
  * 仅支持 MySQL 系源/目标：SHOW CREATE 与 backtick 重写均为 MySQL 专属，非 MySQL 直接早返回报错。
  */
@@ -137,17 +137,7 @@ export async function recreateObject(
   const ddl = (kind === 'VIEW' ? row?.[1] : row?.[2]) ?? ''
   if (!ddl) throw new Error(`无法获取${OBJ_LABEL[src.objType]}定义`)
 
-  let body = ddl
-    .replace(/\sDEFINER\s*=\s*`[^`]*`@`[^`]*`/i, '')
-    .replace(/\sDEFINER\s*=\s*\S+@\S+/i, '')
-  if (kind === 'VIEW') {
-    body = body.replace(/\bVIEW\s+(`[^`]+`\.)?`[^`]+`/i, `VIEW ${dstRef}`)
-  } else {
-    body = body.replace(new RegExp(`\\b${kind}\\s+(\`[^\`]+\`\\.)?\`[^\`]+\``, 'i'), `${kind} ${dstRef}`)
-  }
-
-  // 目标名已确保唯一，DROP IF EXISTS 不会误删已有对象，仅作幂等保护
-  await invoke('execute_query', { id: dst.connectionId, sql: `DROP ${kind} IF EXISTS ${dstRef};` })
+  const body = relocateMysqlObjectDdl(ddl, kind, src.schema, src.name, dstRef)
   await invoke('execute_query', { id: dst.connectionId, sql: body })
 }
 
@@ -169,6 +159,10 @@ export async function pasteDbObject(
 
   // ── 表 ──
   if (clip.objType === 'table') {
+    if (!isMysqlFamily(clip.connType) || !isMysqlFamily(target.connType)) {
+      toast.error('此数据库组合尚不能保证完整定义复制，已拒绝粘贴')
+      return
+    }
     if (sameSchema) {
       // 同库同 schema：逐个复制结构+数据并自动改名（_copy/_copyN）
       for (const name of tableNames) {

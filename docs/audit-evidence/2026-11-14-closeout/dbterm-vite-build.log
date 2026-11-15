@@ -1,0 +1,272 @@
+
+> dbterm@0.1.23 build
+> tsc && vite build
+
+vite v7.3.8 building client environment for production...
+transforming...
+✓ 4289 modules transformed.
+rendering chunks...
+[plugin vite:reporter] 
+(!) /Users/Nico/workSpace/claude/DBterm/node_modules/@tauri-apps/api/core.js is dynamically imported by /Users/Nico/workSpace/claude/DBterm/src/App.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/ConnectionItem.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/ConnectionItem.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/ConnectionItem.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/DbSchemaTree.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/DbSchemaTree.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/DbSchemaTree.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/DbSchemaTree.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/DbSchemaTree.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/DbSchemaTree.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/DbSchemaTree.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/DbSchemaTree.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/DbSchemaTree.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/DbSchemaTree.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/DbSchemaTree.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/DbSchemaTree.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/DbSchemaTree.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/DbSchemaTree.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/DbSchemaTree.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/DbSchemaTree.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/DbSchemaTree.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/ConnectionForm/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/ConnectionForm/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/ConnectionForm/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/ConnectionForm/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/ConnectionForm/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/AlterTableWizard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/AlterTableWizard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/AlterTableWizard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/AlterTableWizard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/AlterTableWizard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/AlterTableWizard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/AlterTableWizard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/BackupPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/BackupPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/BackupPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/BackupPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/BinlogFlashbackPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/BinlogFlashbackPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/BinlogFlashbackPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/ChLineagePanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/ClickHousePanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/ConfigComparePanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/CreateDatabaseDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/CreateDatabaseDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/CreateTableWizard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/CreateTableWizard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/CreateTableWizard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/CreateTableWizard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DataDiffPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DataDiffPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DataDiffPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DataDiffPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DataDiffPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DataDiffPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DatabaseManagerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DatabaseManagerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DatabaseManagerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DuckDbDiffPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DuckLakePanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DuckMaskExportPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DuckMaskExportPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/ExportTaskCenter.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/ImportDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/ImportDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/ImportDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/ImportDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/InstanceExportPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/InstanceExportPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/InstanceExportPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/InstanceExportPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/InstanceExportPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/InstanceImportPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/KbAuditPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/KbMonitorPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/LockHistoryPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/LockHistoryPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/MaxScalePanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/MgrPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/MgrPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/MigrationWizard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/MigrationWizard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/MigrationWizard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/MigrationWizard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/MigrationWizard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OceanBasePanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OgDbePerfPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OgIndexAdvisePanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OgSecurityPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OnlineDdlPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OptimizerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OptimizerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OptimizerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OptimizerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OracleUsersPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OracleUsersPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OracleUsersPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OracleUsersPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OracleUsersPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OracleUsersPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OracleUsersPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OracleUsersPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/PerfSchemaPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/PgAdvancedPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/PgBouncerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/PgFdwPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/PgMaintenancePanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/PgPartitionPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/PgPartmanPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/PgReplicationPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/PgRolesPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/PgVectorPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/PgVectorPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/ReplicationPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/ReplicationPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/StructureDiffPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/StructureDiffPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/StructureDiffPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/StructureDiffPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/StructureDiffPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TableBrowser.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TableBrowser.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TableBrowser.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TableBrowser.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TableBrowser.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TableBrowser.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TableBrowser.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TableBrowser.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TableBrowser.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TableBrowser.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TableBrowser.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TableBrowser.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TableBrowser.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TableInfoModal.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TidbPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TidbPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TimeravelPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TxMonitorPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TxMonitorPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/UsersPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/UsersPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/UsersPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/UsersPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/UsersPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/UsersPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/UsersPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/UsersPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/VariablesPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/ExportTaskDock.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoBackupPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoBackupPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoBalancerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoBalancerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoCopyPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoGridFsPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoGridFsPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoGridFsPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoGridFsPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoMaskExportPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoRecoveryPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoRiskPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoSmartShellPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoSmartShellPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoSmartShellPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoStreamPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoStreamPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/QuitGuard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SchemaBrowser/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SchemaBrowser/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SchemaBrowser/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SchemaBrowser/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SchemaBrowser/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SchemaBrowser/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SchemaBrowser/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SchemaBrowser/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SchemaBrowser/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SchemaBrowser/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SchemaBrowser/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SchemaBrowser/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SchemaBrowser/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Settings/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/DdlModal.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/ExportDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/ExportDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/ExportDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/ExportDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/ExportDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/ObjectEditor.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/ObjectEditor.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/ObjectEditor.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/ObjectEditor.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/ObjectEditor.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/ObjectEditor.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/ObjectEditor.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/ObjectEditor.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/ResultTable.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/ResultTable.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/TablePeekModal.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/TablePeekModal.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/CommandHistoryPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/FileManagerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/FileManagerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/FileManagerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/FileManagerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/FileManagerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/FileManagerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/FileManagerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/FileManagerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/FileManagerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/FileManagerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/FileManagerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/FileManagerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/FileManagerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/FileManagerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/PerfPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/PerfPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/QuickConnectDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Tools/tools/DocumentTools.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Tools/tools/DocumentTools.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Tools/tools/DocumentTools.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Tools/tools/DocumentTools.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Tools/tools/DocumentTools.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Tools/tools/DocumentTools.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Tools/tools/DocumentTools.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Workspace/TabBar.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Workspace/TabBar.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Workspace/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Workspace/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/shared/ExportDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/stores/appStore.ts, /Users/Nico/workSpace/claude/DBterm/src/stores/dbCapsStore.ts, /Users/Nico/workSpace/claude/DBterm/src/utils/dbCopyPaste.ts, /Users/Nico/workSpace/claude/DBterm/src/utils/dbCopyPaste.ts, /Users/Nico/workSpace/claude/DBterm/src/utils/dbCopyPaste.ts, /Users/Nico/workSpace/claude/DBterm/src/utils/objectEditor.ts but also statically imported by /Users/Nico/workSpace/claude/DBterm/node_modules/@tauri-apps/api/dpi.js, /Users/Nico/workSpace/claude/DBterm/node_modules/@tauri-apps/api/event.js, /Users/Nico/workSpace/claude/DBterm/node_modules/@tauri-apps/api/image.js, /Users/Nico/workSpace/claude/DBterm/node_modules/@tauri-apps/api/path.js, /Users/Nico/workSpace/claude/DBterm/node_modules/@tauri-apps/api/webview.js, /Users/Nico/workSpace/claude/DBterm/node_modules/@tauri-apps/api/webviewWindow.js, /Users/Nico/workSpace/claude/DBterm/node_modules/@tauri-apps/api/window.js, /Users/Nico/workSpace/claude/DBterm/node_modules/@tauri-apps/plugin-clipboard-manager/dist-js/index.js, /Users/Nico/workSpace/claude/DBterm/node_modules/@tauri-apps/plugin-dialog/dist-js/index.js, /Users/Nico/workSpace/claude/DBterm/src/components/AssetPanel/KnownHostsManager.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/ConnectionForm/DriverManager.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/BackupRestorePanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DashboardPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DataDictPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DbaPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DuckBackupPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DuckDbAdminPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DuckFileQueryDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DuckMaskExportPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DuckProfilePanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/ErDiagramPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/FullTextSearchPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/GaleraPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/MssqlToolsPanels.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OptimizerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/OraclePanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/PgMaintenancePanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/RedisToolsPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/ReplicationPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/SchedulerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/SqliteAdminPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/TimeravelPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoAlertPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoInspectPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoSchemaPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoTxPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoUsersPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/RedisBrowser/CliPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/RedisBrowser/DbaPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/RedisBrowser/HashEditor.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/RedisBrowser/InfoDashboard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/RedisBrowser/ListEditor.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/RedisBrowser/NewKeyDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/RedisBrowser/PubSubPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/RedisBrowser/SetEditor.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/RedisBrowser/StreamViewer.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/RedisBrowser/ToolsPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/RedisBrowser/ValueEditor.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/RedisBrowser/ZSetEditor.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/RedisBrowser/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Settings/ConnExportImportDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Settings/SshConfigImportDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Settings/SshKeysTab.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/DbBrowser.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/FileManagerWindow.tsx, /Users/Nico/workSpace/claude/DBterm/src/utils/exportTasks.ts, /Users/Nico/workSpace/claude/DBterm/src/utils/schemaArchiveExport.ts, dynamic import will not move module into another chunk.
+
+[plugin vite:reporter] 
+(!) /Users/Nico/workSpace/claude/DBterm/node_modules/@tauri-apps/api/event.js is dynamically imported by /Users/Nico/workSpace/claude/DBterm/src/components/ConnectionForm/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/BackupPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/DataDiffPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/ImportDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/InstanceExportPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/InstanceImportPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/DbTools/MigrationWizard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/MongoBrowser/MongoStreamPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/QuitGuard.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SchemaBrowser/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SqlEditor/ExportDialog.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/FileManagerPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/FileManagerWindow.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Terminal/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/Tools/tools/DocumentTools.tsx, /Users/Nico/workSpace/claude/DBterm/src/utils/multiWindow.ts, /Users/Nico/workSpace/claude/DBterm/src/utils/multiWindow.ts, /Users/Nico/workSpace/claude/DBterm/src/utils/multiWindow.ts, /Users/Nico/workSpace/claude/DBterm/src/utils/multiWindow.ts but also statically imported by /Users/Nico/workSpace/claude/DBterm/node_modules/@tauri-apps/api/webview.js, /Users/Nico/workSpace/claude/DBterm/node_modules/@tauri-apps/api/webviewWindow.js, /Users/Nico/workSpace/claude/DBterm/node_modules/@tauri-apps/api/window.js, /Users/Nico/workSpace/claude/DBterm/src/components/ConnectionForm/DriverManager.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/RedisBrowser/PubSubPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/RedisBrowser/ToolsPanel.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/RedisBrowser/index.tsx, /Users/Nico/workSpace/claude/DBterm/src/utils/exportTasks.ts, /Users/Nico/workSpace/claude/DBterm/src/utils/schemaArchiveExport.ts, dynamic import will not move module into another chunk.
+
+[plugin vite:reporter] 
+(!) /Users/Nico/workSpace/claude/DBterm/node_modules/@tauri-apps/api/window.js is dynamically imported by /Users/Nico/workSpace/claude/DBterm/src/App.tsx, /Users/Nico/workSpace/claude/DBterm/src/App.tsx, /Users/Nico/workSpace/claude/DBterm/src/components/QuitGuard.tsx, /Users/Nico/workSpace/claude/DBterm/src/stores/settingsStore.ts, /Users/Nico/workSpace/claude/DBterm/src/utils/multiWindow.ts, /Users/Nico/workSpace/claude/DBterm/src/utils/windowRegistry.ts, /Users/Nico/workSpace/claude/DBterm/src/utils/windowRegistry.ts but also statically imported by /Users/Nico/workSpace/claude/DBterm/node_modules/@tauri-apps/api/webview.js, /Users/Nico/workSpace/claude/DBterm/node_modules/@tauri-apps/api/webviewWindow.js, /Users/Nico/workSpace/claude/DBterm/src/components/SshPanels/FileManagerWindow.tsx, dynamic import will not move module into another chunk.
+
+computing gzip size...
+dist/index.html                                                       0.39 kB │ gzip:   0.27 kB
+dist/assets/jetbrains-mono-greek-400-normal-C190GLew.woff2            4.23 kB
+dist/assets/geist-mono-symbols2-400-normal-B5fXMCGq.woff              4.74 kB
+dist/assets/geist-mono-vietnamese-400-normal-CyOwoevh.woff            5.15 kB
+dist/assets/jetbrains-mono-cyrillic-400-normal-BEIGL1Tu.woff2         5.33 kB
+dist/assets/fira-code-greek-ext-400-normal-DR7mBgIM.woff2             5.36 kB
+dist/assets/jetbrains-mono-vietnamese-400-normal-CqNFfHCs.woff        5.37 kB
+dist/assets/fira-code-symbols2-400-normal-_QEZCEwe.woff               5.37 kB
+dist/assets/geist-mono-cyrillic-400-normal-DoshcOXv.woff2             5.55 kB
+dist/assets/ibm-plex-mono-vietnamese-400-normal-DDuiU_S-.woff         5.62 kB
+dist/assets/jetbrains-mono-greek-400-normal-B9oWc5Lo.woff             5.66 kB
+dist/assets/ibm-plex-mono-cyrillic-ext-400-normal-DMdlQ8Kv.woff       5.82 kB
+dist/assets/ibm-plex-mono-vietnamese-400-normal-BulugwFq.woff2        5.87 kB
+dist/assets/fira-code-cyrillic-400-normal-UC0NFL4U.woff2              6.68 kB
+dist/assets/ibm-plex-mono-cyrillic-ext-400-normal-xuaO2J-f.woff2      6.91 kB
+dist/assets/jetbrains-mono-cyrillic-400-normal-ugxPyKxw.woff          6.98 kB
+dist/assets/geist-mono-cyrillic-400-normal-CeA7eGSt.woff              6.98 kB
+dist/assets/geist-mono-latin-ext-400-normal-C1xxG8eb.woff2            7.03 kB
+dist/assets/ibm-plex-mono-cyrillic-400-normal-CEL4l2ZJ.woff           7.20 kB
+dist/assets/fira-code-greek-ext-400-normal-DSPUheWg.woff              7.23 kB
+dist/assets/jetbrains-mono-latin-ext-400-normal-Bc8Ftmh3.woff2        7.34 kB
+dist/assets/fira-code-greek-400-normal-B2Gh_Y8s.woff2                 7.83 kB
+dist/assets/fira-code-latin-ext-400-normal-KSMg0QLl.woff2             7.86 kB
+dist/assets/ibm-plex-mono-cyrillic-400-normal-BSMlKf0J.woff2          8.36 kB
+dist/assets/fira-code-cyrillic-400-normal-dc1q3VD7.woff               8.46 kB
+dist/assets/geist-mono-latin-ext-400-normal-a1APXIwD.woff             9.38 kB
+dist/assets/fira-code-greek-400-normal-DobhaxvF.woff                  9.99 kB
+dist/assets/jetbrains-mono-latin-ext-400-normal-fXTG6kC5.woff        10.13 kB
+dist/assets/fira-code-latin-ext-400-normal-DG73JjOf.woff             10.61 kB
+dist/assets/ibm-plex-mono-latin-ext-400-normal-D3D2R8hC.woff         11.77 kB
+dist/assets/fira-code-cyrillic-ext-400-normal-txZ9Fk_1.woff2         11.96 kB
+dist/assets/geist-mono-latin-400-normal-DKaoCDn5.woff2               12.79 kB
+dist/assets/ibm-plex-mono-latin-400-normal-CvHOgSBP.woff             13.14 kB
+dist/assets/ibm-plex-mono-latin-ext-400-normal-BmRBH3aV.woff2        13.35 kB
+dist/assets/ibm-plex-mono-latin-400-normal-DMJ8VG8y.woff2            14.71 kB
+dist/assets/fira-code-cyrillic-ext-400-normal-Buh61xzB.woff          15.10 kB
+dist/assets/geist-mono-latin-400-normal-BXAprPdR.woff                16.90 kB
+dist/assets/jetbrains-mono-latin-400-normal-V6pRDFza.woff2           21.17 kB
+dist/assets/fira-code-latin-400-normal-DGosTW8U.woff2                23.31 kB
+dist/assets/jetbrains-mono-latin-400-normal-6-qcROiO.woff            27.50 kB
+dist/assets/fira-code-latin-400-normal-C-QZfXAs.woff                 29.84 kB
+dist/assets/index-Mpvu2eSs.css                                        2.27 kB │ gzip:   0.63 kB
+dist/assets/index-GVL3fBIr.css                                        7.11 kB │ gzip:   2.51 kB
+dist/assets/index-2nlfwYAn.css                                        7.46 kB │ gzip:   4.31 kB
+dist/assets/index-BwEqUg7L.css                                       11.68 kB │ gzip:   7.53 kB
+dist/assets/ErDiagramPanel-CdHOcTf-.css                              18.60 kB │ gzip:   3.06 kB
+dist/assets/index-ByKhXWju.css                                       20.76 kB │ gzip:  14.36 kB
+dist/assets/index-BGMijY7Z.css                                      338.09 kB │ gzip:  56.60 kB
+dist/assets/play-DGuQsrhZ.js                                          0.19 kB │ gzip:   0.18 kB
+dist/assets/channel-BVJI_Ffk.js                                       0.20 kB │ gzip:   0.17 kB
+dist/assets/square-CHQk-aEf.js                                        0.22 kB │ gzip:   0.18 kB
+dist/assets/filter-BWnbLfyS.js                                        0.22 kB │ gzip:   0.19 kB
+dist/assets/bookmark-B7hf5-7d.js                                      0.23 kB │ gzip:   0.19 kB
+dist/assets/clock-CYwU3sxZ.js                                         0.26 kB │ gzip:   0.20 kB
+dist/assets/init-ZxktEp_H.js                                          0.26 kB │ gzip:   0.16 kB
+dist/assets/eye-pAZOHvyn.js                                           0.27 kB │ gzip:   0.21 kB
+dist/assets/bell-C7P2YHjC.js                                          0.28 kB │ gzip:   0.22 kB
+dist/assets/undo-2-gY2QI_TN.js                                        0.28 kB │ gzip:   0.21 kB
+dist/assets/circle-check-big-DMS2a7Ik.js                              0.28 kB │ gzip:   0.22 kB
+dist/assets/lock-Dg9wE605.js                                          0.28 kB │ gzip:   0.22 kB
+dist/assets/code-xml-DpK7j8ga.js                                      0.29 kB │ gzip:   0.20 kB
+dist/assets/link-B3mJWYWf.js                                          0.32 kB │ gzip:   0.22 kB
+dist/assets/globe-DrcNedsP.js                                         0.32 kB │ gzip:   0.22 kB
+dist/assets/key-round-BUfN9jwb.js                                     0.32 kB │ gzip:   0.25 kB
+dist/assets/activity-BsJSdooh.js                                      0.33 kB │ gzip:   0.24 kB
+dist/assets/timer-CcdPffN6.js                                         0.33 kB │ gzip:   0.21 kB
+dist/assets/panel-bottom-open-Cr6sMsCz.js                             0.34 kB │ gzip:   0.24 kB
+dist/assets/chunk-JWPE2WC7-BcbgxNju.js                                0.37 kB │ gzip:   0.20 kB
+dist/assets/chunk-2Q5K7J3B-D7xJ-p7g.js                                0.38 kB │ gzip:   0.24 kB
+dist/assets/git-compare-RgXxO95q.js                                   0.39 kB │ gzip:   0.24 kB
+dist/assets/braces-aXSTEVxz.js                                        0.39 kB │ gzip:   0.25 kB
+dist/assets/users-CbmsMOYF.js                                         0.40 kB │ gzip:   0.26 kB
+dist/assets/hash-C1eVA0gq.js                                          0.41 kB │ gzip:   0.22 kB
+dist/assets/maximize-2-BWBZq_Oq.js                                    0.41 kB │ gzip:   0.24 kB
+dist/assets/user-plus-PlbRhUQr.js                                     0.42 kB │ gzip:   0.26 kB
+dist/assets/save-HXcK1g7V.js                                          0.43 kB │ gzip:   0.27 kB
+dist/assets/chunk-5VM5RSS4-mf8lqklg.js                                0.43 kB │ gzip:   0.30 kB
+dist/assets/hard-drive-download-DI2vtMur.js                           0.44 kB │ gzip:   0.26 kB
+dist/assets/scale-CVzCni-u.js                                         0.46 kB │ gzip:   0.27 kB
+dist/assets/layers-CnVuqZYK.js                                        0.47 kB │ gzip:   0.28 kB
+dist/assets/network-Bm0lehNj.js                                       0.51 kB │ gzip:   0.26 kB
+dist/assets/chunk-XXDRQBXY-CE9Gsx0E.js                                0.53 kB │ gzip:   0.32 kB
+dist/assets/hard-drive-BNRTBw3h.js                                    0.53 kB │ gzip:   0.31 kB
+dist/assets/eye-off-CEUn9wrp.js                                       0.53 kB │ gzip:   0.32 kB
+dist/assets/loader-jDiE0xGf.js                                        0.54 kB │ gzip:   0.27 kB
+dist/assets/list-jNAz95DK.js                                          0.55 kB │ gzip:   0.24 kB
+dist/assets/clipboard-list-Ba3Yld2w.js                                0.57 kB │ gzip:   0.31 kB
+dist/assets/cpu-BSuXH5EX.js                                           0.65 kB │ gzip:   0.29 kB
+dist/assets/stateDiagram-v2-4QOOHH4V-Co7aUevH.js                      0.78 kB │ gzip:   0.43 kB
+dist/assets/classDiagram-DTDB5LWJ-B7SCM5dd.js                         0.82 kB │ gzip:   0.45 kB
+dist/assets/classDiagram-v2-JRS7N3AN-B7SCM5dd.js                      0.82 kB │ gzip:   0.45 kB
+dist/assets/pin-w7k5WOPx.js                                           0.82 kB │ gzip:   0.35 kB
+dist/assets/swimlanesDiagram-VK2B7HYN-B3QWEb-u.js                     0.82 kB │ gzip:   0.46 kB
+dist/assets/chevrons-right-DmTpnY0l.js                                0.85 kB │ gzip:   0.34 kB
+dist/assets/index-CBqV3J-t.js                                         0.86 kB │ gzip:   0.33 kB
+dist/assets/capacityStore-ByMcc53x.js                                 0.92 kB │ gzip:   0.42 kB
+dist/assets/redisStore-IX4L482A.js                                    1.02 kB │ gzip:   0.38 kB
+dist/assets/infoDiagram-RXCK75RN-DVkdxiKX.js                          1.05 kB │ gzip:   0.57 kB
+dist/assets/chunk-POPQ4Y6H-DDh8z5VH.js                                1.07 kB │ gzip:   0.48 kB
+dist/assets/boxes-Bl6RtMTe.js                                         1.09 kB │ gzip:   0.46 kB
+dist/assets/dataDiffState-B8J7l58W.js                                 1.69 kB │ gzip:   0.79 kB
+dist/assets/value-BqLgGnVf.js                                         1.77 kB │ gzip:   0.71 kB
+dist/assets/sizeCapture-X5ZJPWSS-H8a61gKt.js                          1.85 kB │ gzip:   0.76 kB
+dist/assets/ConfirmDialog-B7VUB_vk.js                                 2.02 kB │ gzip:   0.73 kB
+dist/assets/ordinal-CxptdPJm.js                                       2.20 kB │ gzip:   0.77 kB
+dist/assets/EnvWatermark-CmlvBKX5.js                                  2.21 kB │ gzip:   1.00 kB
+dist/assets/railroadDiagram-O6MQD6OU-CabRd84n.js                      2.89 kB │ gzip:   1.01 kB
+dist/assets/ToolsLauncher-B1togxwa.js                                 3.00 kB │ gzip:   1.05 kB
+dist/assets/abnfDiagram-VCTEODGH-cTmWuEGX.js                          3.52 kB │ gzip:   1.23 kB
+dist/assets/pegDiagram-XKGWAZYB-aawZotyv.js                           3.76 kB │ gzip:   1.26 kB
+dist/assets/chunk-F27PBJKO-0oS1s-6a.js                                3.79 kB │ gzip:   1.14 kB
+dist/assets/ebnfDiagram-PWID7BFC-BbUFgr-V.js                          3.93 kB │ gzip:   1.21 kB
+dist/assets/DdlModal-Dv3DggAt.js                                      4.42 kB │ gzip:   1.54 kB
+dist/assets/catalog-CJXmoewp.js                                       4.53 kB │ gzip:   1.88 kB
+dist/assets/schemaArchiveExport-DZMwdnOO.js                           5.37 kB │ gzip:   1.91 kB
+dist/assets/SqlCodeView-MQnOnv4i.js                                   5.83 kB │ gzip:   1.71 kB
+dist/assets/path-CxhvkG1z.js                                          5.84 kB │ gzip:   0.96 kB
+dist/assets/sqlDialect-C56UzSiJ.js                                    5.84 kB │ gzip:   1.92 kB
+dist/assets/exportTasks-OssaX1yF.js                                   5.90 kB │ gzip:   1.79 kB
+dist/assets/MaxScalePanel-BdEuU9NC.js                                 5.93 kB │ gzip:   1.77 kB
+dist/assets/routineExec-BmK9aho9.js                                   6.01 kB │ gzip:   2.15 kB
+dist/assets/SqlVariableDialog-CtOsaW4-.js                             6.02 kB │ gzip:   1.75 kB
+dist/assets/objectEditor-CBjXm7sD.js                                  6.64 kB │ gzip:   2.29 kB
+dist/assets/CreateDatabaseDialog-CJ3aZJqv.js                          6.78 kB │ gzip:   2.10 kB
+dist/assets/arc-DqhUy91S.js                                           6.94 kB │ gzip:   1.96 kB
+dist/assets/SearchableSelect-DiqFliYP.js                              7.30 kB │ gzip:   2.29 kB
+dist/assets/diagram-Z3DM3KII-LYgPbOJZ.js                              7.42 kB │ gzip:   2.43 kB
+dist/assets/KnownHostsManager-BTIAD74P.js                             7.73 kB │ gzip:   1.86 kB
+dist/assets/OgIndexAdvisePanel-Ca4Ri5i9.js                            8.10 kB │ gzip:   2.63 kB
+dist/assets/ExportTaskCenter-CLDfZI4D.js                              8.36 kB │ gzip:   2.31 kB
+dist/assets/dbCopyPaste-C1y2oSwV.js                                   8.43 kB │ gzip:   3.05 kB
+dist/assets/menuClamp-BhYHHj7R.js                                     8.68 kB │ gzip:   2.50 kB
+dist/assets/ChLineagePanel-6RQEdHu7.js                                9.16 kB │ gzip:   2.90 kB
+dist/assets/defaultLocale-B2RvLBDe.js                                 9.37 kB │ gzip:   2.80 kB
+dist/assets/FullTextSearchPanel-BK7dOoYp.js                           9.58 kB │ gzip:   2.48 kB
+dist/assets/linear-CtC0QxNh.js                                        9.63 kB │ gzip:   2.70 kB
+dist/assets/ConfigComparePanel-DZpmeLex.js                           10.13 kB │ gzip:   2.85 kB
+dist/assets/DuckLakePanel-C7nxY3yR.js                                10.13 kB │ gzip:   2.92 kB
+dist/assets/ExportDialog-DFdtDJKU.js                                 10.19 kB │ gzip:   2.67 kB
+dist/assets/RollbackSqlPanel-DBpqsLz6.js                             10.65 kB │ gzip:   2.84 kB
+dist/assets/diagram-UQ7AKVKN-BF1vuiHh.js                             11.49 kB │ gzip:   3.37 kB
+dist/assets/BackupRestorePanel-BPkm0keJ.js                           12.05 kB │ gzip:   3.13 kB
+dist/assets/QueryHistoryPanel-CdqjxIYr.js                            12.41 kB │ gzip:   3.50 kB
+dist/assets/pieDiagram-E7YTZNPT-Cz6Epiwg.js                          12.60 kB │ gzip:   3.55 kB
+dist/assets/MariaPhysicalToolsPanel-DxudnCWA.js                      12.72 kB │ gzip:   3.18 kB
+dist/assets/PgVectorPanel-R3Z61D-7.js                                12.82 kB │ gzip:   3.51 kB
+dist/assets/DuckDbDiffPanel-DGA2kctY.js                              12.88 kB │ gzip:   3.02 kB
+dist/assets/GaleraPanel-p4Igh_4M.js                                  13.23 kB │ gzip:   3.39 kB
+dist/assets/DuckMaskExportPanel-hYV1y5xN.js                          13.57 kB │ gzip:   3.28 kB
+dist/assets/InstanceImportPanel-DKdKHzUZ.js                          13.65 kB │ gzip:   3.33 kB
+dist/assets/AuditLogPanel-Cv4ZSHDj.js                                13.79 kB │ gzip:   3.46 kB
+dist/assets/PgPitrGuidePanel-CVXGAbDo.js                             13.81 kB │ gzip:   4.13 kB
+dist/assets/RecordingPanel-DZu1IDyb.js                               14.03 kB │ gzip:   3.76 kB
+dist/assets/MssqlPitrGuidePanel-Bd02zXr3.js                          14.20 kB │ gzip:   4.37 kB
+dist/assets/MssqlToolsPanels-BVDGq5w8.js                             14.40 kB │ gzip:   4.35 kB
+dist/assets/TablePeekModal-DvcilQ_y.js                               16.02 kB │ gzip:   4.12 kB
+dist/assets/PgFdwPanel-DanIXJ3c.js                                   16.07 kB │ gzip:   3.73 kB
+dist/assets/diagram-S7CK7UJ4-D8e_D1dj.js                             16.08 kB │ gzip:   4.92 kB
+dist/assets/DatabaseManagerPanel-Bn97_hu9.js                         16.17 kB │ gzip:   3.33 kB
+dist/assets/DbToolPanels-CQLfKvLh.js                                 16.92 kB │ gzip:   3.26 kB
+dist/assets/OptimizerPanel-CZsuPATc.js                               17.75 kB │ gzip:   4.32 kB
+dist/assets/cynefinDiagram-5FMLGOSQ-TDtto8m0.js                      18.40 kB │ gzip:   4.63 kB
+dist/assets/OnlineDdlPanel-ZIad9WG5.js                               19.04 kB │ gzip:   4.75 kB
+dist/assets/stateDiagram-HBIQ2CUA-CJLbLUn-.js                        19.11 kB │ gzip:   4.83 kB
+dist/assets/PgPartmanPanel-DFyPs_aj.js                               19.65 kB │ gzip:   5.14 kB
+dist/assets/TimeravelPanel-BE2rX-tO.js                               19.91 kB │ gzip:   4.39 kB
+dist/assets/OgDbePerfPanel-B1Cr83GB.js                               19.95 kB │ gzip:   4.18 kB
+dist/assets/DataDictPanel-PL7qYd7x.js                                20.06 kB │ gzip:   5.34 kB
+dist/assets/RedisToolsPanel-DbLtubDc.js                              20.61 kB │ gzip:   3.93 kB
+dist/assets/DuckFileQueryDialog-CyY0AXIb.js                          20.66 kB │ gzip:   4.61 kB
+dist/assets/KbAuditPanel-DvaHul90.js                                 20.66 kB │ gzip:   5.20 kB
+dist/assets/SchedulerPanel-CS8gPBkM.js                               20.89 kB │ gzip:   4.82 kB
+dist/assets/diagram-VSXAHHWV-DIVbH5FG.js                             21.65 kB │ gzip:   5.53 kB
+dist/assets/KbMonitorPanel-QscAfa5d.js                               21.97 kB │ gzip:   5.01 kB
+dist/assets/webviewWindow-8BE-bUKr.js                                22.20 kB │ gzip:   4.04 kB
+dist/assets/OgSecurityPanel-Do565W2O.js                              22.30 kB │ gzip:   4.41 kB
+dist/assets/OceanBasePanel-Nt86FMXj.js                               22.57 kB │ gzip:   4.90 kB
+dist/assets/BinlogFlashbackPanel-DiTT5SFf.js                         22.74 kB │ gzip:   5.05 kB
+dist/assets/dagre-3AP2YEHR-B_e0LHEM.js                               23.35 kB │ gzip:   5.69 kB
+dist/assets/PgBouncerPanel-CQGLb4vr.js                               24.54 kB │ gzip:   4.43 kB
+dist/assets/PgPartitionPanel-ZNQ291JD.js                             26.61 kB │ gzip:   5.12 kB
+dist/assets/DriverManager-TlkWeJp-.js                                26.72 kB │ gzip:   6.17 kB
+dist/assets/PgRolesPanel-GFNODtuN.js                                 27.42 kB │ gzip:   5.24 kB
+dist/assets/index-Bg57z7el.js                                        28.53 kB │ gzip:   7.58 kB
+dist/assets/RoutineWizard-83tBRCYq.js                                28.76 kB │ gzip:   6.91 kB
+dist/assets/PgReplicationPanel-DlPkBGhJ.js                           29.84 kB │ gzip:   6.07 kB
+dist/assets/chunk-SVP7TREG-Dpci1Og4.js                               30.84 kB │ gzip:   5.89 kB
+dist/assets/ExportDialog-NN3kY_uK.js                                 31.54 kB │ gzip:   6.79 kB
+dist/assets/diagram-VX7I27RA-DrMlJfZa.js                             32.43 kB │ gzip:   7.75 kB
+dist/assets/ishikawaDiagram-5VMMS53U-DghOZObe.js                     35.14 kB │ gzip:   9.29 kB
+dist/assets/ClickHousePanel-Bw2dbsv4.js                              35.24 kB │ gzip:   6.54 kB
+dist/assets/PgAdvancedPanel-CDyg3a0R.js                              35.28 kB │ gzip:   7.09 kB
+dist/assets/InstanceExportPanel-2iP4YZey.js                          35.44 kB │ gzip:   7.21 kB
+dist/assets/TidbPanel-DlDJCPIH.js                                    37.12 kB │ gzip:   7.31 kB
+dist/assets/kanban-definition-3QL26DDD-BSYwKZuC.js                   38.18 kB │ gzip:   9.47 kB
+dist/assets/mindmap-definition-FBJOCRG2-DM9QL98r.js                  43.36 kB │ gzip:  10.65 kB
+dist/assets/PgMaintenancePanel-DDnw42L6.js                           43.60 kB │ gzip:   8.30 kB
+dist/assets/wardleyDiagram-VM6X3IG4-BohbQxVI.js                      44.58 kB │ gzip:   8.84 kB
+dist/assets/journeyDiagram-EYS64GPL-Bwv5QlJ4.js                      45.36 kB │ gzip:  11.20 kB
+dist/assets/ObjectEditor-D6EQTrsa.js                                 46.12 kB │ gzip:  11.69 kB
+dist/assets/sankeyDiagram-P5KCCOFB-gCpzn1kk.js                       46.17 kB │ gzip:  11.67 kB
+dist/assets/requirementDiagram-EFPCY7ZU-BIXbdFEz.js                  52.61 kB │ gzip:  12.11 kB
+dist/assets/DbaTemplatesPanel-CDPFrQYf.js                            55.56 kB │ gzip:  16.41 kB
+dist/assets/erDiagram-SSCWMZ5O-a0-q-mcI.js                           56.27 kB │ gzip:  13.61 kB
+dist/assets/OraclePanel-Cdwscayw.js                                  57.39 kB │ gzip:  10.72 kB
+dist/assets/gitGraphDiagram-WWUBYQGX-DH4fN6yY.js                     57.55 kB │ gzip:  11.53 kB
+dist/assets/timeline-definition-24CTP7MA-CCeJEdnt.js                 60.57 kB │ gzip:  13.51 kB
+dist/assets/quadrantDiagram-AXDQQJYC-D_eXwI31.js                     61.72 kB │ gzip:  12.51 kB
+dist/assets/MigrationWizard-DFGwgUcB.js                              63.88 kB │ gzip:  12.96 kB
+dist/assets/purify.es-BccBCzh1.js                                    66.80 kB │ gzip:  15.72 kB
+dist/assets/transform-BMKzoBmP.js                                    67.61 kB │ gzip:  15.87 kB
+dist/assets/CreateTableWizard-CYMvjUvq.js                            70.30 kB │ gzip:  15.07 kB
+dist/assets/chunk-G27WJ6UU-DrS0rF7o.js                               72.89 kB │ gzip:  17.19 kB
+dist/assets/blockDiagram-NRAW4CY4-BlAkccKh.js                        76.07 kB │ gzip:  17.30 kB
+dist/assets/layout-BFWohA02.js                                       78.73 kB │ gzip:  18.62 kB
+dist/assets/xychartDiagram-S5SC5T6Z-CX_KTquC.js                      83.28 kB │ gzip:  16.39 kB
+dist/assets/chunk-LCL6LL3I-Cvw2oa2q.js                               84.52 kB │ gzip:  20.19 kB
+dist/assets/vennDiagram-4TSXK5OY-bHo150Fj.js                         88.91 kB │ gzip:  21.57 kB
+dist/assets/sqlHighlight-BMV2Ho0Y.js                                 95.07 kB │ gzip:  27.25 kB
+dist/assets/index-BqvamACH.js                                        95.63 kB │ gzip:  17.05 kB
+dist/assets/index-BzughlOe.js                                        95.84 kB │ gzip:  17.34 kB
+dist/assets/SqliteAdminPanel-BZxUC4_w.js                             99.22 kB │ gzip:  16.30 kB
+dist/assets/flowDiagram-A5DVABFB-Dl2wa9XU.js                        105.41 kB │ gzip:  24.37 kB
+dist/assets/c4Diagram-UCG6FXSJ-DXkjl0tr.js                          111.19 kB │ gzip:  23.27 kB
+dist/assets/DuckDbAdminPanel-DWOPRhQB.js                            115.78 kB │ gzip:  18.56 kB
+dist/assets/ganttDiagram-EL5Y4UJY-t7KeH5oZ.js                       133.65 kB │ gzip:  30.53 kB
+dist/assets/DbaPanel-DeMM_mdy.js                                    135.91 kB │ gzip:  21.79 kB
+dist/assets/index-HozZEOei.js                                       157.90 kB │ gzip:  23.07 kB
+dist/assets/TableBrowser-CETT9fsv.js                                161.63 kB │ gzip:  30.94 kB
+dist/assets/sequenceDiagram-WJ2MYXX4-BwuS0crd.js                    201.73 kB │ gzip:  38.09 kB
+dist/assets/sqlFunctions-Mwxk_Tv-.js                                207.01 kB │ gzip:  45.00 kB
+dist/assets/index-BaIWPYdX.js                                       208.56 kB │ gzip:  44.16 kB
+dist/assets/cose-bilkent-JH36ORCC-C3jvcncP.js                       214.61 kB │ gzip:  34.46 kB
+dist/assets/DbSchemaTree-ns_hY-bh.js                                239.75 kB │ gzip:  38.69 kB
+dist/assets/index-eADv6JwG.js                                       243.54 kB │ gzip:  42.14 kB
+dist/assets/index-D1sSebsz.js                                       274.11 kB │ gzip:  49.05 kB
+dist/assets/ToolPage-cVjPdFOr.js                                    293.52 kB │ gzip:  75.86 kB
+dist/assets/swimlanes-XN3QIQJK-DGMeZ2f1.js                          298.73 kB │ gzip:  60.94 kB
+dist/assets/ErDiagramPanel-Ddm3gFcX.js                              301.49 kB │ gzip:  67.43 kB
+dist/assets/html2canvas.esm-CMq0_Xqz.js                             349.46 kB │ gzip:  63.26 kB
+dist/assets/index.es-DkxBnRVm.js                                    361.26 kB │ gzip:  75.74 kB
+dist/assets/index-Nb-ORJX8.js                                       413.85 kB │ gzip:  62.19 kB
+dist/assets/architectureDiagram-5GKGNRK7-b9f3HSPZ.js                423.31 kB │ gzip:  64.97 kB
+dist/assets/index-CGa3KeFc.js                                       444.16 kB │ gzip:  97.80 kB
+dist/assets/katex-oVG3DVWa.js                                       484.52 kB │ gzip: 105.27 kB
+dist/assets/jspdf.es.min-CAIwg5qJ.js                                594.97 kB │ gzip: 147.51 kB
+dist/assets/index-CEiw0RG3.js                                       669.02 kB │ gzip: 153.33 kB
+dist/assets/index-DqMpOWeg.js                                       731.98 kB │ gzip: 164.45 kB
+dist/assets/index-D390R8pg.js                                       820.54 kB │ gzip: 202.19 kB
+dist/assets/xlsx-D6h3nj8f.js                                        866.44 kB │ gzip: 193.75 kB
+dist/assets/cytoscape.esm-CXrHI7Kx.js                               961.04 kB │ gzip: 203.78 kB
+dist/assets/mermaid.core-AsSqsc8I.js                              1,091.93 kB │ gzip: 191.52 kB
+dist/assets/cynefin-OW5HDTMX-5s-ES8Pd.js                          1,302.82 kB │ gzip: 216.16 kB
+✓ built in 6.22s

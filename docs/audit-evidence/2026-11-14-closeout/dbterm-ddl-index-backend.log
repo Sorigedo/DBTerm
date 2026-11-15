@@ -1,0 +1,519 @@
+warning: use of deprecated method `futures_channel::mpsc::UnboundedReceiver::<T>::try_next`: please use `try_recv` instead
+   --> vendor/sqlx-postgres/src/listener.rs:335:56
+    |
+335 |         if let Ok(Some(notification)) = self.buffer_rx.try_next() {
+    |                                                        ^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: variant `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/mod.rs:78:5
+   |
+70 | pub enum FrontendMessageFormat {
+   |          --------------------- variant in this enum
+...
+78 |     Flush = b'H',
+   |     ^^^^^
+   |
+   = note: `FrontendMessageFormat` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/flush.rs:11:12
+   |
+11 | pub struct Flush;
+   |            ^^^^^
+
+warning: `sqlx-postgres` (lib) generated 3 warnings
+   Compiling app v0.1.23 (/Users/Nico/workSpace/claude/DBterm/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.86s
+     Running unittests src/lib.rs (target/debug/deps/app_lib-bccc94f7de71602a)
+
+running 484 tests
+test commands::clickhouse::tests::test_base_url_http ... ok
+test commands::clickhouse::tests::test_base_url_defaults ... ok
+test commands::clickhouse::tests::test_base_url_https ... ok
+test commands::clickhouse::tests::test_cell_to_string ... ok
+test commands::db::tests::test_get_connection_password_whitespace_id ... ok
+test commands::db_caps::tests::test_db_capabilities_default ... ok
+test commands::db_caps::tests::test_version_ge ... ok
+test commands::db::tests::test_get_connection_password_empty_id ... ok
+test commands::db_caps::tests::agent_and_none_tunnels_do_not_require_password_store ... ok
+test commands::db_caps::tests::legacy_tunnel_password_and_key_passphrase_are_preserved ... ok
+test commands::db_caps::tests::tunnel_credentials_restore_persisted_secret_without_exposing_lookup_errors ... ok
+test commands::db_diff::tests::mysql_comparison_decodes_numbers_dates_and_nulls_without_loss ... ignored, requires explicitly selected disposable DBTERM_EXPORT_TEST_URL
+test commands::db_caps::tests::test_parse_semver ... ok
+test commands::db_dba::tests::test_note ... ok
+test commands::db_dba::tests::test_from_qr ... ok
+test commands::db_diff::tests::real_mysql_comparison_distinguishes_adjacent_floats ... ignored, requires explicitly selected disposable DBTERM_TEST_MYSQL_URL
+test commands::db_diff::tests::real_mysql_comparison_distinguishes_empty_set_and_enum_members ... ignored, requires explicitly selected disposable DBTERM_TEST_MYSQL_URL
+test commands::db_diff::tests::real_mysql_comparison_preserves_unicode_despite_connection_encoding ... ignored, requires explicitly selected disposable DBTERM_TEST_MYSQL_URL
+test commands::db_diff::tests::real_mysql_comparison_snapshots_pagination_and_exact_values ... ignored, requires explicitly selected disposable DBTERM_TEST_MYSQL_URL
+test commands::db_diff::tests::real_mysql_full_merge_counts_composite_keys_and_capped_samples ... ignored, requires explicitly selected disposable DBTERM_TEST_MYSQL_URL
+test commands::db_diff::tests::real_mysql_keyset_keeps_adjacent_i64_u64_limits_across_pages ... ignored, requires explicitly selected disposable DBTERM_TEST_MYSQL_URL
+test commands::db_diff::tests::test_chunk_needs_refill ... ok
+test commands::db_diff::tests::test_q_mysql ... ok
+test commands::db_diff::tests::nonbinary_decode_errors_cannot_become_literal_hex_text ... ok
+test commands::db_diff::tests::comparison_retained_samples_have_aggregate_byte_budget ... ok
+test commands::db_caps::tests::malformed_tunnel_configuration_fails_before_direct_connection ... ok
+test commands::db_diff::tests::test_q_pg ... ok
+test commands::db_diff::tests::null_and_empty_text_are_distinct_in_data_comparison ... ok
+test commands::db_diff::tests::comparison_rejects_unsafe_keys_and_missing_columns ... ok
+test commands::db_diff::tests::test_chunk_peek_advance ... ok
+test commands::db_diff::tests::integer_cursor_sql_uses_exact_unquoted_numeric_literals ... ok
+test commands::db_export::archive_tests::duckdb_temp_csv_directory_is_private ... ok
+test commands::db_diff::tests::validated_integer_keys_follow_real_integer_order_without_guessing ... ok
+test commands::db_export::archive_tests::cancellation_registration_cleans_up_early_returns_without_removing_replacements ... ok
+test commands::db_export::archive_tests::clickhouse_sql_literals_preserve_bytes_small_decimals_and_nested_values ... ok
+test commands::db_export::archive_tests::duckdb_temp_csv_paths_are_unique_and_cleanup_on_drop ... ok
+test commands::db_export::archive_tests::export_rejects_ambiguous_object_keys_but_preserves_positional_formats ... ok
+test commands::db_export::archive_tests::export_cleanup_rejects_symlink_workspace ... ok
+test commands::db_export::archive_tests::export_cleanup_rejects_nested_temp_directories ... ok
+test commands::db_export::archive_tests::export_selected_target_none_keeps_saved_target_and_invalid_schema_refuses ... ok
+test commands::db_export::archive_tests::export_selected_target_routes_mysql_database_and_rejects_sqlite_attachments ... ok
+test commands::db_export::archive_tests::json_export_duplicate_columns_must_not_silently_drop_first_value ... ok
+test commands::db_export::archive_tests::mysql_sql_export_preserves_enum_and_set_internal_members ... ignored, requires DBTERM_EXPORT_TEST_URL pointing at disposable MySQL
+test commands::db_export::archive_tests::mysql_sql_export_round_trips_typed_values ... ignored, requires DBTERM_EXPORT_TEST_URL pointing at a disposable MySQL 8 database
+test commands::db_export::archive_tests::mysql_tabular_exports_never_silently_turn_decode_errors_into_null ... ignored, requires DBTERM_EXPORT_TEST_URL pointing at disposable MySQL
+test commands::db_export::archive_tests::mysql_xlsx_large_ids_and_decimals_are_text_with_exact_digits ... ignored, requires disposable MySQL DBTERM_EXPORT_TEST_URL
+test commands::db_export::archive_tests::export_selected_target_preserves_pg_database_and_security_config ... ok
+test commands::db_export::archive_tests::native_export_target_preserves_oracle_service_and_duck_file_but_routes_physical_databases ... ok
+test commands::clickhouse_tcp::pool_identity_tests::same_id_changed_endpoint_or_credentials_never_matches ... ok
+test commands::clickhouse::tests::test_client_shared ... ok
+test commands::db_export::archive_tests::gbk_export_rejects_unmappable_characters_without_writing_replacements ... ok
+test commands::db_export::archive_tests::rejects_archive_path_traversal ... ok
+test commands::db_export::archive_tests::final_text_tail_and_buffer_flush_errors_propagate ... ok
+test commands::db_export::archive_tests::sqlserver_unicode_literal_preserves_utf16_nul_quotes_and_astral_text ... ok
+test commands::db_export::archive_tests::export_workspaces_are_unique_and_preserve_existing_contents ... ok
+test commands::db_export::archive_tests::duckdb_temp_csv_cleans_up_early_error_and_unwind ... ok
+test commands::db_export::archive_tests::staged_export_files_are_owner_only ... ok
+test commands::db_export::archive_tests::test_archive_entry_binary ... ok
+test commands::db_export::archive_tests::stream_sql_writer_uses_dialect_quotes_and_escaping ... ok
+test commands::db_export::archive_tests::archive_failure_keeps_existing_output_and_removes_staging_file ... ok
+test commands::db_export::archive_tests::test_archive_entry_construction ... ok
+test commands::db_export::archive_tests::test_ident_quote_backtick ... ok
+test commands::db_export::archive_tests::test_ident_quote_bracket ... ok
+test commands::db_export::archive_tests::test_ident_quote_double ... ok
+test commands::db_export::archive_tests::test_row_writer_csv_variant ... ok
+test commands::db_export::archive_tests::test_row_writer_json_variant ... ok
+test commands::db_export::archive_tests::test_row_writer_jsonl_variant ... ok
+test commands::db_export::archive_tests::test_row_writer_md_variant ... ok
+test commands::db_export::archive_tests::test_row_writer_sql_mysql ... ok
+test commands::db_export::archive_tests::test_row_writer_sql_pg ... ok
+test commands::db_export::archive_tests::test_safe_archive_name_absolute_paths ... ok
+test commands::db_export::archive_tests::test_safe_archive_name_parent_traversal ... ok
+test commands::db_export::archive_tests::test_safe_archive_name_valid_paths ... ok
+test commands::db_export::archive_tests::xlsx_text_preserves_controls_and_literal_ooxml_escape_sequences ... ok
+test commands::db_export::archive_tests::export_readonly_sql_guard_rejects_mutation_batches_and_hidden_writes ... ok
+test commands::db_export::archive_tests::xlsx_numeric_cells_do_not_round_large_database_identifiers_or_decimals ... ok
+test commands::db_diff::tests::comparison_deadline_drops_pending_scan_resources_without_success_result ... ok
+test commands::db_export::archive_tests::sqlite_sql_export_round_trips_storage_classes_and_bytes ... ok
+test commands::db_extra::batch_insert_atomicity_tests::mysql_rejects_nontransactional_target_and_rolls_back_later_chunk ... ignored, requires explicitly selected disposable local MySQL: DBTERM_TEST_MYSQL_PORT
+test commands::db_extra::batch_insert_atomicity_tests::pg_later_chunk_duplicate_rolls_back_first_chunk ... ignored, requires explicitly selected disposable local PostgreSQL: DBTERM_TEST_PG_PORT
+test commands::db_export::archive_tests::xlsx_rejects_column_overflow_and_row_shape_without_publishing_cells ... ok
+test commands::db_export::archive_tests::staged_exports_preserve_existing_destination_on_failure_and_commit_on_success ... ok
+test commands::db_extra::connection_policy_audit_tests::credential_store_failure_never_becomes_empty_authentication ... ok
+test commands::db_export::archive_tests::sqlite_duplicate_projection_fails_before_replacing_existing_json_export ... ok
+test commands::db_extra::connection_policy_audit_tests::irrelevant_agent_credentials_are_not_read ... ok
+test commands::db_extra::connection_policy_audit_tests::malformed_policy_objects_reject_without_losing_valid_defaults ... ok
+test commands::db_extra::copy_publication_atomicity_tests::real_mysql_copy_is_invisible_until_complete_and_preserves_raw_ddl ... ignored, requires disposable MySQL DBTERM_TEST_MYSQL_PORT
+test commands::db_extra::delete_atomicity_tests::mysql_later_fk_failure_restores_earlier_delete_and_null_matches ... ignored, requires disposable local MySQL DBTERM_TEST_MYSQL_PORT
+test commands::db_export::archive_tests::packs_one_sql_file_per_table ... ok
+test commands::db_extra::connection_policy_audit_tests::malformed_tunnel_policy_never_becomes_direct_connection ... ok
+test commands::db_export::archive_tests::packs_schema_zips_inside_database_zip ... ok
+test commands::db_export::archive_tests::xlsx_writer_deflates_large_worksheet_xml_with_fast_level ... ok
+test commands::db_export::archive_tests::sqlite_export_readonly_blocks_temp_writes_on_actual_connection ... ok
+test commands::db_extra::draft_insert::tests::mysql_variable_columns_defaults_and_later_chunk_rollback ... ignored, requires explicitly disposable DBTERM_DRAFT_MYSQL_URL
+test commands::db_export::archive_tests::xlsx_writer_rolls_over_to_new_sheet_and_repeats_header ... ok
+test commands::db_extra::draft_insert::tests::postgres_draft_text_parameters_cast_to_target_types ... ignored, requires explicitly disposable DBTERM_DRAFT_PG_URL
+test commands::db_export::archive_tests::xlsx_writer_writes_number_cells_without_inline_string_markup ... ok
+test commands::db_extra::draft_insert::tests::real_mysql_insert_commit_disconnect_checks_complete_batch_and_unknown_receipt ... ignored, requires explicitly disposable local MySQL DBTERM_TEST_MYSQL_PORT
+test commands::db_extra::draft_insert::tests::readonly_drafts_refuse_before_nonexistent_file_connection ... ok
+test commands::db_extra::draft_insert::tests::native_draft_statements_share_transaction_and_later_error_rolls_back ... ok
+test commands::db_extra::migration_scalar_tests::mysql_stream_preserves_set_bitmasks_even_when_text_labels_collide ... ignored, requires disposable local MySQL DBTERM_TEST_MYSQL_PORT
+test commands::db_extra::migration_scalar_tests::mysql_stream_zero_date_strict_failure_preserves_existing_target ... ignored, requires disposable local MySQL DBTERM_TEST_MYSQL_PORT
+test commands::db_extra::migration_scalar_tests::postgres_commit_error_is_not_treated_as_confirmed_rollback_for_table_recovery ... ok
+test commands::db_extra::migration_scalar_tests::postgres_failed_restore_reports_and_preserves_backup_when_target_cannot_be_dropped ... ignored, requires explicitly disposable local PostgreSQL DBTERM_TEST_PG_PORT
+test commands::db_extra::migration_scalar_tests::postgres_restore_transaction_rolls_back_target_drop_if_backup_rename_fails ... ignored, requires explicitly disposable local PostgreSQL DBTERM_TEST_PG_PORT
+test commands::db_extra::migration_verification_tests::admin_sql_tls_unknown_mode_fails_before_network ... ok
+test commands::db_extra::migration_verification_tests::real_mysql_migration_verification_detects_equal_count_different_content ... ignored, requires isolated MySQL at DBTERM_TEST_MYSQL_URL
+test commands::db_extra::migration_scalar_tests::active_stream_uses_scalar_projection_and_rechecks_unsupported_types_before_target_setup ... ok
+test commands::db_extra::mysql_ddl_fidelity_tests::database_export_preserves_charset_collation_and_version_comments ... ok
+test commands::db_extra::mysql_ddl_fidelity_tests::migration_only_replaces_table_identifier_in_user_ddl ... ok
+test commands::db_extra::mysql_ddl_fidelity_tests::migration_preserves_foreign_keys_and_column_collations ... ok
+test commands::db_extra::mysql_ddl_fidelity_tests::migration_rejects_malformed_source_ddl_instead_of_building_partial_table ... ok
+test commands::db_extra::mysql_ddl_fidelity_tests::real_mysql_setup_preserves_ddl_and_restores_existing_table_on_create_failure ... ignored, requires explicitly selected disposable local MySQL: DBTERM_TEST_MYSQL_PORT
+test commands::db_extra::batch_insert_atomicity_tests::sqlite_malformed_later_row_leaves_existing_rows_untouched ... ok
+test commands::db_extra::mysql_ddl_fidelity_tests::structure_diff_uses_complete_column_sql_including_expression_defaults ... ok
+test commands::db_extra::mysql_ddl_fidelity_tests::structure_diff_detects_attributes_missing_from_column_summary ... ok
+test commands::db_extra::mysql_ddl_fidelity_tests::transfer_digest_handles_null_boundaries_duplicates_and_same_count_changes ... ok
+test commands::db_extra::native_insert_atomicity_tests::later_native_insert_failure_rolls_back_and_reports_rollback_failure ... ok
+test commands::db_extra::native_insert_atomicity_tests::malformed_native_deletes_reject_before_driver_or_credentials ... ok
+test commands::db_extra::native_insert_atomicity_tests::malformed_native_batches_fail_before_driver_or_credentials ... ok
+test commands::db_extra::native_insert_atomicity_tests::native_batch_rejects_any_malformed_row_before_writing ... ok
+test commands::db_extra::mysql_ddl_fidelity_tests::where_filter_rejects_statement_and_query_suffix_injection ... ok
+test commands::db_extra::native_insert_atomicity_tests::sqlserver_batch_rolls_back_later_failure_and_does_not_retry_commit ... ok
+test commands::db_extra::native_insert_atomicity_tests::uncertain_native_commit_is_not_retried ... ok
+test commands::db_extra::optimistic_delete_tests::delete_baseline_requires_unique_columns_original_keys_and_complete_rows ... ok
+test commands::db_extra::batch_insert_atomicity_tests::sqlite_later_duplicate_rolls_back_every_insert ... ok
+test commands::db_extra::optimistic_delete_tests::mysql_delete_baseline_is_exact_and_later_stale_row_rolls_back ... ignored, requires disposable local MySQL DBTERM_TEST_MYSQL_PORT
+test commands::db_extra::delete_atomicity_tests::sqlite_malformed_later_key_leaves_all_rows ... ok
+test commands::db_extra::pg_delete_fidelity_tests::pg_case_space_and_null_baseline_changes_refuse_delete ... ignored, requires isolated PostgreSQL DBTERM_TEST_PG_PORT
+test commands::db_extra::pg_delete_fidelity_tests::pg_composite_integer_key_deletes_selected_rows_only ... ignored, requires isolated PostgreSQL DBTERM_TEST_PG_PORT
+test commands::db_extra::pg_delete_fidelity_tests::pg_later_stale_row_rolls_back_prior_delete ... ignored, requires isolated PostgreSQL DBTERM_TEST_PG_PORT
+test commands::db_extra::batch_insert_atomicity_tests::sqlite_valid_batch_commits_every_row ... ok
+test commands::db_extra::pg_insert_fidelity_tests::pg_grid_insert_rejects_oversized_text_and_retains_domain_constraints ... ignored, requires disposable DBTERM_TEST_PG_PORT
+test commands::db_extra::pg_insert_fidelity_tests::pg_grid_insert_typed_values_keep_text_and_roll_back_later_conversion ... ignored, requires disposable DBTERM_TEST_PG_PORT
+test commands::db_extra::pg_insert_fidelity_tests::pg_type_planning_locks_target_until_transaction_finishes ... ignored, requires disposable DBTERM_TEST_PG_PORT
+test commands::db_extra::publication_acceptance_tests::real_mysql_delete_commit_disconnect_checks_complete_batch_and_unknown_receipt ... ignored, requires explicitly disposable local MySQL DBTERM_TEST_MYSQL_PORT
+test commands::db_extra::publication_acceptance_tests::real_mysql_publish_rejects_stage_charset_and_concurrent_target_ddl_changes ... ignored, requires explicitly selected disposable local MySQL: DBTERM_TEST_MYSQL_PORT
+test commands::db_extra::publication_disconnect_tests::real_mysql_publish_disconnect_preserves_complete_old_or_new_and_recovery_tables ... ignored, requires explicitly disposable local MySQL DBTERM_TEST_MYSQL_PORT
+test commands::db_extra::schema_compare_safety_tests::database_signature_keeps_charset_collation_encryption_and_normalizes_only_name ... ok
+test commands::db_extra::schema_compare_safety_tests::incomplete_engine_metadata_never_claims_complete_schema_equality ... ok
+test commands::db_extra::schema_compare_safety_tests::mysql_backspace_default_requires_same_escape_mode_for_raw_alter ... ignored, requires disposable local MySQL DBTERM_TEST_MYSQL_PORT
+test commands::db_extra::schema_compare_safety_tests::mysql_full_definition_capture_includes_hidden_generated_and_rejects_triggers ... ignored, requires disposable local MySQL DBTERM_TEST_MYSQL_PORT
+test commands::db_extra::schema_compare_safety_tests::schema_sql_modes_reject_literal_interpretation_mismatch ... ok
+test commands::db_extra::schema_compare_snapshot::tests::mysql_schema_snapshot_keeps_all_table_locks_detects_new_tables_and_refuses_partial_visibility ... ignored, requires disposable local MySQL DBTERM_TEST_MYSQL_PORT
+test commands::db_extra::schema_compare_snapshot::tests::schema_snapshot_preserves_unicode_and_rejects_functional_index_mismatch ... ignored, requires disposable local MySQL DBTERM_TEST_MYSQL_PORT
+test commands::db_extra::schema_compare_safety_tests::raw_definition_column_list_must_match_metadata_order_and_names ... ok
+test commands::db_extra::sql_file_reader::tests::delimiter_and_dollar_body_preserve_statement_text ... ok
+test commands::db_extra::sql_file_reader::tests::incomplete_tokens_and_midstatement_directives_reject ... ok
+test commands::db_extra::sql_file_reader::tests::mysql_execution_preserves_version_comments_delimiters_modes_and_stops_on_error ... ignored, requires disposable local MySQL DBTERM_TEST_MYSQL_PORT
+test commands::db_extra::sql_file_reader::tests::literals_and_executable_comments_are_preserved ... ok
+test commands::db_extra::sql_file_reader::tests::sql_mode_changes_apply_before_parsing_following_statement ... ok
+test commands::db_extra::sql_file_reader::tests::postgres_session_escape_mode_and_sqlite_quoted_identifier_are_respected ... ok
+test commands::db_tx::pg_tx_finish_tests::postgres_commit_and_recovered_savepoint_keep_successful_changes ... ignored, requires disposable DBTERM_TEST_PG_PORT
+test commands::db_tx::pg_tx_finish_tests::postgres_deferred_failure_and_disconnect_never_return_success ... ignored, requires disposable DBTERM_TEST_PG_PORT
+test commands::db_tx::pg_tx_finish_tests::postgres_failed_transaction_commit_is_never_reported_success ... ignored, requires disposable DBTERM_TEST_PG_PORT
+test commands::db_extra::delete_atomicity_tests::sqlite_null_key_predicate_deletes_the_selected_row ... ok
+test commands::db_tx::tests::duckdb_transaction_variant_owns_retained_handle ... ok
+test commands::db_tx::tests::commit_keeps_identity_registered_while_waiting_for_execution ... ok
+test commands::db_extra::native_insert_atomicity_tests::native_transaction_runner_rolls_back_actual_constraint_failure ... ok
+test commands::db_tx::tests::manual_tx_rejects_implicit_commit_controls_and_multiple_statements ... ok
+test commands::db_tx::tests::same_connection_operations_share_gate_but_other_connections_proceed ... ok
+test commands::db_tx::tests::sqlserver_transaction_variant_owns_retained_handle ... ok
+test commands::db_extra::native_insert_atomicity_tests::native_delete_runner_restores_earlier_deletes_after_later_failure ... ok
+test commands::db_tx::tests::stale_oracle_is_preserved_when_native_pool_is_unavailable ... ok
+test commands::db_tx::tests::test_active_tx_read_only ... ok
+test commands::db_tx::tests::test_active_tx_structure ... ok
+test commands::db_tx::tests::test_cleanup_long_running_active_tx ... ok
+test commands::db_tx::tests::test_cleanup_stale_txns_mixed ... ok
+test commands::db_tx::tests::test_cleanup_stale_txns_no_stale ... ok
+test commands::db_tx::tests::test_cleanup_stale_txns_with_stale ... ok
+test commands::db_tx::tests::test_mysql_cfg_deserialization ... ok
+test commands::db_tx::tests::test_pg_cfg_deserialization ... ok
+test commands::db_tx::tests::test_tag_sql ... ok
+test commands::db_tx::tests::test_tx_conn_oracle_variant ... ok
+test commands::db_tx::tests::test_tx_state_creation ... ok
+test commands::db_tx::tests::test_tx_state_insert_and_retrieve ... ok
+test commands::db_extra::sql_file_reader::tests::sqlite_trigger_body_is_one_statement_and_literals_survive_execution ... ok
+test commands::db_tx::tests::test_tx_state_multiple_connections ... ok
+test commands::db_tx::tests::test_tx_state_remove ... ok
+test commands::db_tx::tx_cancel_tests::postgres_authenticated_cancel_stops_long_query_and_releases_locks ... ignored, requires disposable DBTERM_TEST_PG_PORT
+test commands::db_tx::tx_cancel_tests::postgres_running_cancel_invalidates_client_and_eventually_releases_server_locks ... ignored, requires disposable DBTERM_TEST_PG_PORT
+test commands::duckdb::memory_tests::alter_batch_rejects_transaction_control_and_keeps_quoted_semicolons ... ok
+test commands::db_extra::delete_atomicity_tests::sqlite_nonunique_locator_rolls_back_instead_of_deleting_multiple_rows ... ok
+test commands::db_tx::tests::transaction_connectors_reuse_read_only_init_sql_guard_before_network ... ok
+test commands::duckdb::memory_tests::blob_display_encodes_in_one_exact_buffer ... ok
+test commands::duckdb::memory_tests::decoded_cells_are_charged_before_allocation ... ok
+test commands::duckdb::memory_tests::duck_cache_refuses_replacement_until_retained_handle_is_released ... ok
+test commands::duckdb::memory_tests::duck_diff_uses_file_path_and_distinguishes_schema_identity ... ok
+test commands::duckdb::memory_tests::duck_cache_identity_includes_file_read_only_extra_and_driver ... ok
+test commands::duckdb::memory_tests::native_allocations_are_freed_when_preflight_rejects_a_cell ... ok
+test commands::db_tx::tests::queued_sqlite_execution_cannot_run_after_commit_or_enter_new_transaction ... ok
+test commands::duckdb::memory_tests::real_duckdb_alter_batch_rollback_preserves_original_definition ... ignored, requires verified local DBTERM_TEST_DUCKDB_LIBRARY
+test commands::duckdb::memory_tests::real_duckdb_cache_changes_files_without_redirecting_retained_transaction ... ignored, requires verified local DBTERM_TEST_DUCKDB_LIBRARY
+test commands::duckdb::memory_tests::real_duckdb_nested_formatting_preserves_transaction_and_reports_cost ... ignored, requires verified local DBTERM_TEST_DUCKDB_LIBRARY
+test commands::duckdb::memory_tests::real_duckdb_preserves_embedded_zero_text_and_recovers_after_budget_error ... ignored, requires verified local DBTERM_TEST_DUCKDB_LIBRARY
+test commands::duckdb::memory_tests::real_duckdb_preserves_empty_blob_and_null_as_distinct_values ... ignored, requires verified local DBTERM_TEST_DUCKDB_LIBRARY
+test commands::duckdb::memory_tests::real_duckdb_repeated_results_and_budget_failures_release_native_memory ... ignored, requires verified local DBTERM_TEST_DUCKDB_LIBRARY
+test commands::duckdb::memory_tests::real_duckdb_vector_scalar_parity_and_cross_chunk_validity ... ignored, requires verified local DBTERM_TEST_DUCKDB_LIBRARY
+test commands::duckdb::memory_tests::selected_duck_catalog_requires_exact_existing_name_and_safe_quoting ... ok
+test commands::duckdb::memory_tests::utf8_preflight_matches_lossy_output_without_allocating_a_copy ... ok
+test commands::mariadb_admin::tests::test_dbconncfg_from_config ... ok
+test commands::mariadb_admin::tests::mariadb_tunnel_credential_lookup_respects_auth_type ... ok
+test commands::mariadb_admin::tests::malformed_tunnel_config_fails_closed ... ok
+test commands::mariadb_admin::tests::test_dbconncfg_timeout ... ok
+test commands::mysql_migration_safety::tests::rejects_values_that_string_transport_cannot_preserve ... ok
+test commands::oracle::draft_target_tests::empty_schema_uses_unqualified_table ... ok
+test commands::db_extra::delete_atomicity_tests::sqlite_later_trigger_failure_restores_earlier_deleted_row ... ok
+test commands::oracle::tests::oracle_delete_malformed_keys_rejected_before_native_driver ... ok
+test commands::oracle::tests::oracle_readonly_insert_rejected_before_driver_lookup ... ok
+test commands::oracle::tests::oracle_readonly_query_policy_keeps_literals_and_rejects_locking ... ok
+test commands::oracle::tests::oracle_single_row_update_checks_before_commit_and_checks_rollback ... ok
+test commands::oracle::tests::selected_oracle_schema_is_quoted_as_one_identifier ... ok
+test commands::oracle::tests::test_index_info_creation ... ok
+test commands::db_tx::tests::empty_sqlite_transaction_result_preserves_column_names ... ok
+test commands::oracle::tests::test_oracle_column_info_creation ... ok
+test commands::oracle::tests::test_oracle_exec_result_creation ... ok
+test commands::oracle::tests::oracle_readonly_native_queries_reject_writes_before_driver_lookup ... ok
+test commands::oracle::tests::test_oracle_extra_connect_string_default ... ok
+test commands::oracle::tests::test_oracle_extra_connect_string_sid ... ok
+test commands::oracle::tests::test_oracle_extra_default ... ok
+test commands::oracle::tests::test_oracle_query_result_creation ... ok
+test commands::oracle::tests::test_oracle_table_info_creation ... ok
+test commands::pg_admin::tls_tests::pg_admin_tls_policy_matches_query_connector ... ignored, requires dedicated PostgreSQL17 TLS fixture DBTERM_TEST_PG_TLS_ROOT
+test commands::pg_admin::tls_tests::pg_admin_tunnel_agent_and_none_never_read_unused_credentials ... ok
+test commands::pg_admin::tls_tests::pg_admin_tunnel_credential_lookup_failure_is_not_empty_password ... ok
+test commands::pg_admin::tls_tests::pg_admin_tunnel_legacy_credential_wins_without_lookup ... ok
+test commands::pg_admin::tls_tests::pg_admin_tunnel_missing_saved_credential_allows_key_auth ... ok
+test commands::pg_admin::tls_tests::pg_admin_tunnel_restores_persisted_credential_at_construction ... ok
+test commands::pg_admin::tls_tests::pg_admin_malformed_extra_rejects_before_direct_connection ... ok
+test commands::pg_admin::tls_tests::pg_admin_unknown_tls_rejects_before_tunnel_or_network ... ok
+test commands::pg_cancel::tests::active_cancel_never_resumes_original_operation ... ok
+test commands::pg_admin::tls_tests::pg_admin_valid_minimal_extra_preserves_defaults_and_tunnel ... ok
+test commands::db_extra::optimistic_delete_tests::legacy_pk_only_delete_demonstrates_newer_row_would_be_lost ... ok
+test commands::db_extra::optimistic_delete_tests::sqlite_delete_refuses_row_changed_after_grid_read ... ok
+test commands::db_extra::draft_insert::tests::sqlite_variable_columns_keep_defaults_null_text_and_rollback_later_error ... ok
+test commands::pg_cancel::tests::completed_operation_does_not_send_cancellation ... ok
+test commands::pg_cancel::tests::completion_racing_active_cancel_is_not_reported_as_safe_retry ... ok
+test commands::pg_cancel_transport_tests::postgres_cancel_capability_cannot_cancel_other_session ... ignored, requires dedicated PostgreSQL17 TLS fixture DBTERM_TEST_PG_TLS_ROOT
+test commands::pg_cancel::tests::presignalled_cancel_never_starts_operation ... ok
+test commands::pg_cancel_transport_tests::postgres_cancel_prefer_must_not_downgrade_negotiated_tls ... ignored, requires dedicated PostgreSQL17 TLS fixture DBTERM_TEST_PG_TLS_ROOT
+test commands::oracle::tests::oracle_single_row_orchestration_rolls_back_real_multirow_update ... ok
+test commands::pg_cancel_transport_tests::postgres_encrypted_cancel_reports_server_query_cancelled ... ignored, requires dedicated PostgreSQL17 TLS fixture DBTERM_TEST_PG_TLS_ROOT
+test commands::pg_cancel::tests::failed_cancel_send_drops_operation_without_resuming_it ... ok
+test commands::pg_cancel_transport_tests::postgres_expired_cancel_capability_cannot_cancel_replacement_session ... ignored, requires dedicated PostgreSQL17 TLS fixture DBTERM_TEST_PG_TLS_ROOT
+test commands::pg_cancel_transport_tests::postgres_verify_full_cancel_uses_trusted_certificate ... ignored, requires dedicated PostgreSQL17 TLS fixture DBTERM_TEST_PG_TLS_ROOT
+test commands::pg_explain::tests::postgres_explain_analyze_executes_query_once_and_recovers_from_failure ... ignored, requires disposable DBTERM_TEST_PG_PORT
+test commands::pg_explain::tests::postgres_explain_analyze_refuses_persistent_sequence_side_effects ... ignored, requires disposable DBTERM_TEST_PG_PORT
+test commands::pg_cancel::tests::yielded_before_sql_is_never_resumed_after_cancel ... ok
+test commands::pg_explain::tests::postgres_explain_timeout_also_bounds_lock_waits ... ignored, requires disposable DBTERM_TEST_PG_PORT
+test commands::pg_explain::tests::postgres_explain_timeout_stops_backend_and_restores_session_settings ... ignored, requires disposable DBTERM_TEST_PG_PORT
+test commands::query::commit_disconnect_tests::real_mysql_commit_disconnect_reports_unknown_and_observer_checks_both_outcomes ... ignored, requires explicitly selected disposable local MySQL DBTERM_TEST_MYSQL_PORT
+test commands::query::optimistic_update_tests::mysql_grid_update_with_saved_latin1_database_preserves_batch ... ignored, requires disposable loopback MySQL DBTERM_TEST_MYSQL_PORT; no desktop application
+test commands::query::optimistic_update_tests::mysql_optimistic_update_rejects_stale_case_space_null_and_rolls_back_batch ... ignored, requires disposable local MySQL DBTERM_TEST_MYSQL_PORT
+test commands::query::optimistic_update_tests::postgres_optimistic_typed_updates_preserve_encoding_and_atomic_baselines ... ignored, requires disposable PostgreSQL DBTERM_TEST_PG_PORT
+test commands::query::tests::bulk_edit_pg_placeholders_preserve_nulls_and_primary_key_binding_order ... ok
+test commands::query::tests::automatic_limits_preserve_writes_and_survive_trailing_comments ... ok
+test commands::query::tests::automatic_limits_do_not_append_after_row_lock_clauses ... ok
+test commands::query::tests::cancel_registration_duplicate_must_not_cancel_existing_query ... ok
+test commands::query::tests::cancellation_is_owner_scoped_and_token_stays_reserved_until_request_exit ... ok
+test commands::query::tests::database_switch_sql_preserves_identifier_bytes ... ok
+test commands::query::tests::completed_query_lease_preserves_healthy_pool_reuse ... ok
+test commands::oracle::tests::oracle_native_mutation_commands_guard_before_driver ... ok
+test commands::query::tests::empty_sqlite_result_preserves_column_names ... ok
+test commands::query::tests::inline_edit_safety_rejects_nontransactional_views_and_invisible_triggers ... ok
+test commands::pty::tests::test_which_shell ... ok
+test commands::query::tests::cancellation_guard_unregisters_when_request_future_is_dropped ... ok
+test commands::query::tests::limit_detection_only_accepts_top_level_unquoted_clause ... ok
+test commands::query::tests::malformed_pg_options_reject_before_direct_connection ... ok
+test commands::query::tests::idle_pool_cache_reaps_registry_without_closing_active_sqlite_handles ... ok
+test commands::query::tests::malformed_db_options_never_fall_back_to_direct_or_writable ... ok
+test commands::query::tests::malformed_sqlite_options_cannot_discard_readonly ... ok
+test commands::query::tests::management_queries_are_query_results_but_not_auto_limited ... ok
+test commands::query::tests::mysql_session_script_split_ignores_comment_semicolons ... ok
+test commands::query::tests::mysql_session_script_split_keeps_quoted_semicolons ... ok
+test commands::query::tests::mysql_user_prepared_statement_commands_use_text_protocol ... ok
+test commands::query::tests::mysql_user_variables_ignore_strings_and_comments ... ok
+test commands::query::tests::old_cancellation_guard_cannot_remove_a_new_generation ... ok
+test commands::query::tests::postgres_ddl_batch_executes_and_rolls_back_as_one_request ... ignored, requires explicitly disposable DBTERM_TEST_PG_PORT and DBTERM_TEST_PG_DATA_DIR
+test commands::db_tx::tx_cancel_tests::queued_transaction_request_can_cancel_without_touching_active_transaction ... ok
+test commands::query::tests::query_config_rejects_nonobjects_and_preserves_valid_options ... ok
+test commands::query::tests::idle_pool_cache_reaps_mysql_pg_but_preserves_recent_entries_and_clones ... ok
+test commands::query::tests::query_tunnel_credential_lookup_is_fail_closed_and_auth_aware ... ok
+test commands::pty::tests::test_local_shell_nonexistent ... ok
+test commands::query::tests::real_mysql_archive_object_preserves_raw_view_ddl_and_refuses_unsafe_routine ... ignored, requires explicitly selected disposable DBTERM_TEST_MYSQL_URL
+test commands::query::tests::real_mysql_cancelled_query_does_not_reuse_its_interrupted_connection ... ignored, requires isolated MySQL at DBTERM_TEST_MYSQL_PORT
+test commands::query::tests::real_mysql_inline_edit_rejects_unsafe_tables_and_rolls_back_warnings ... ignored, requires isolated MySQL at DBTERM_TEST_MYSQL_URL
+test commands::query::tests::rollback_failure_never_claims_inline_edit_was_rolled_back ... ok
+test commands::query::tests::read_only_guard_rejects_dml_hidden_behind_cte_or_explain ... ok
+test commands::query::tests::select_queries_support_auto_row_limit_after_comments ... ok
+test commands::query::tests::rownum_identifier_only_suppresses_oracle_limit ... ok
+test commands::query::tests::read_only_init_sql_is_rejected_before_any_pool_reuse ... ok
+test commands::query::tests::selected_query_target_preserves_physical_database_for_schema_engines ... ok
+test commands::query::tests::pool_callback_owner_survives_cache_drop_and_active_checkout ... ok
+test commands::query::tests::selected_query_target_routes_database_engines_and_preserves_file_engines ... ok
+test commands::query::tests::interrupted_query_lease_never_returns_its_session_to_pool ... ok
+test commands::query::tests::sql_tls_policy_preserves_explicit_disable_and_requires_legacy_ssl ... ok
+test commands::query::optimistic_update_tests::sqlite_optimistic_update_rejects_newer_value_and_keeps_batch_atomic ... ok
+test commands::query::tests::selected_query_target_no_selection_is_unchanged_and_schemas_isolate_pool_identity ... ok
+test commands::query::tests::sqlserver_top_is_not_added_to_management_queries ... ok
+test commands::query::tests::sqlserver_limit_handles_multiline_select ... ok
+test commands::query::tests::sqlserver_cte_limit_targets_outer_select_and_preserves_sql ... ok
+test commands::query::tests::test_db_conn_cfg_default ... ok
+test commands::query::tests::test_db_conn_cfg_timeout_clamping ... ok
+test commands::query::tests::pool_identity_includes_full_config_and_credentials ... ok
+test commands::query::tests::test_db_conn_cfg_tunnel_password ... ok
+test commands::query::tests::test_invalidate_mysql_pool ... ok
+test commands::query::tests::test_invalidate_pg_pool ... ok
+test commands::query::tests::test_invalidate_sqlite_pool ... ok
+test commands::query::tests::sqlserver_limit_leaves_set_operations_and_cte_writes_unchanged ... ok
+test commands::query::tests::test_mysql_pwd_ext_empty_password ... ok
+test commands::query::tests::test_mysql_pwd_ext_non_empty_password ... ok
+test commands::query::tests::test_tag_sql_basic ... ok
+test commands::query::tests::test_validate_cancel_token_invalid ... ok
+test commands::query::tests::test_validate_cancel_token_valid ... ok
+test commands::query_result_budget::tests::includes_utf8_and_null_cell_overhead_in_memory_budget ... ok
+test commands::query_result_budget::tests::rejects_first_row_beyond_limit ... ok
+test commands::sqlite_admin::alter_execute::reader::tests::delimiter_and_dollar_body_preserve_statement_text ... ok
+test commands::sqlite_admin::alter_execute::reader::tests::mysql_execution_preserves_version_comments_delimiters_modes_and_stops_on_error ... ignored, requires disposable local MySQL DBTERM_TEST_MYSQL_PORT
+test commands::sqlite_admin::alter_execute::reader::tests::incomplete_tokens_and_midstatement_directives_reject ... ok
+test commands::sqlite_admin::alter_execute::reader::tests::literals_and_executable_comments_are_preserved ... ok
+test commands::sqlite_admin::alter_execute::reader::tests::postgres_session_escape_mode_and_sqlite_quoted_identifier_are_respected ... ok
+test commands::sqlite_admin::alter_execute::reader::tests::sql_mode_changes_apply_before_parsing_following_statement ... ok
+test commands::query::tests::unknown_sql_tls_modes_fail_before_network_and_pool_reuse ... ok
+test commands::sqlite_admin::db_compare_boundary_tests::equal_counts_report_never_claims_data_equality_or_generates_sync_sql ... ok
+test commands::sqlite_admin::alter_execute::reader::tests::sqlite_trigger_body_is_one_statement_and_literals_survive_execution ... ok
+test commands::query::tests::sqlite_inline_edit_multiple_matches_rolls_back_rows_and_trigger_writes ... ok
+test commands::pty::tests::test_list_path_commands ... ok
+test commands::query::tests::sqlite_bulk_edit_later_failure_rolls_back_earlier_primary_key_change ... ok
+test commands::sqlite_admin::db_compare_boundary_tests::real_sqlite_compare_keeps_legal_sqlite_prefix_names ... ok
+test commands::query::tests::sqlite_pool_never_reuses_different_file_with_same_connection_id ... ok
+test commands::sqlite_admin::db_compare_boundary_tests::real_sqlite_admin_connection_enforces_every_readonly_policy ... ok
+test commands::sqlite_admin::db_compare_boundary_tests::real_sqlite_equal_count_different_values_is_explicitly_unchecked ... ok
+test commands::sqlite_admin::export_safety_tests::sqlite_dump_refuses_contentless_fts_instead_of_exporting_empty_search_index ... ok
+test commands::sqlite_admin::export_safety_tests::sqlite_mask_output_quotes_cannot_inject_sql_and_preserve_null ... ok
+test commands::sqlite_admin::db_compare_boundary_tests::real_sqlite_dump_and_rescue_keep_legal_sqlite_prefix_table ... ok
+test commands::sqlite_admin::sqlite_alter_atomicity_tests::production_column_changes_preserve_constraints_on_later_ddl_failure ... ok
+test commands::sqlite_admin::sqlite_alter_atomicity_tests::rebuild_foreign_key_violation_rolls_back_all_changes ... ok
+test commands::sqlite_admin::db_compare_boundary_tests::real_sqlite_dump_and_rescue_never_overwrite_source_or_existing_output ... ok
+test commands::sqlite_admin::sqlite_alter_atomicity_tests::rebuild_preserves_trigger_body_semicolons_and_multiline_text ... ok
+test commands::sqlite_admin::sqlite_alter_atomicity_tests::simple_alter_rejects_transaction_control_injected_through_column_definition ... ok
+test commands::sqlite_admin::sqlite_alter_atomicity_tests::simple_alter_later_error_rolls_back_first_column_and_preserves_literal ... ok
+test commands::sqlite_admin::sqlite_alter_plan::tests::changed_existing_attributes_require_rebuild_instead_of_silent_success ... ok
+test commands::sqlite_admin::sqlite_alter_plan::tests::existing_advanced_constraints_are_safe_when_metadata_is_unchanged ... ok
+test commands::sqlite_admin::sqlite_alter_plan::tests::incomplete_original_column_payload_and_new_primary_key_reject ... ok
+test commands::sqlite_admin::db_compare_boundary_tests::real_sqlite_restore_keeps_open_connection_on_same_database ... ok
+test commands::sqlserver::authorization_tests::native_admin_loader_refuses_read_only_before_credentials ... ok
+test commands::sqlserver::authorization_tests::native_connection_loader_refuses_another_engine_before_credentials ... ok
+test commands::sqlserver::authorization_tests::native_explain_sql_authorization_preserves_reads_and_denies_mutating_batches ... ok
+test commands::sqlserver::authorization_tests::native_query_dispatch_refuses_read_only_mutation_before_credentials ... ok
+test commands::sqlserver::authorization_tests::native_update_refuses_read_only_before_credentials_or_connection ... ok
+test commands::sqlserver::backup_target::tests::backup_refuses_missing_ambiguous_or_unreadable_target ... ok
+test commands::sqlserver::backup_target::tests::backup_unique_nondbo_target_preserves_every_identifier_part ... ok
+test commands::sqlserver::ddl_columns::tests::collation_named_default_and_unicode_text_are_preserved ... ok
+test commands::sqlserver::ddl_columns::tests::computed_expression_is_preserved_instead_of_materialized_as_ordinary_column ... ok
+test commands::sqlserver::ddl_columns::tests::identity_replication_and_sparse_rowguid_attributes_are_not_invented_or_lost ... ok
+test commands::sqlserver::ddl_columns::tests::nonpersisted_computed_inferred_nullability_does_not_add_invalid_not_null ... ok
+test commands::sqlserver::ddl_columns::tests::user_type_keeps_schema_and_case_and_does_not_append_underlying_length ... ok
+test commands::sqlserver::ddl_constraints::tests::check_expression_unicode_and_disabled_trust_are_preserved ... ok
+test commands::sqlite_admin::export_safety_tests::sqlite_export_roundtrips_generated_columns_and_trigger_effects_once ... ok
+test commands::sqlserver::ddl_constraints::tests::composite_foreign_key_keeps_mapping_actions_and_state ... ok
+test commands::sqlserver::ddl_constraints::tests::unknown_reference_action_is_not_converted_to_no_action ... ok
+test commands::sqlserver::ddl_indexes::tests::unique_constraint_is_not_converted_to_plain_unique_index ... ok
+test commands::sqlserver::ddl_indexes::tests::named_primary_key_keeps_nonclustered_descending_and_disabled_state ... ok
+test commands::sqlserver::ddl_indexes::tests::unique_filtered_covering_index_preserves_order_direction_and_options ... ok
+test commands::sqlserver::ddl_indexes::tests::unreadable_filter_or_key_or_partition_is_not_silently_omitted ... ok
+test commands::sqlserver::pool_identity_tests::column_metadata_refuses_missing_or_ambiguous_schema_instead_of_mixing_rows ... ok
+test commands::sqlserver::pool_identity_tests::selected_database_target_requires_one_actual_table_schema ... ok
+test commands::sqlserver::pool_identity_tests::sqlserver_single_update_does_not_commit_multiple_rows_or_retry_lost_commit ... ok
+test commands::sqlserver::pool_identity_tests::sqlserver_ui_security_fields_and_safe_defaults_are_honored ... ok
+test commands::ssh_config::tests::test_delete_nonexistent_host ... ok
+test commands::sqlserver::pool_identity_tests::same_id_changed_endpoint_or_credentials_never_matches ... ok
+test commands::ssh_config::tests::test_list_known_hosts ... ok
+test commands::ssh_keys::tests::test_validate_in_ssh_dir_traversal ... ok
+test commands::ssh_keys::tests::test_validate_pub_key_path_nonexistent ... ok
+test commands::ssh_keys::tests::test_list_ssh_keys ... ok
+test db_tunnel::tests::build_locks_reuse_live_lock_and_release_unused_entries ... ok
+test db_tunnel::tests::idle_tunnel_cache_eviction_requires_no_external_or_cached_pool_owner ... ok
+test db_tunnel::tests::shared_tunnel_identity_tracks_endpoint_and_credentials ... ok
+test db_tunnel::tests::test_build_locks_initialization ... ok
+test db_tunnel::tests::shared_tunnel_identity_tracks_key_rotation_and_rejects_unreadable_key ... ok
+test db_tunnel::tests::test_db_tunnel_cfg_agent_auth ... ok
+test db_tunnel::tests::test_db_tunnel_cfg_clone ... ok
+test db_tunnel::tests::test_db_tunnel_cfg_construction ... ok
+test db_tunnel::tests::test_db_tunnel_cfg_default ... ok
+test db_tunnel::tests::test_db_tunnel_cfg_effective_port_custom ... ok
+test db_tunnel::tests::test_db_tunnel_cfg_effective_port_default ... ok
+test db_tunnel::tests::test_db_tunnel_cfg_high_port ... ok
+test db_tunnel::tests::test_db_tunnel_cfg_key_auth ... ok
+test db_tunnel::tests::test_db_tunnel_cfg_mfa_auth ... ok
+test db_tunnel::tests::test_db_tunnel_cfg_standard_port ... ok
+test db_tunnel::tests::test_pool_initialization ... ok
+test db_tunnel::tests::test_db_tunnel_cfg_various_auth_types ... ok
+test keychain::tests::test_clear_all ... ok
+test keychain::tests::test_delete_nonexistent_password ... ok
+test keychain::tests::test_empty_password ... ok
+test keychain::tests::test_file_permissions ... ok
+test keychain::tests::test_get_nonexistent_password ... ok
+test keychain::tests::test_multiple_connections ... ok
+test keychain::tests::test_password_delete ... ok
+test keychain::tests::test_password_set_and_get ... ok
+test keychain::tests::test_password_update ... ok
+test keychain::tests::test_special_characters_in_password ... ok
+test keychain::tests::test_ssh_tunnel_password ... ok
+test logging::tests::test_config_with_app_dir ... ok
+test keychain::tests::test_unicode_password ... ok
+test logging::tests::test_logging_config_default ... ok
+test logging::tests::test_log_directory_creation ... ok
+test models::tests::test_column_info_nullable ... ok
+test models::tests::test_column_info_primary_key ... ok
+test models::tests::test_conn_config_serde ... ok
+test models::tests::test_conn_type_default_ports ... ok
+test commands::sqlite_admin::sqlite_alter_plan::tests::type_change_preserves_storage_or_rolls_back_before_drop ... ok
+test models::tests::test_disk_entry_usage ... ok
+test models::tests::test_conn_type_serde_camelcase ... ok
+test models::tests::test_file_entry_directory ... ok
+test models::tests::test_query_result_defaults ... ok
+test models::tests::test_table_info_view_flag ... ok
+test models::tests::test_routine_info_types ... ok
+test models::tests::test_test_result_serialization ... ok
+test pool_manager::tests::test_pool_manager_clear ... ok
+test pool_manager::tests::test_pool_manager_concurrent_access ... ok
+test commands::sqlite_admin::sqlite_alter_plan::tests::rebuild_retains_autoincrement_high_watermark ... ok
+test pool_manager::tests::test_pool_manager_get_or_create ... ok
+test commands::sqlite_admin::sqlite_alter_plan::tests::rebuild_default_retains_check_unique_fk_collation_and_autoincrement ... ok
+test pool_manager::tests::test_pool_manager_keys ... ok
+test commands::sqlite_admin::export_safety_tests::sqlite_export_roundtrips_fts_rowids_sequence_and_exact_storage ... ok
+test pool_manager::tests::test_pool_manager_remove ... ok
+test pool_manager::tests::test_pool_manager_stats ... ok
+test pool_manager::tests::test_pool_manager_stats_empty ... ok
+test pool_manager::tests::test_pool_manager_degraded_connections ... ok
+test pool_manager::tests::test_pool_manager_health_check ... ok
+test pool_manager::tests::test_pool_manager_avg_age_calculation ... ok
+test commands::db_extra::draft_insert::tests::drafts_reject_bad_shape_duplicates_payload_and_quote_native_data ... ok
+test commands::sqlite_admin::export_safety_tests::sqlite_export_all_tables_share_one_snapshot_during_concurrent_commit ... ok
+test pool_manager::tests::test_pool_manager_cleanup_idle ... ok
+test pool_manager::tests::test_pool_manager_max_lifetime ... ok
+test ssh::exec_integration_tests::loopback_upload_no_response_is_bounded ... ok
+test ssh::exec_integration_tests::local_fallback_upload_failure_preserves_original_file ... ok
+test commands::query::tests::bounded_sqlite_results_reject_overflow_without_committing_transaction ... ok
+test commands::sqlite_admin::export_safety_tests::sqlite_rescue_streams_large_table_and_masked_dump_preserves_sql_structure ... ok
+test ssh::exec_integration_tests::upload_source_hash_uses_bounded_reads ... ok
+test ssh::sftp::tests::cached_lookup_releases_pool_lock_before_invalidation ... ok
+test ssh::sftp::tests::cancellation_before_transfer_registration_is_not_lost ... ok
+test ssh::sftp::tests::directory_stage_does_not_merge_or_overwrite_existing_destination ... ok
+test ssh::sftp::tests::failed_or_cancelled_download_keeps_old_bytes ... ok
+test ssh::sftp::tests::local_download_stage_preserves_original_until_commit ... ok
+test ssh::sftp::tests::recognizes_closed_sftp_session_errors_as_retryable ... ok
+test ssh::sftp::tests::stale_failure_does_not_evict_a_reconnected_session ... ok
+test storage::tests::test_atomic_write ... ok
+test storage::tests::test_clear ... ok
+test storage::tests::test_delete_connection ... ok
+test storage::tests::test_delete_nonexistent ... ok
+test storage::tests::test_file_permissions ... ok
+test storage::tests::test_load_empty ... ok
+test storage::tests::test_persistence ... ok
+test storage::tests::test_storage_new ... ok
+test storage::tests::test_upsert_multiple_connections ... ok
+test storage::tests::test_upsert_new_connection ... ok
+test storage::tests::test_upsert_update_existing ... ok
+test tester::connection_policy_audit_tests::agent_authentication_has_no_credential_dependency ... ok
+test tester::connection_policy_audit_tests::malformed_policy_objects_reject_without_losing_valid_defaults ... ok
+test tester::connection_policy_audit_tests::malformed_tunnel_policy_never_becomes_direct_connection ... ok
+test tester::connection_policy_audit_tests::saved_tunnel_password_is_restored_and_lookup_failures_reject ... ok
+test tester::tests::test_db_extra_cfg_defaults ... ok
+test tester::tests::test_db_extra_cfg_ssh_tunnel ... ok
+test tester::tests::test_db_extra_cfg_ssl_config ... ok
+test tester::tests::test_expand_home_relative_path ... ok
+test tester::tests::test_expand_home_with_tilde ... ok
+test tester::tests::test_expand_home_without_tilde ... ok
+test tester::tests::tester_sql_tls_unknown_mode_fails_before_network ... ok
+test tracing_utils::tests::test_timer_failure ... ok
+test tracing_utils::tests::test_timer_success ... ok
+test tracing_utils::tests::test_traced_result_err ... ok
+test tracing_utils::tests::test_traced_result_ok ... ok
+test ssh::exec_integration_tests::loopback_upload_requires_confirmed_zero_status_after_stdout_eof ... ok
+test ssh::exec_integration_tests::loopback_upload_real_staging_preserves_target_on_changed_source ... ok
+test ssh::exec_integration_tests::local_fallback_upload_validates_integrity_and_preserves_metadata ... ok
+test ssh::sftp::integration_tests::loopback_sftp_recovers_closed_channel_and_changed_configuration ... ok
+test ssh::exec_integration_tests::loopback_exec_authentication_stall_is_bounded ... ok
+test ssh::exec_integration_tests::loopback_exec_channel_open_stall_is_bounded ... ok
+test ssh::exec_integration_tests::loopback_upload_authentication_stall_is_bounded ... ok
+test ssh::exec_integration_tests::loopback_upload_channel_open_stall_is_bounded ... ok
+test commands::sqlite_admin::db_compare_boundary_tests::real_sqlite_backup_restore_failure_preserves_database_and_output_publication ... ok
+test ssh::exec_integration_tests::loopback_exec_requires_confirmed_zero_status_after_stdout_eof ... ok
+
+test result: ok. 414 passed; 0 failed; 70 ignored; 0 measured; 0 filtered out; finished in 6.47s
+

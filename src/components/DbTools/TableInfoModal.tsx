@@ -26,6 +26,7 @@ interface Props {
   schema: string
   name: string
   isView?: boolean
+  ssSchema?: string
   /** 预加载的元信息（对象列表页已有，直接传入免去再查询） */
   meta?: TableMetaLite
   onClose: () => void
@@ -35,7 +36,7 @@ interface Props {
  * 表信息小弹窗：展示行数 / 数据·索引·总占用大小 / 引擎 / 编码 / 注释等，可一键复制。
  * 取代原「快捷 SQL ▸ 统计行数」，更直观且不跳查询页。
  */
-export default function TableInfoModal({ connectionId, connType, schema, name, isView, meta, onClose }: Props) {
+export default function TableInfoModal({ connectionId, connType, schema, name, ssSchema, isView, meta, onClose }: Props) {
   const [data, setData] = useState<TableMetaLite | null>(meta ?? null)
   const [loading, setLoading] = useState(!meta)
   const [error, setError] = useState('')
@@ -48,13 +49,19 @@ export default function TableInfoModal({ connectionId, connType, schema, name, i
   }, [onClose])
 
   useEffect(() => {
+    setData(meta ?? null)
+    setError('')
+    setCopied(false)
+    setLoading(!meta)
     if (meta) return
     let alive = true
     ;(async () => {
       try {
         const { invoke } = await import('@tauri-apps/api/core')
-        const list = await invoke<TableMetaLite[]>('list_tables_meta', { id: connectionId, schema })
-        const found = list.find(t => t.name === name)
+        const list = await invoke<TableMetaLite[]>('list_tables_meta', { id: connectionId, schema, ssSchema })
+        const matches = list.filter(t => t.name === name)
+        if (matches.length > 1) throw new Error('存在同名对象，无法唯一确定表信息')
+        const found = matches[0]
         if (!alive) return
         if (found) setData(found)
         else setError('未找到该对象的元信息')
@@ -65,7 +72,7 @@ export default function TableInfoModal({ connectionId, connType, schema, name, i
       }
     })()
     return () => { alive = false }
-  }, [connectionId, schema, name, meta])
+  }, [connectionId, schema, name, ssSchema, meta])
 
   const total = data ? data.dataLength + data.indexLength : 0
   // 这些方言的 list_tables_meta 会返回真实(或近真实)的存储大小（Oracle 索引大小暂为 0）
@@ -95,7 +102,7 @@ export default function TableInfoModal({ connectionId, connType, schema, name, i
   }
 
   function doCopy() {
-    const text = [`${schema ? schema + '.' : ''}${name}`, ...rows.map(r => `${r.label}：${r.value}`)].join('\n')
+    const text = [`${schema ? schema + '.' : ''}${ssSchema ? ssSchema + '.' : ''}${name}`, ...rows.map(r => `${r.label}：${r.value}`)].join('\n')
     navigator.clipboard.writeText(text).then(() => {
       setCopied(true)
       toast.success('表信息已复制')
@@ -108,7 +115,7 @@ export default function TableInfoModal({ connectionId, connType, schema, name, i
       <div className="dbtool-modal" onMouseDown={(e) => e.stopPropagation()} style={{ width: 380 }}>
         <div className="dbtool-modal__header">
           <Info size={15} color="var(--accent)" />
-          <span className="dbtool-modal__title">表信息 · {name}</span>
+          <span className="dbtool-modal__title">表信息 · {ssSchema ? ssSchema + '.' : ''}{name}</span>
           <button className="dbtool-modal__close" onClick={onClose}><X size={15} /></button>
         </div>
         <div className="dbtool-modal__body">
@@ -127,7 +134,7 @@ export default function TableInfoModal({ connectionId, connType, schema, name, i
         </div>
         <div className="dbtool-modal__footer">
           <button className="dbtool-btn dbtool-btn--cancel" onClick={onClose}>关闭</button>
-          <button className="dbtool-btn dbtool-btn--primary" onClick={doCopy} disabled={!data}>
+          <button className="dbtool-btn dbtool-btn--primary" onClick={doCopy} disabled={loading || !!error || !data}>
             {copied ? <Check size={13} /> : <Copy size={13} />}复制
           </button>
         </div>

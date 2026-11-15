@@ -5,6 +5,7 @@ import { useObjectDraftStore, type ObjType } from '../stores/objectDraftStore'
 import { toast } from '../stores/toastStore'
 import { isMysqlFamily } from './sqlDialect'
 import type { ConnType } from '../types'
+import { preserveObjectDdl } from './objectDdlSafety'
 
 const OBJ_LABEL: Record<ObjType, string> = { view: '视图', function: '函数', procedure: '存储过程' }
 
@@ -37,44 +38,22 @@ export async function buildNewViewDdl(connType: ConnType, name: string): Promise
   return `CREATE OR REPLACE VIEW ${qid(connType, name)} AS\n${formatted}`
 }
 
-/** SHOW CREATE VIEW 的原始 DDL → 可编辑/可读的 CREATE OR REPLACE VIEW 形式（去 ALGORITHM/DEFINER/SQL SECURITY 噪声、去当前库限定、格式化 SELECT） */
+/** 服务器返回完整 CREATE 时原样编辑；仅 SELECT 定义补充对象声明 */
 export async function prettyViewDdl(raw: string, connType: ConnType, schema: string, name: string): Promise<string> {
   if (!raw) return ''
-  // 仅当 raw 是完整的 CREATE … VIEW … AS … 时（MySQL SHOW CREATE VIEW 形态），剥掉 AS 之前的头部；
-  // PG/Oracle 的视图定义往往只有 SELECT 主体，此时整体当主体，避免误把 SELECT 内的列别名 ` AS ` 当分隔符
-  const m = /CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM\s*=\s*\S+\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:SQL\s+SECURITY\s+\S+\s+)?VIEW\b[\s\S]*?\sAS\s/i.exec(raw)
-  const body = m ? raw.slice(m.index + m[0].length) : raw
-  let select = body.trim().replace(/;\s*$/, '')
-  // 去掉「当前库.」限定（已在该库下，参考 Navicat 省略）：`tttt`.`test` → `test`
-  if (schema) {
-    const q = qid(connType, schema).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    select = select.replace(new RegExp(q + '\\.', 'g'), '')
-  }
-  const formatted = await fmt(select, connType)
-  return `CREATE OR REPLACE VIEW ${qid(connType, name)} AS\n${formatted}`
+  if (isMysqlFamily(connType) || /^\s*CREATE\b/i.test(raw)) return preserveObjectDdl(raw)
+  // Engines returning only a SELECT body need a declaration; keep that body unchanged.
+  const ref = schema ? qid(connType, schema) + '.' + qid(connType, name) : qid(connType, name)
+  return 'CREATE OR REPLACE VIEW ' + ref + ' AS\n' + raw
+
 }
 
-/** 去掉 DEFINER 噪声并把头部子句分行（函数体由服务器原样保留，不用 sql-formatter 以免压成一行/改写类型） */
+/** 服务器对象定义原样保留，包括 DEFINER、权限语义和函数体。 */
 export async function prettyRoutineDdl(raw: string, _connType: ConnType): Promise<string> {
-  if (!raw) return ''
-  const s = raw
-    .replace(/\sDEFINER\s*=\s*`[^`]*`@`[^`]*`/i, '')
-    .replace(/\sDEFINER\s*=\s*\S+@\S+/i, '')
-    .trim()
-  // 仅对 BEGIN 之前的「头部」分行；函数体（BEGIN…END）MySQL 会原样存储，保持其换行
-  const bi = s.search(/\bBEGIN\b/i)
-  const head = (bi >= 0 ? s.slice(0, bi) : s)
-    .replace(/\)\s*RETURNS\s+/i, ')\nRETURNS ')
-    .replace(/\s+(NOT\s+DETERMINISTIC|DETERMINISTIC)\b/gi, '\n$1')
-    .replace(/\s+(CONTAINS SQL|NO SQL|READS SQL DATA|MODIFIES SQL DATA)\b/gi, '\n$1')
-    .replace(/\s+(SQL SECURITY (?:DEFINER|INVOKER))\b/gi, '\n$1')
-    .replace(/\s+(LANGUAGE SQL)\b/gi, '\n$1')
-    .replace(/\s+(COMMENT\s)/gi, '\n$1')
-    .trim()
-  return bi >= 0 ? `${head}\n${s.slice(bi)}` : head
+  return preserveObjectDdl(raw)
 }
 
-/** 打开「编辑」对象设计页：拉取现有定义 → 清洗 → 以 edit 模式填入编辑器 */
+/** 打开「编辑」对象设计页：拉取现有定义 → 原样以 edit 模式填入编辑器 */
 export async function openEditObject(p: {
   connectionId: string; connType: ConnType; schema: string; objType: ObjType; name: string
 }): Promise<void> {

@@ -1,0 +1,20 @@
+node:internal/modules/run_main:107
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: new index must target selected schema
++ actual - expected
+
++ 'CREATE INDEX [ix_old] ON [selected_db]..[same] ([old]);'
+- "CREATE INDEX [ix_old] ON [selected_db].[ops'.]]中文].[same] ([old]);"
+
+    at file:///Users/Nico/workSpace/claude/DBterm/scripts/acceptance/sqlserver-structure-edit.mjs:19:9 {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: 'CREATE INDEX [ix_old] ON [selected_db]..[same] ([old]);',
+  expected: "CREATE INDEX [ix_old] ON [selected_db].[ops'.]]中文].[same] ([old]);",
+  operator: 'strictEqual',
+  diff: 'simple'
+}
+
+Node.js v26.8.2

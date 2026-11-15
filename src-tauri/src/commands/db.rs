@@ -14,7 +14,7 @@ pub fn list_connections(storage: State<'_, StorageState>) -> Result<Vec<ConnConf
     storage.lock().unwrap_or_else(std::sync::PoisonError::into_inner).load()
 }
 #[tauri::command]
-pub fn save_connection(
+pub async fn save_connection(
     mut config: ConnConfig,
     password: Option<String>,
     storage: State<'_, StorageState>,
@@ -47,24 +47,33 @@ pub fn save_connection(
         crate::ssh::stash_db_tunnel_secret(&mut config)?;
     }
 
-    // 配置变更后失效各引擎连接池，使新主机/密码/只读等配置生效
-    crate::commands::query::invalidate_mysql_pool(&config.id);
-    crate::commands::query::invalidate_pg_pool(&config.id);
-    crate::commands::query::invalidate_sqlite_pool(&config.id);
-    crate::commands::clickhouse_tcp::invalidate(&config.id);
+    // Persist first. A failed write must not report the new endpoint while the
+    // next load still returns the old configuration. Do not hold storage over await.
+    let saved = {
+        storage.lock().unwrap_or_else(std::sync::PoisonError::into_inner).upsert(config)?
+    };
+    crate::db_tunnel::DbTunnel::invalidate_shared(&saved.id).await;
 
-    storage.lock().unwrap_or_else(std::sync::PoisonError::into_inner).upsert(config)
+    // 配置变更后失效各引擎连接池，使新主机/密码/只读等配置生效
+    crate::commands::query::invalidate_mysql_pool(&saved.id);
+    crate::commands::query::invalidate_pg_pool(&saved.id);
+    crate::commands::query::invalidate_sqlite_pool(&saved.id);
+    crate::commands::clickhouse_tcp::invalidate(&saved.id);
+
+    Ok(saved)
 }
 
 #[tauri::command]
-pub fn delete_connection(id: String, storage: State<'_, StorageState>) -> Result<(), String> {
+pub async fn delete_connection(id: String, storage: State<'_, StorageState>) -> Result<(), String> {
     keychain::delete_password(&id)?;
     crate::ssh::purge_secrets(&id);   // 一并清理代理/跳板密码 keychain 条目
+    { storage.lock().unwrap_or_else(std::sync::PoisonError::into_inner).delete(&id)?; }
+    crate::db_tunnel::DbTunnel::invalidate_shared(&id).await;
     crate::commands::query::invalidate_mysql_pool(&id);
     crate::commands::query::invalidate_pg_pool(&id);
     crate::commands::query::invalidate_sqlite_pool(&id);
     crate::commands::clickhouse_tcp::invalidate(&id);
-    storage.lock().unwrap_or_else(std::sync::PoisonError::into_inner).delete(&id)
+    Ok(())
 }
 
 #[tauri::command]

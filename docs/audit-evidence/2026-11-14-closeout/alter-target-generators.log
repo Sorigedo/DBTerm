@@ -1,0 +1,2 @@
+Re-optimizing dependencies because vite config has changed
+PASS actual ALTER builders: PostgreSQL combined rename/type/null/default, default removal, unchanged definition and quoted identifiers/comments; SQL Server rename database qualification and Unicode literal escaping. No SQL Server service execution in this script.

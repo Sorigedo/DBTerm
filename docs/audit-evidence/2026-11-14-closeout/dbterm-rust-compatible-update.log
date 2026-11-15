@@ -1,0 +1,18 @@
+    Updating crates.io index
+     Locking 14 packages to latest compatible versions
+    Updating anyhow v1.0.102 -> v1.0.104
+    Removing concurrent-queue v2.5.0
+    Updating crossbeam-epoch v0.9.18 -> v0.9.21
+    Updating event-listener v5.4.1 -> v5.4.2
+    Updating hickory-net v0.26.1 -> v0.26.3
+    Updating hickory-proto v0.26.1 -> v0.26.3
+    Updating hickory-resolver v0.26.1 -> v0.26.3
+    Updating quinn-proto v0.11.14 -> v0.11.19
+    Updating quinn-udp v0.5.14 -> v0.5.16
+      Adding rand_pcg v0.10.2
+    Updating rustix v1.1.4 -> v1.1.6
+    Updating rustls v0.23.40 -> v0.23.46
+    Updating rustls-webpki v0.103.13 -> v0.103.17
+    Updating tokio v1.52.3 -> v1.54.1
+    Updating webpki-roots v1.0.7 -> v1.0.12
+note: pass `--verbose` to see 235 unchanged dependencies behind latest

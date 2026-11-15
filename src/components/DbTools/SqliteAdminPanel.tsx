@@ -1,6 +1,6 @@
 ﻿// SQLite 维护诊断面板（S0.4 + S2.1–S2.6）
 // 仅对 SQLite 连接显示，与 SQL 侧通用工具面板并列
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { Loader2, RefreshCw, CheckCircle2, XCircle, AlertTriangle, X } from 'lucide-react'
 import ConfirmDialog from '../shared/ConfirmDialog'
@@ -10,6 +10,7 @@ import { useCapacityStore } from '../../stores/capacityStore'
 import { useShortcuts } from '../../utils/useShortcuts'
 import { toast } from '../../stores/toastStore'
 import SearchableSelect from './SearchableSelect'
+import { createDiffRequestOwner } from './dataDiffState'
 import { queueBackgroundExport } from '../../utils/exportTasks'
 
 // Tauri WebView2 不支持浏览器 blob 下载，统一走保存对话框 + 后端写文件
@@ -135,7 +136,18 @@ export default function SqliteAdminPanel({ connectionId, onClose }: Props) {
   const [confirmRescue, setConfirmRescue] = useState(false)
   // db diff tab
   const [diffRightId, setDiffRightId] = useState('')
-  const [diffResult, setDiffResult] = useState<DbDiffResult | null>(null)
+  const [storedResult, setDiffResult] = useState<DbDiffResult | null>(null)
+  const [diffOwner] = useState(() => createDiffRequestOwner())
+  const [diffResultKey, setDiffResultKey] = useState<string | null>(null)
+  const diffSelectionKey = JSON.stringify([connectionId, diffRightId.trim()])
+  const diffSelectionRef = useRef(diffSelectionKey)
+  diffSelectionRef.current = diffSelectionKey
+  const diffResult = diffResultKey === diffSelectionKey ? storedResult : null
+  useEffect(() => {
+    diffOwner.invalidate()
+    setDiffResult(null); setDiffErr('')
+    return () => { diffOwner.invalidate() }
+  }, [diffOwner, diffSelectionKey])
   const [diffLoading, setDiffLoading] = useState(false)
   const [diffErr, setDiffErr] = useState('')
   const [diffScriptExpanded, setDiffScriptExpanded] = useState(false)
@@ -327,13 +339,16 @@ export default function SqliteAdminPanel({ connectionId, onClose }: Props) {
 
   const runDbDiff = useCallback(async () => {
     if (!diffRightId.trim()) return
+    const epoch = diffOwner.begin()
+    if (epoch === null) return
+    const current = () => diffOwner.current(epoch) && diffSelectionRef.current === diffSelectionKey
     setDiffLoading(true); setDiffErr(''); setDiffResult(null)
     try {
       const r = await invoke<DbDiffResult>('sqlite_db_diff', { leftId: connectionId, rightId: diffRightId.trim(), tables: null })
-      setDiffResult(r)
-    } catch (e) { setDiffErr(String(e)) }
-    finally { setDiffLoading(false) }
-  }, [connectionId, diffRightId])
+      if (current()) { setDiffResult(r); setDiffResultKey(diffSelectionKey) }
+    } catch (e) { if (current()) setDiffErr(String(e)) }
+    finally { if (diffOwner.finish(epoch)) setDiffLoading(false) }
+  }, [connectionId, diffRightId, diffOwner, diffSelectionKey])
 
   const doRescue = useCallback(async () => {
     if (!rescuePath.trim()) return
@@ -1241,7 +1256,7 @@ export default function SqliteAdminPanel({ connectionId, onClose }: Props) {
         <div style={{ flex: 1, overflowY: 'auto', padding: 12 }}>
           <div style={{ marginBottom: 12 }}>
             <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>
-              当前连接为左库（基准），输入右库连接 ID 进行比较（生成 INSERT/DELETE 脚本以使左库与右库一致）
+              当前连接为左库。比较 sqlite_master 中用户表、视图、显式索引和触发器的原始 DDL；数据仅比行数，不生成同步脚本。双方读取快照独立，不代表同一业务时点。
             </div>
             <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
               <input value={diffRightId} onChange={e => setDiffRightId(e.target.value)} placeholder="右库连接 ID（从连接面板复制）"
@@ -1260,7 +1275,7 @@ export default function SqliteAdminPanel({ connectionId, onClose }: Props) {
                   DDL 差异（{diffResult.ddlDiff.length} 项）
                 </div>
                 {diffResult.ddlDiff.length === 0
-                  ? <div style={{ fontSize: 12, color: 'var(--success)' }}>DDL 完全一致</div>
+                  ? <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>未发现用户对象原始 DDL 差异；数据及 PRAGMA、内部对象未验证</div>
                   : (
                     <table className="redis-hash-table">
                       <thead><tr><th style={{ width: 70 }}>类型</th><th>对象名</th><th style={{ width: 60 }}>操作</th></tr></thead>
@@ -1286,7 +1301,7 @@ export default function SqliteAdminPanel({ connectionId, onClose }: Props) {
               <div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
                   <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)' }}>
-                    数据同步脚本（约 {diffResult.dataChanges.toLocaleString()} 行变更）
+                    行数报告（行数差绝对值合计 {diffResult.dataChanges.toLocaleString()}；内容未校验）
                   </span>
                   <button className="dbtool-btn dbtool-btn--ghost" style={{ padding: '2px 8px', fontSize: 11 }}
                     onClick={() => setDiffScriptExpanded(e => !e)}>

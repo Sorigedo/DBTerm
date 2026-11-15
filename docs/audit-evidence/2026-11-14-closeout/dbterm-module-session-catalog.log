@@ -1,0 +1,2 @@
+PASS module archive captures original ANSI_NULLS/QUOTED_IDENTIFIER flags; raw DDL remains separate.
+PASS actual production module SELECT identity/left-join/session flags; SQLite synthetic catalog only.

@@ -1,0 +1,15 @@
+node:internal/modules/run_main:107
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: incomplete summary must not silently change or omit existing attribute edits: {"baseType":"VARCHAR"} => ALTER TABLE [selected_db].[ops'.]]中文].[same] ALTER COLUMN [old] TYPE VARCHAR(128);
+    at file:///Users/Nico/workSpace/claude/DBterm/scripts/acceptance/sqlserver-structure-edit.mjs:17:10 {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: false,
+  expected: true,
+  operator: '==',
+  diff: 'simple'
+}
+
+Node.js v26.8.2

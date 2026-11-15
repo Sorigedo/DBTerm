@@ -1,0 +1,2 @@
+PASS constraint query contract includes ordered FK mappings/actions, names, trust, disabled and replication attributes.
+PASS actual FK/check SELECT target filtering, ordered composite mapping, actions and state; synthetic SQLite catalogs only.

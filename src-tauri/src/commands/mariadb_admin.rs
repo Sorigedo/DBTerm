@@ -27,10 +27,29 @@ struct DbConnCfg {
     #[serde(rename = "sshKeyPath",  default)] ssh_key_path: String,
 }
 impl DbConnCfg {
-    fn from_config(c: &ConnConfig) -> Self {
-        c.extra_json.as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default()
+    fn from_config(c: &ConnConfig) -> Result<Self, String> {
+        match c.extra_json.as_deref().filter(|raw| !raw.trim().is_empty()) {
+            Some(raw) => serde_json::from_str(raw)
+                .map_err(|_| "连接扩展配置损坏，已拒绝连接".to_string()),
+            None => Ok(Self::default()),
+        }
+    }
+    fn tunnel_config_with(
+        &self, conn_id: &str, lookup: impl FnOnce(&str) -> Result<Option<String>, String>,
+    ) -> Result<crate::db_tunnel::DbTunnelCfg, String> {
+        let password = if matches!(self.ssh_auth_type.as_str(), "agent" | "none") {
+            String::new()
+        } else if !self.ssh_password.is_empty() {
+            self.ssh_password.clone()
+        } else {
+            lookup(&format!("{conn_id}::ssh-tunnel"))
+                .map_err(|_| "读取数据库 SSH 隧道凭据失败，已拒绝连接；请检查凭据存储后重试".to_string())?
+                .unwrap_or_default()
+        };
+        Ok(crate::db_tunnel::DbTunnelCfg {
+            host: self.ssh_host.clone(), port: self.ssh_port, user: self.ssh_user.clone(),
+            auth_type: self.ssh_auth_type.clone(), password, key_path: self.ssh_key_path.clone(),
+        })
     }
     fn timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
@@ -50,22 +69,19 @@ async fn maria_connect(
     config: &ConnConfig,
     password: Option<&str>,
 ) -> Result<(sqlx::MySqlConnection, Option<std::sync::Arc<crate::db_tunnel::DbTunnel>>), String> {
-    use sqlx::mysql::{MySqlConnectOptions, MySqlSslMode};
+    use sqlx::mysql::MySqlConnectOptions;
     use crate::commands::query::MySqlPwdExt;
-    use crate::{db_tunnel::{DbTunnel, DbTunnelCfg}, tester::expand_home};
+    use crate::{db_tunnel::DbTunnel, tester::expand_home};
 
-    let cfg  = DbConnCfg::from_config(config);
+    let cfg  = DbConnCfg::from_config(config)?;
+    let tls_mode = crate::commands::query::mysql_tls_mode(config, &cfg.ssl_mode)?;
     let user = config.username.as_deref().unwrap_or("root");
     let db   = config.database.as_deref().unwrap_or("");
     let pwd  = password.unwrap_or("");
 
     let tunnel: Option<std::sync::Arc<DbTunnel>>;
     let (h, p) = if cfg.ssh_tunnel {
-        let tcfg = DbTunnelCfg {
-            host: cfg.ssh_host.clone(), port: cfg.ssh_port,
-            user: cfg.ssh_user.clone(), auth_type: cfg.ssh_auth_type.clone(),
-            password: cfg.ssh_password.clone(), key_path: cfg.ssh_key_path.clone(),
-        };
+        let tcfg = cfg.tunnel_config_with(&config.id, crate::keychain::get_password)?;
         let t = DbTunnel::open_shared(&config.id, &tcfg,
             config.host.as_deref().unwrap_or("127.0.0.1"),
             config.port.unwrap_or(3306)).await?;
@@ -79,12 +95,7 @@ async fn maria_connect(
 
     let mut opts = MySqlConnectOptions::new().host(&h).port(p).username(user).password_opt(pwd);
     if !db.is_empty() { opts = opts.database(db); }
-    opts = opts.ssl_mode(match cfg.ssl_mode.as_str() {
-        "require"     => MySqlSslMode::Required,
-        "verify-ca"   => MySqlSslMode::VerifyCa,
-        "verify-full" => MySqlSslMode::VerifyIdentity,
-        _             => MySqlSslMode::Disabled,
-    });
+    opts = opts.ssl_mode(tls_mode);
     if !cfg.ssl_ca.is_empty()   { opts = opts.ssl_ca(expand_home(&cfg.ssl_ca)); }
     if !cfg.ssl_cert.is_empty() { opts = opts.ssl_client_cert(expand_home(&cfg.ssl_cert)); }
     if !cfg.ssl_key.is_empty()  { opts = opts.ssl_client_key(expand_home(&cfg.ssl_key)); }
@@ -555,6 +566,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn malformed_tunnel_config_fails_closed() {
+        let config: ConnConfig = serde_json::from_value(serde_json::json!({
+            "id":"maria-fixture","name":"maria","type":"mariadb",
+            "host":"127.0.0.1","port":1,"useSsl":false,
+            "extraJson":r#"{"sshTunnel":true,"sshPort":"bad"}"#,
+            "createdAt":0,"updatedAt":0
+        })).unwrap();
+        assert!(DbConnCfg::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn mariadb_tunnel_credential_lookup_respects_auth_type() {
+        let password = DbConnCfg { ssh_auth_type: "password".into(), ..Default::default() };
+        let tunnel = password.tunnel_config_with("maria-fixture", |key| {
+            assert_eq!(key, "maria-fixture::ssh-tunnel");
+            Ok(Some("saved".into()))
+        }).unwrap();
+        assert_eq!(tunnel.password, "saved");
+        let error = password.tunnel_config_with("maria-fixture", |_| Err("private-error".into())).err().unwrap();
+        assert!(!error.contains("private-error"));
+        let key = DbConnCfg { ssh_auth_type: "key".into(), ssh_key_path: "/tmp/key".into(), ..Default::default() };
+        let tunnel = key.tunnel_config_with("maria-fixture", |_| Ok(Some("passphrase".into()))).unwrap();
+        assert_eq!(tunnel.password, "passphrase");
+        assert_eq!(tunnel.key_path, "/tmp/key");
+        let legacy = DbConnCfg { ssh_password: "legacy".into(), ..Default::default() };
+        assert_eq!(legacy.tunnel_config_with("maria-fixture", |_| panic!("legacy bypasses lookup")).unwrap().password, "legacy");
+        for auth in ["agent", "none"] {
+            let cfg = DbConnCfg { ssh_auth_type: auth.into(), ..Default::default() };
+            assert!(cfg.tunnel_config_with("maria-fixture", |_| panic!("unneeded lookup")).unwrap().password.is_empty());
+        }
+    }
+
+    #[test]
     fn test_dbconncfg_timeout() {
         let mut cfg = DbConnCfg::default();
         assert_eq!(cfg.timeout(), std::time::Duration::from_secs(15));
@@ -586,7 +630,7 @@ mod tests {
             read_only: None,
             env_label: None,
         };
-        let cfg = DbConnCfg::from_config(&config);
+        let cfg = DbConnCfg::from_config(&config).unwrap();
         assert_eq!(cfg.connect_timeout, 20);
     }
 }

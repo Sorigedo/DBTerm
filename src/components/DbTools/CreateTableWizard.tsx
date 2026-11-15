@@ -5,10 +5,12 @@ import { toast } from '../../stores/toastStore'
 import SearchableSelect from './SearchableSelect'
 import type { ConnType } from '../../types'
 import {
-  qid, tableRef, sqlStr, dialectFamily, isMysqlFamily,
+  qid, tableRef, sqlStr, dialectFamily, isMysqlFamily, sqlServerRename,
   supportsUnsigned, supportsTableOptions, supportsInlineComment, supportsCommentOn,
   autoIncrementColumn,
 } from '../../utils/sqlDialect'
+import { buildIndexAlterStatements, buildMysqlTableOptionClauses, shouldFetchMysqlCollations, validateMysqlExistingIndexEdits } from './createTableSql'
+import { existingMysqlColumnEdit, validateExistingTableTarget } from './createTableEditSafety'
 
 // ── 数据模型 ─────────────────────────────────────────────────────────────────
 
@@ -32,7 +34,7 @@ interface NewCol {
   comment: string
 }
 
-interface NewIndex {
+export interface NewIndex {
   _id: string
   name: string
   columns: string       // 逗号分隔字段名
@@ -69,6 +71,7 @@ interface Props {
   connectionId: string
   connType: ConnType
   schema: string
+  ssSchema?: string
   editTable?: string   // 提供时进入「修改表结构」编辑模式
   onClose: () => void
   onDone: () => void
@@ -320,48 +323,72 @@ function commentStatements(ct: ConnType, tref: string, tableComment: string, col
 }
 
 // 修改表结构：对比原始列快照生成 ALTER 语句（按方言）
-function buildAlterSql(opts: {
+export function buildAlterSql(opts: {
   connType: ConnType
-  schema: string; table: string; comment: string
+  schema: string; table: string; comment: string; ssSchema?: string
   engine: string; charset: string; collation: string; rowFormat: string; autoIncStart: string
-  cols: NewCol[]; origCols: NewCol[]
+  cols: NewCol[]; origCols: NewCol[]; indexes: NewIndex[]; origIndexes: NewIndex[]
   origEngine: string; origCharset: string; origCollation: string; origRowFormat: string; origAutoIncStart: string; origComment: string
+  tableOptionsLoaded: boolean
 }): string {
   const {
-    connType: ct, schema, table, comment, engine, charset, collation, rowFormat, autoIncStart,
-    cols, origCols, origEngine, origCharset, origCollation, origRowFormat, origAutoIncStart, origComment,
+    connType: ct, schema, table, comment, engine, charset, collation, rowFormat, autoIncStart, ssSchema,
+    cols, origCols, indexes, origIndexes, origEngine, origCharset, origCollation, origRowFormat, origAutoIncStart, origComment,
+    tableOptionsLoaded,
   } = opts
   const fam = dialectFamily(ct)
   const canUseRowFormat = supportsRowFormat(ct)
   const valid = cols.filter(c => c.name.trim())
   if (valid.length === 0) return '-- 至少保留一个字段'
-  const tref = tableRef(ct, schema, table)
+  const tref = tableRef(ct, schema, table, ssSchema)
   const origById = new Map(origCols.map(o => [o._id, o]))
   const curIds   = new Set(valid.map(c => c._id))
 
+  if (ct === 'sqlServer') {
+    // 列摘要缺少排序规则、计算列、identity等属性，不能重建原字段定义。
+    const attributes: (keyof NewCol)[] = ['baseType', 'length', 'unsigned', 'nullable', 'primaryKey', 'autoIncrement', 'defaultType', 'defaultValue', 'comment']
+    for (const current of valid) {
+      const original = origById.get(current._id)
+      if (original && attributes.some(key => original[key] !== current[key]))
+        return '-- 现有字段的完整定义无法从列摘要还原，请在 SQL 编辑器中明确修改原始 DDL'
+    }
+    const indexEdit = validateMysqlExistingIndexEdits(indexes, origIndexes)
+    if (indexEdit) return '-- ' + indexEdit
+  }
+
   if (fam === 'mysql') {
     // —— MySQL/MariaDB：单条 ALTER + 多子句 ——
+    const unsafeIndexEdit = validateMysqlExistingIndexEdits(indexes, origIndexes)
+    if (unsafeIndexEdit) return `-- ${unsafeIndexEdit}`
     const clauses: string[] = []
     for (const o of origCols) if (!curIds.has(o._id)) clauses.push(`  DROP COLUMN ${qid(ct, o.name.trim())}`)
     for (const c of valid) {
       const orig = origById.get(c._id)
       if (!orig) clauses.push(`  ADD COLUMN ${columnDef(c, ct)}`)
-      else if (columnDef(orig, ct) !== columnDef(c, ct) || orig.name.trim() !== c.name.trim()) {
-        if (orig.name.trim() !== c.name.trim()) clauses.push(`  CHANGE COLUMN ${qid(ct, orig.name.trim())} ${columnDef(c, ct)}`)
-        else clauses.push(`  MODIFY COLUMN ${columnDef(c, ct)}`)
+      else {
+        const change = existingMysqlColumnEdit(ct, orig, c)
+        if (change.error) return `-- ${change.error}`
+        if (change.sql) clauses.push(`  ${change.sql}`)
       }
     }
-    if (engine && engine !== origEngine) clauses.push(`  ENGINE=${engine}`)
-    if (charset && charset !== origCharset) clauses.push(`  DEFAULT CHARSET=${charset}`)
-    if (collation && collation !== origCollation) clauses.push(`  COLLATE=${collation}`)
-    if (canUseRowFormat && rowFormat && rowFormat !== origRowFormat) clauses.push(`  ROW_FORMAT=${rowFormat}`)
-    const hasAutoInc = valid.some(c => c.autoIncrement)
-    if (hasAutoInc && autoIncStart.trim()) {
-      const nextAutoInc = normalizePositiveInt(autoIncStart)
-      if (!nextAutoInc) return '-- 自动递增值必须是大于等于 1 的整数'
-      if (nextAutoInc !== origAutoIncStart) clauses.push(`  AUTO_INCREMENT=${nextAutoInc}`)
+    if (tableOptionsLoaded) {
+      clauses.push(...buildMysqlTableOptionClauses({
+        loaded: true,
+        engine, charset, collation,
+        originalEngine: origEngine,
+        originalCharset: origCharset,
+        originalCollation: origCollation,
+      }))
+      if (canUseRowFormat && rowFormat && rowFormat !== origRowFormat) clauses.push(`  ROW_FORMAT=${rowFormat}`)
+      const hasAutoInc = valid.some(c => c.autoIncrement)
+      if (hasAutoInc && autoIncStart.trim()) {
+        const nextAutoInc = normalizePositiveInt(autoIncStart)
+        if (!nextAutoInc) return '-- 自动递增值必须是大于等于 1 的整数'
+        if (nextAutoInc !== origAutoIncStart) clauses.push(`  AUTO_INCREMENT=${nextAutoInc}`)
+      }
+      if (comment !== origComment) clauses.push(`  COMMENT=${sqlStr(comment)}`)
     }
-    if (comment !== origComment) clauses.push(`  COMMENT=${sqlStr(comment)}`)
+    clauses.push(...buildIndexAlterStatements(ct, schema, table, indexes, origIndexes, ssSchema))
     if (clauses.length === 0) return '-- 结构未发生变化'
     return `ALTER TABLE ${tref}\n${clauses.join(',\n')};`
   }
@@ -371,9 +398,11 @@ function buildAlterSql(opts: {
   for (const o of origCols) if (!curIds.has(o._id)) stmts.push(`ALTER TABLE ${tref} DROP COLUMN ${qid(ct, o.name.trim())};`)
   for (const c of valid) {
     const orig = origById.get(c._id)
-    if (!orig) { stmts.push(`ALTER TABLE ${tref} ADD COLUMN ${columnDef(c, ct)};`); continue }
+    if (!orig) { stmts.push(`ALTER TABLE ${tref} ADD${ct === 'sqlServer' ? '' : ' COLUMN'} ${columnDef(c, ct)};`); continue }
     if (orig.name.trim() !== c.name.trim()) {
-      stmts.push(`ALTER TABLE ${tref} RENAME COLUMN ${qid(ct, orig.name.trim())} TO ${qid(ct, c.name.trim())};`)
+      stmts.push(ct === 'sqlServer'
+        ? sqlServerRename(schema, table, c.name.trim(), orig.name.trim(), ssSchema)
+        : `ALTER TABLE ${tref} RENAME COLUMN ${qid(ct, orig.name.trim())} TO ${qid(ct, c.name.trim())};`)
     }
     if (colType(orig, ct) !== colType(c, ct)) {
       if (fam === 'sqlite') stmts.push(`-- SQLite 不支持修改列「${c.name.trim()}」类型，请删除后重建该列或重建表`)
@@ -386,6 +415,7 @@ function buildAlterSql(opts: {
       stmts.push(`COMMENT ON COLUMN ${tref}.${qid(ct, c.name.trim())} IS ${c.comment ? sqlStr(c.comment) : 'NULL'};`)
     }
   }
+  stmts.push(...buildIndexAlterStatements(ct, schema, table, indexes, origIndexes, ssSchema))
   if (supportsCommentOn(ct) && comment !== origComment) {
     stmts.push(`COMMENT ON TABLE ${tref} IS ${comment ? sqlStr(comment) : 'NULL'};`)
   }
@@ -477,7 +507,7 @@ function buildSql(opts: {
 
 type Tab = 'fields' | 'indexes' | 'fkeys' | 'triggers' | 'options' | 'sql'
 
-export default function CreateTableWizard({ connectionId, connType, schema, editTable, onClose, onDone }: Props) {
+export default function CreateTableWizard({ connectionId, connType, schema, editTable, ssSchema, onClose, onDone }: Props) {
   const isEdit = !!editTable
   const fam  = dialectFamily(connType)
   const isMy = isMysqlFamily(connType)         // ENGINE/CHARSET/SHOW/UNSIGNED 等 MySQL 专属 UI 的开关
@@ -506,9 +536,12 @@ export default function CreateTableWizard({ connectionId, connType, schema, edit
   const [origRowFormat, setOrigRowFormat] = useState('DEFAULT')
   const [origAutoIncStart, setOrigAutoIncStart] = useState('')
   const [origComment, setOrigComment] = useState('')
+  // 编辑模式只有成功读取表级元数据后，才允许把 ENGINE/CHARSET 等选项写回 ALTER。
+  const [tableOptionsLoaded, setTableOptionsLoaded] = useState(!isEdit || !isMy)
   const [editLoaded, setEditLoaded]   = useState(false)
   const [currentDdl, setCurrentDdl]   = useState('')
   const [indexes, setIndexes]   = useState<NewIndex[]>([])
+  const [origIndexes, setOrigIndexes] = useState<NewIndex[]>([])
   const [fkeys, setFkeys]       = useState<NewFK[]>([])
   const [triggers, setTriggers] = useState<NewTrigger[]>([])
   const [executing, setExecuting]   = useState(false)
@@ -556,6 +589,7 @@ export default function CreateTableWizard({ connectionId, connType, schema, edit
         const esc = (s: string) => s.replace(/'/g, "''")
         let loadedColsSnapshot: NewCol[] = []
         if (isMy) {
+          setTableOptionsLoaded(false)
           // MySQL 系：information_schema 文本列为二进制字符集，全部 CAST AS CHAR 强制为字符串；并带 EXTRA/COMMENT
           const colRes = await invoke<Rows>('execute_query', {
             id: connectionId,
@@ -584,12 +618,13 @@ export default function CreateTableWizard({ connectionId, connType, schema, edit
               const cmtVal = String(cmt ?? '')
               setEngine(engVal); setCharset(csVal); setCollation(collVal); setRowFormat(rowFmtVal); setAutoIncStart(autoIncVal); setComment(cmtVal)
               setOrigEngine(engVal); setOrigCharset(csVal); setOrigCollation(collVal); setOrigRowFormat(rowFmtVal); setOrigAutoIncStart(autoIncVal); setOrigComment(cmtVal)
+              setTableOptionsLoaded(true)
             }
-          } catch { /* 选项加载失败忽略 */ }
+          } catch { /* 选项加载失败：只允许字段级 ALTER，禁止把默认表选项写回 */ }
         } else {
           // 非 MySQL：走后端按方言分派的 table_columns（PG/SQLite/DuckDB 通用），无 ENGINE/CHARSET/COMMENT
           type Col = { name: string; dataType: string; nullable: boolean; key: string; defaultValue: string | null }
-          const list = await invoke<Col[]>('table_columns', { id: connectionId, schema, table: editTable })
+          const list = await invoke<Col[]>('table_columns', { id: connectionId, schema, table: editTable, ...(ssSchema ? { ssSchema } : {}) })
           if (cancelled) return
           const loaded = list.map(c => {
             const { baseType, length } = parseColumnType(c.dataType)
@@ -610,27 +645,29 @@ export default function CreateTableWizard({ connectionId, connType, schema, edit
         }
         try {
           const dict = await invoke<{ indexes: DictIndex[] }[]>('db_data_dictionary', {
-            id: connectionId, schema, tables: [editTable],
+            id: connectionId, schema, tables: [editTable], ...(ssSchema ? { ssSchema } : {}),
           })
           if (!cancelled && dict[0]) {
             const pkCols = loadedColsSnapshot.filter(c => c.primaryKey && c.name.trim()).map(c => c.name.trim()).join(', ')
-            setIndexes(dict[0].indexes.filter(idx => !isPrimaryIndex(idx, pkCols)).map(dictIndexToNewIndex))
+            const loadedIndexes = dict[0].indexes.filter(idx => !isPrimaryIndex(idx, pkCols)).map(dictIndexToNewIndex)
+            setIndexes(loadedIndexes)
+            setOrigIndexes(loadedIndexes.map(i => ({ ...i })))
           }
         } catch { /* 索引加载失败时不阻塞字段编辑 */ }
         // 当前完整 DDL（无改动时预览展示）—— 后端 get_table_ddl 已按方言分派
         try {
-          const ddl = await invoke<string>('get_table_ddl', { id: connectionId, schema, table: editTable })
+          const ddl = await invoke<string>('get_table_ddl', { id: connectionId, schema, table: editTable, ...(ssSchema ? { ssSchema } : {}) })
           if (!cancelled) setCurrentDdl(ddl)
         } catch { /* 忽略 */ }
         setEditLoaded(true)
       } catch (e) { if (!cancelled) { setExecErr(String(e)); setEditLoaded(true) } }
     })()
     return () => { cancelled = true }
-  }, [connectionId, schema, editTable, isMy])
+  }, [connectionId, schema, editTable, ssSchema, isMy])
 
   // charset 变化时拉排序规则（仅 MySQL 系；SHOW COLLATION 是 MySQL 专属）
   useEffect(() => {
-    if (!isMy || !charset) return
+    if (!shouldFetchMysqlCollations(isMy, isEdit, tableOptionsLoaded, charset)) return
     let cancelled = false
     ;(async () => {
       try {
@@ -648,7 +685,7 @@ export default function CreateTableWizard({ connectionId, connType, schema, edit
       } catch { setCollations([]); setCollation('') }
     })()
     return () => { cancelled = true }
-  }, [connectionId, charset, isMy])
+  }, [connectionId, charset, isMy, isEdit, tableOptionsLoaded])
 
   useEffect(() => {
     if (!pendingFocusId) return
@@ -681,10 +718,14 @@ export default function CreateTableWizard({ connectionId, connType, schema, edit
     }
   }, [])
 
+  const tableTargetError = isEdit ? validateExistingTableTarget(table, editTable!) : null
   const sql = isEdit
-    ? buildAlterSql({
-        connType, schema, table, comment, engine, charset, collation, rowFormat, autoIncStart, cols, origCols,
+    ? tableTargetError
+      ? `-- ${tableTargetError}`
+      : buildAlterSql({
+        connType, schema, ssSchema, table, comment, engine, charset, collation, rowFormat, autoIncStart, cols, origCols, indexes, origIndexes,
         origEngine, origCharset, origCollation, origRowFormat, origAutoIncStart, origComment,
+        tableOptionsLoaded,
       })
     : buildSql({ connType, schema, table, comment, engine, charset, collation, rowFormat, autoIncStart, cols, indexes, fkeys, triggers })
   const ready = !sql.startsWith('--') && (!isEdit || editLoaded)
@@ -963,31 +1004,33 @@ export default function CreateTableWizard({ connectionId, connType, schema, edit
                   )}
                   {indexes.map(idx => {
                     const sel = idx.columns.split(',').map(s => s.trim()).filter(Boolean)
+                    const unsupported = isEdit && !idx.columns.trim()
                     return (
                       <div key={idx._id} className="ctw-grid ctw-grid--idx ctw-grid--row">
-                        <input value={idx.name} placeholder="留空自动命名" autoComplete="off"
+                        <input value={idx.name} placeholder="留空自动命名" autoComplete="off" disabled={unsupported}
                           onChange={e => setIndexes(prev => prev.map(x => x._id === idx._id ? { ...x, name: e.target.value } : x))} />
-                        <div className="ctw-idx-field-cell" tabIndex={0}
-                          onClick={() => setPickerModal(idx._id)}
-                          onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setPickerModal(idx._id) } }}>
+                        <div className="ctw-idx-field-cell" tabIndex={unsupported ? undefined : 0}
+                          title={unsupported ? '函数或前缀索引无法在结构化编辑器中无损表示，请在 SQL 编辑器中修改原始 DDL' : undefined}
+                          onClick={() => { if (!unsupported) setPickerModal(idx._id) }}
+                          onKeyDown={e => { if (!unsupported && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); setPickerModal(idx._id) } }}>
                           <div className="ctw-idx-field-tags">
                             {sel.length === 0
-                              ? <span className="ctw-idx-no-fields">点击选择字段…</span>
+                              ? <span className="ctw-idx-no-fields">{unsupported ? '复杂索引（只读）' : '点击选择字段…'}</span>
                               : sel.map(f => <span key={f} className="ctw-idx-field-tag">{f}</span>)}
                           </div>
                         </div>
                         <span className="c">
-                          <button type="button" role="checkbox" aria-checked={idx.unique}
+                          <button type="button" role="checkbox" aria-checked={idx.unique} disabled={unsupported}
                             className={`ctw-chk${idx.unique ? ' on' : ''}`}
                             onClick={() => setIndexes(prev => prev.map(x => x._id === idx._id ? { ...x, unique: !x.unique } : x))}>
                             {idx.unique && <Check size={10} strokeWidth={3} />}
                           </button>
                         </span>
-                        <SearchableSelect value={idx.method}
+                        <SearchableSelect value={idx.method} disabled={unsupported}
                           onChange={v => setIndexes(prev => prev.map(x => x._id === idx._id ? { ...x, method: v as IndexMethod } : x))}
                           options={['BTREE', 'HASH', 'FULLTEXT', 'SPATIAL']} />
                         <span className="ctw-row-ops">
-                          <button className="del" onClick={() => setIndexes(prev => prev.filter(x => x._id !== idx._id))}>
+                          <button className="del" disabled={unsupported} onClick={() => setIndexes(prev => prev.filter(x => x._id !== idx._id))}>
                             <Trash2 size={11} />
                           </button>
                         </span>

@@ -1,0 +1,60 @@
+name: Platform validation
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    name: Windows x64 native build and tests
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Frontend type check and tests
+        run: |
+          npm run typecheck
+          npm test -- --runInBand
+
+      - name: Build Windows Tauri application
+        run: npm run tauri -- build --target x86_64-pc-windows-msvc --no-bundle
+
+      - name: Run Windows-compatible Rust tests
+        run: >-
+          cargo test --locked --manifest-path src-tauri/Cargo.toml
+          -- --skip ssh::exec_integration_tests::loopback_upload_real_staging_preserves_target_on_changed_source
+
+      - name: Verify Windows executable
+        shell: pwsh
+        run: |
+          $binary = Resolve-Path 'src-tauri/target/x86_64-pc-windows-msvc/release/DBTerm.exe'
+          $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($binary)
+          if ($info.ProductName -ne 'DBTerm') { throw "Unexpected product name: $($info.ProductName)" }
+          Get-Item $binary | Select-Object FullName, Length

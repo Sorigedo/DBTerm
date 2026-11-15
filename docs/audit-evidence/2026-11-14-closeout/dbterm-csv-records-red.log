@@ -1,0 +1,12 @@
+
+thread 'main' (551573) panicked at /var/folders/29/p22btbvx12n6p5bqjgkjwy800000gn/T/dbterm-csv-red-_ebvarfx/red.rs:27:2:
+assertion `left == right` failed: quoted newline must stay in one CSV record
+  left: 3
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Traceback (most recent call last):
+  File "/Users/Nico/workSpace/claude/DBterm/scripts/acceptance/csv-import-records-red.py", line 15, in <module>
+    subprocess.run([tmp+'/red'],check=True)
+  File "/Users/Nico/.pyenv/versions/3.12.9/lib/python3.12/subprocess.py", line 573, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['/var/folders/29/p22btbvx12n6p5bqjgkjwy800000gn/T/dbterm-csv-red-_ebvarfx/red']' returned non-zero exit status 101.

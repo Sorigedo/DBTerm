@@ -1,0 +1,46 @@
+warning: use of deprecated method `futures_channel::mpsc::UnboundedReceiver::<T>::try_next`: please use `try_recv` instead
+   --> vendor/sqlx-postgres/src/listener.rs:335:56
+    |
+335 |         if let Ok(Some(notification)) = self.buffer_rx.try_next() {
+    |                                                        ^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: variant `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/mod.rs:78:5
+   |
+70 | pub enum FrontendMessageFormat {
+   |          --------------------- variant in this enum
+...
+78 |     Flush = b'H',
+   |     ^^^^^
+   |
+   = note: `FrontendMessageFormat` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/flush.rs:11:12
+   |
+11 | pub struct Flush;
+   |            ^^^^^
+
+warning: `sqlx-postgres` (lib) generated 3 warnings
+   Compiling app v0.1.23 (/Users/Nico/workSpace/claude/DBterm/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.35s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/app_lib-bccc94f7de71602a)
+
+running 1 test
+test commands::query::optimistic_update_tests::mysql_grid_update_with_saved_latin1_database_preserves_batch ... 
+thread 'commands::query::optimistic_update_tests::mysql_grid_update_with_saved_latin1_database_preserves_batch' (149019) panicked at src/commands/optimistic_update_tests.rs:18:5:
+ordinary grid save failed: Err("该字段显示值不能恢复精确并发基线，已拒绝覆盖；请使用显式 SQL；已回滚")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    commands::query::optimistic_update_tests::mysql_grid_update_with_saved_latin1_database_preserves_batch
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 454 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--lib`

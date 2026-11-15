@@ -332,7 +332,7 @@ pub async fn ss_force_plan(
     if query_id <= 0 || plan_id <= 0 {
         return Err("query_id 和 plan_id 必须大于 0".to_string());
     }
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = super::load_write_conn(&id, &storage)?;
     let entry_arc = super::get_entry(&id, &pool, &config, password.as_deref()).await?;
     let mut entry = entry_arc.lock().await;
 
@@ -356,7 +356,7 @@ pub async fn ss_unforce_plan(
     if query_id <= 0 || plan_id <= 0 {
         return Err("query_id 和 plan_id 必须大于 0".to_string());
     }
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = super::load_write_conn(&id, &storage)?;
     let entry_arc = super::get_entry(&id, &pool, &config, password.as_deref()).await?;
     let mut entry = entry_arc.lock().await;
 

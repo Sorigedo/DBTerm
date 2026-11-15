@@ -1,0 +1,161 @@
+{
+  "initial": [
+    [
+      "1",
+      "alpha",
+      "one"
+    ],
+    [
+      "2",
+      "beta",
+      "two"
+    ],
+    [
+      "3",
+      "gamma",
+      "three"
+    ]
+  ],
+  "saves": [
+    [
+      {
+        "columns": [
+          "a"
+        ],
+        "values": [
+          "alpha"
+        ],
+        "pkColumns": [
+          "id"
+        ],
+        "pkValues": [
+          "2"
+        ],
+        "expectedValues": [
+          "beta"
+        ]
+      }
+    ],
+    [
+      {
+        "columns": [
+          "a",
+          "b"
+        ],
+        "values": [
+          "fill",
+          "fill"
+        ],
+        "pkColumns": [
+          "id"
+        ],
+        "pkValues": [
+          "1"
+        ],
+        "expectedValues": [
+          "alpha",
+          "one"
+        ]
+      },
+      {
+        "columns": [
+          "a",
+          "b"
+        ],
+        "values": [
+          "fill",
+          "fill"
+        ],
+        "pkColumns": [
+          "id"
+        ],
+        "pkValues": [
+          "2"
+        ],
+        "expectedValues": [
+          "alpha",
+          "two"
+        ]
+      },
+      {
+        "columns": [
+          "a",
+          "b"
+        ],
+        "values": [
+          "fill",
+          "fill"
+        ],
+        "pkColumns": [
+          "id"
+        ],
+        "pkValues": [
+          "3"
+        ],
+        "expectedValues": [
+          "gamma",
+          "three"
+        ]
+      }
+    ],
+    [
+      {
+        "columns": [
+          "a",
+          "b"
+        ],
+        "values": [
+          "A1",
+          "B1"
+        ],
+        "pkColumns": [
+          "id"
+        ],
+        "pkValues": [
+          "1"
+        ],
+        "expectedValues": [
+          "fill",
+          "fill"
+        ]
+      },
+      {
+        "columns": [
+          "a",
+          "b"
+        ],
+        "values": [
+          "A2",
+          "B2"
+        ],
+        "pkColumns": [
+          "id"
+        ],
+        "pkValues": [
+          "2"
+        ],
+        "expectedValues": [
+          "fill",
+          "fill"
+        ]
+      }
+    ]
+  ],
+  "expected": [
+    [
+      "1",
+      "A1",
+      "B1"
+    ],
+    [
+      "2",
+      "A2",
+      "B2"
+    ],
+    [
+      "3",
+      "fill",
+      "fill"
+    ]
+  ]
+}

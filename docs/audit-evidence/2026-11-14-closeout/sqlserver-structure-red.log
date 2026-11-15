@@ -1,0 +1,20 @@
+node:internal/modules/run_main:107
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: rename must preserve selected schema and original attributes
++ actual - expected
+
++ 'ALTER TABLE [selected_db]..[same] RENAME COLUMN [old] TO [renamed];'
+- "EXEC [selected_db].sys.sp_rename N'[ops''.]]中文].[same].[old]', N'renamed', N'COLUMN';"
+
+    at file:///Users/Nico/workSpace/claude/DBterm/scripts/acceptance/sqlserver-structure-edit.mjs:11:9 {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: 'ALTER TABLE [selected_db]..[same] RENAME COLUMN [old] TO [renamed];',
+  expected: "EXEC [selected_db].sys.sp_rename N'[ops''.]]中文].[same].[old]', N'renamed', N'COLUMN';",
+  operator: 'strictEqual',
+  diff: 'simple'
+}
+
+Node.js v26.8.2

@@ -1,0 +1,3 @@
+Re-optimizing dependencies because vite config has changed
+Port 5173 is in use, trying another one...
+PASS actual TableBrowser: single cell, Shift columns, rectangle, staged saves, baseline values, unknown-outcome block and double-submit guard; simulated IPC/clipboard only.

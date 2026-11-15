@@ -1,9 +1,9 @@
-﻿import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { X, GitCompareArrows, Copy, Check, CheckCircle2, AlertTriangle, Loader } from 'lucide-react'
 import { useAppStore } from '../../stores/appStore'
 import SearchableSelect from './SearchableSelect'
-import { qid, tableRef } from '../../utils/sqlDialect'
+import { createDiffRequestOwner, diffCell, equalDiffCells, comparisonSampleSummary, isBinaryDiffType, diffEncodingLabel, type DiffCell } from './dataDiffState'
 
 interface Props {
   connectionId: string
@@ -27,6 +27,8 @@ interface BackendResult {
   samples_only_dst: DiffSample[]
   samples_mismatch: DiffSample[]
   sample_capped: boolean
+  column_types: Record<string, string>
+  column_encodings: Record<string, string>
 }
 
 interface DiffRow {
@@ -57,50 +59,13 @@ function deriveCols(samples: DiffSample[], kind: 'src' | 'dst'): string[] {
   return [...set]
 }
 
-// 从 backend 结果生成前端用的同步 SQL（仅覆盖样本，大差异需后端导出）
-function generateSyncSql(
-  result: BackendResult,
-  dstSchema: string,
-  dstTable: string,
-  connType: string,
-): string {
-  const tbl = tableRef(connType, dstSchema, dstTable)
-  const q = (c: string) => qid(connType, c)
-  const esc = (v: string | null) => v === null ? 'NULL' : `'${String(v).replace(/'/g, "''")}'`
-  const lines: string[] = []
-
-  for (const d of result.samples_only_src) {
-    const cols = Object.keys(d.src).map(q).join(', ')
-    const vals = Object.values(d.src).map(esc).join(', ')
-    lines.push(`INSERT INTO ${tbl} (${cols}) VALUES (${vals});`)
-  }
-  for (const d of result.samples_only_dst) {
-    const where = Object.entries(d.dst).map(([c, v]) =>
-      v === null ? `${q(c)} IS NULL` : `${q(c)} = ${esc(v)}`
-    ).join(' AND ')
-    lines.push(`DELETE FROM ${tbl} WHERE ${where};`)
-  }
-  for (const d of result.samples_mismatch) {
-    const setCols = Object.keys(d.src).filter(c => !(Object.keys(d.dst).includes(c) &&
-      d.src[c] === d.dst[c]))
-    if (setCols.length === 0) continue
-    const set = setCols.map(c => `${q(c)} = ${esc(d.src[c])}`).join(', ')
-    const where = Object.entries(d.src)
-      .filter(([c]) => c in d.dst && d.src[c] === d.dst[c])  // pk cols are equal
-      .slice(0, 1)  // pick at least one
-      .map(([c, v]) => `${q(c)} = ${esc(v)}`).join(' AND ') || '1=1'
-    lines.push(`UPDATE ${tbl} SET ${set} WHERE ${where};`)
-  }
-  return lines.join('\n')
-}
-
 // 系统库不作默认 schema（避免误选 information_schema 等）
 const SYSTEM_SCHEMAS = new Set(['information_schema', 'performance_schema', 'mysql', 'sys', 'pg_catalog', 'pg_toast'])
 function pickDefaultSchema(schemas: string[]): string {
   return schemas.find(s => !SYSTEM_SCHEMAS.has(s.toLowerCase())) ?? schemas[0] ?? ''
 }
 
-export default function DataDiffPanel({ connectionId, connType, schema, onClose }: Props) {
+export default function DataDiffPanel({ connectionId, schema, onClose }: Props) {
   const connections = useAppStore(s => s.connections)
   const [tables, setTables] = useState<TableInfo[]>([])
   const [loadingTables, setLoadingTables] = useState(true)
@@ -120,16 +85,42 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
   const [running, setRunning]     = useState(false)
   const [progress, setProgress]   = useState<Progress | null>(null)
   const [error, setError]         = useState('')
-  const [result, setResult]       = useState<BackendResult | null>(null)
+  const [storedResult, setResult] = useState<BackendResult | null>(null)
+  const [resultSelectionKey, setResultSelectionKey] = useState('')
+  const [srcTablesKey, setSrcTablesKey] = useState('')
+  const [dstTablesKey, setDstTablesKey] = useState('')
+  const [columnsKey, setColumnsKey] = useState('')
   const [activeTab, setActiveTab] = useState<'only-src' | 'only-dst' | 'diff'>('only-src')
-  const [sql, setSql]             = useState('')
+  const [resultContext, setResultContext] = useState<Record<string, unknown> | null>(null)
   const [copied, setCopied]       = useState(false)
 
   // 用于目标表列表（目标连接变化时重新拉取）
   const [dstTables, setDstTables] = useState<TableInfo[]>([])
   const [loadingDstTables, setLoadingDstTables] = useState(false)
 
-  const windowId = useRef(`${Date.now()}`).current
+  const windowId = useRef(crypto.randomUUID()).current
+  const requestOwner = useRef(createDiffRequestOwner()).current
+  const selectionKey = JSON.stringify([srcConnId, srcSchema, srcTable, dstConnId, dstSchema, dstTable, pkCols])
+  const selectionRef = useRef(selectionKey)
+  selectionRef.current = selectionKey
+  const result = resultSelectionKey === selectionKey ? storedResult : null
+  const resultRef = useRef(result)
+  resultRef.current = result
+  const progressSelectionKey = useRef('')
+  const sourceTablesKey = JSON.stringify([srcConnId, srcSchema])
+  const targetTablesKey = JSON.stringify([dstConnId, dstSchema])
+  const sourceColumnsKey = JSON.stringify([srcConnId, srcSchema, srcTable])
+  const metadataReady = srcTablesKey === sourceTablesKey && dstTablesKey === targetTablesKey && columnsKey === sourceColumnsKey
+  const mounted = useRef(true)
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; requestOwner.invalidate() } }, [requestOwner])
+  useEffect(() => {
+    requestOwner.invalidate()
+    setResult(null)
+    setResultContext(null)
+    setProgress(null)
+    setError('')
+    setCopied(false)
+  }, [srcConnId, srcSchema, srcTable, dstConnId, dstSchema, dstTable, pkCols])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -140,6 +131,7 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
   // 源 schema 列表（源连接变化时）
   useEffect(() => {
     let alive = true
+    setSrcSchemas([])
     ;(async () => {
       try {
         const { invoke } = await import('@tauri-apps/api/core')
@@ -155,6 +147,7 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
   // 目标 schema 列表（目标连接变化时）
   useEffect(() => {
     let alive = true
+    setDstSchemas([])
     ;(async () => {
       try {
         const { invoke } = await import('@tauri-apps/api/core')
@@ -169,15 +162,17 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
 
   // 源表列表（源连接 / schema 变化时）
   useEffect(() => {
-    if (!srcSchema) { setTables([]); return }
+    setTables([])
+    setSrcTablesKey('')
+    setSrcTable('')
+    if (!srcSchema) { setLoadingTables(false); return }
     let alive = true
     setLoadingTables(true)
-    setSrcTable('')
     ;(async () => {
       try {
         const { invoke } = await import('@tauri-apps/api/core')
         const list = await invoke<TableInfo[]>('list_tables', { id: srcConnId, schema: srcSchema })
-        if (alive) setTables(list.filter(t => !t.isView))
+        if (alive) { setTables(list.filter(t => !t.isView)); setSrcTablesKey(JSON.stringify([srcConnId, srcSchema])) }
       } catch (e) {
         if (alive) setError(String(e))
       } finally {
@@ -189,7 +184,10 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
 
   // 选定源表后拉取列，自动预选主键（key === 'PRI'）
   useEffect(() => {
-    if (!srcTable) { setSrcCols([]); setPkCols([]); return }
+    setSrcCols([])
+    setPkCols([])
+    setColumnsKey('')
+    if (!srcTable) return
     let alive = true
     ;(async () => {
       try {
@@ -197,6 +195,7 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
         const cols = await invoke<{ name: string; key: string }[]>('table_columns', { id: srcConnId, schema: srcSchema, table: srcTable })
         if (!alive) return
         setSrcCols(cols)
+        setColumnsKey(JSON.stringify([srcConnId, srcSchema, srcTable]))
         setPkCols(cols.filter(c => c.key === 'PRI').map(c => c.name))  // 无主键则留空待用户选择
         setPkPickerOpen(false)
       } catch {
@@ -208,16 +207,18 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
 
   // 目标表列表（目标连接 / schema 变化时）
   useEffect(() => {
-    if (!dstSchema) { setDstTables([]); return }
+    setDstTables([])
+    setDstTablesKey('')
+    setDstTable('')
+    if (!dstSchema) { setLoadingDstTables(false); return }
     let alive = true
     setLoadingDstTables(true)
-    setDstTable('')
     ;(async () => {
       try {
         const { invoke } = await import('@tauri-apps/api/core')
         const list = await invoke<TableInfo[]>('list_tables', { id: dstConnId, schema: dstSchema })
-        if (alive) setDstTables(list.filter(t => !t.isView))
-      } catch { /* 允许失败 */ } finally {
+        if (alive) { setDstTables(list.filter(t => !t.isView)); setDstTablesKey(JSON.stringify([dstConnId, dstSchema])) }
+      } catch (e) { if (alive) setError(String(e)) } finally {
         if (alive) setLoadingDstTables(false)
       }
     })()
@@ -225,52 +226,59 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
   }, [dstConnId, dstSchema])
 
   const runDiff = useCallback(async () => {
+    if (requestOwner.busy) return
+    if (!metadataReady) { setError('当前连接、库、表的元数据尚未加载完成，请稍后重试'); return }
     if (!srcTable || !dstTable) { setError('请选择源表和目标表'); return }
-    if (pkCols.length === 0) { setError('请选择主键列'); return }
-
+    if (pkCols.length === 0) { setError('请选择完整整数主键'); return }
+    const epoch = requestOwner.begin()
+    if (epoch === null) return
+    const current = () => mounted.current && requestOwner.current(epoch) && selectionRef.current === selectionKey
+    const context = { srcConnId, srcSchema, srcTable, dstConnId, dstSchema, dstTable, pkCols: [...pkCols] }
+    progressSelectionKey.current = selectionKey
     setRunning(true)
     setError('')
     setResult(null)
-    setSql('')
+    setResultContext(null)
     setProgress(null)
-
-    // 监听进度事件
-    const { listen } = await import('@tauri-apps/api/event')
-    const unlisten = await listen<Progress>(`diff_progress_${windowId}`, e => {
-      setProgress(e.payload)
-    })
-
+    setCopied(false)
+    let unlisten: (() => void) | undefined
     try {
+      const { listen } = await import('@tauri-apps/api/event')
+      const eventId = `${windowId}_${epoch}`
+      unlisten = await listen<Progress>(`diff_progress_${eventId}`, e => { if (current()) setProgress(e.payload) })
+      if (!current()) return
       const { invoke } = await import('@tauri-apps/api/core')
+      if (!current()) return
       const res = await invoke<BackendResult>('db_diff_data', {
-        srcId: srcConnId,
-        srcSchema,
-        srcTable,
-        dstId: dstConnId,
-        dstSchema,
-        dstTable,
-        pkCols,
-        windowId,
+        srcId: context.srcConnId, srcSchema: context.srcSchema, srcTable: context.srcTable,
+        dstId: context.dstConnId, dstSchema: context.dstSchema, dstTable: context.dstTable,
+        pkCols: context.pkCols, windowId: eventId,
       })
+      if (!current()) return
       setResult(res)
-      setSql(generateSyncSql(res, dstSchema, dstTable, connType))
-      // 自动切到有差异的 tab
+      setResultSelectionKey(selectionKey)
+      setResultContext(context)
       if (res.total_only_src > 0) setActiveTab('only-src')
       else if (res.total_only_dst > 0) setActiveTab('only-dst')
       else if (res.total_mismatch > 0) setActiveTab('diff')
-    } catch (e) {
-      setError(String(e))
-    } finally {
-      unlisten()
-      setRunning(false)
+    } catch (e) { if (current()) setError(String(e)) }
+    finally {
+      try { unlisten?.() } finally {
+        if (requestOwner.finish(epoch) && mounted.current) setRunning(false)
+      }
     }
-  }, [srcConnId, srcSchema, srcTable, dstConnId, dstSchema, dstTable, pkCols, windowId])
+  }, [srcConnId, srcSchema, srcTable, dstConnId, dstSchema, dstTable, pkCols, windowId, requestOwner, selectionKey, metadataReady])
 
-  const copySql = () => {
-    navigator.clipboard.writeText(sql).then(() => {
+  const copySamples = () => {
+    if (!result || !resultContext) return
+    const copiedKey = selectionKey
+    const copiedResult = result
+    const current = () => mounted.current && selectionRef.current === copiedKey && resultRef.current === copiedResult
+    navigator.clipboard.writeText(JSON.stringify({ context: resultContext, sampleOnly: result.sample_capped, result }, null, 2)).then(() => {
+      if (!current()) return
       setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
-    })
+      setTimeout(() => { if (current()) setCopied(false) }, 2000)
+    }).catch(e => { if (current()) setError(String(e)) })
   }
 
   // 把 backend 样本转为展示用的列表
@@ -312,10 +320,15 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '14px 16px', borderBottom: '1px solid var(--border)', flexShrink: 0 }}>
           <GitCompareArrows size={15} color="var(--accent)" />
           <span style={{ fontWeight: 600, color: 'var(--text-bright)', fontSize: 14 }}>数据对比</span>
-          <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 4 }}>· 按主键分块归并，支持千万级大表</span>
+          <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 4 }}>· MySQL InnoDB 整数主键，只读快照对比</span>
           <button onClick={onClose} style={{ marginLeft: 'auto', color: 'var(--text-muted)', lineHeight: 0 }}><X size={15} /></button>
         </div>
 
+        <div style={{ padding: '8px 16px', color: 'var(--text-muted)', fontSize: 11 }}>
+          仅支持相同列结构的 MySQL InnoDB 基础表和完整非空整数主键。两侧快照分别建立；运行期间的跨库业务变动无法保证同一时点。差异样本仅供核对，不生成同步写入 SQL。
+          SET 字段按内部位图、ENUM 字段按内部序号比对并展示，以区分空集合、空成员及 ENUM 无效值；复制 JSON 包含字段编码说明。
+          单次对比最多运行 5 分钟，锁等待最多 30 秒。关闭窗口不会立即取消服务端扫描；超时后客户端释放专用连接，服务端查询与快照释放取决于断开处理。
+        </div>
         {/* 配置区 */}
         <div style={{ padding: '14px 16px', borderBottom: '1px solid var(--border)', flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 12 }}>
           {/* 源 → 目标 卡片 */}
@@ -323,11 +336,11 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
             {/* 源 */}
             <div style={diffCardStyle}>
               <div style={diffCardLabel}>源</div>
-              <SearchableSelect value={srcConnId} onChange={setSrcConnId} mono={false} searchPlaceholder="搜索连接…"
-                items={connections.filter(c => c.type !== 'ssh' && c.type !== 'local').map(c => ({ value: c.id, label: c.name }))} />
-              <SearchableSelect value={srcSchema} onChange={setSrcSchema}
+              <SearchableSelect value={srcConnId} onChange={setSrcConnId} disabled={running} mono={false} searchPlaceholder="搜索连接…"
+                items={connections.filter(c => ['mysql', 'mariadb', 'tidb', 'oceanBase'].includes(c.type)).map(c => ({ value: c.id, label: c.name }))} />
+              <SearchableSelect value={srcSchema} onChange={setSrcSchema} disabled={running}
                 options={srcSchemas} placeholder="选择 Schema" searchPlaceholder="搜索 schema…" />
-              <SearchableSelect value={srcTable} onChange={setSrcTable} disabled={loadingTables}
+              <SearchableSelect value={srcTable} onChange={setSrcTable} disabled={running || loadingTables}
                 options={tables.map(t => t.name)} placeholder="选择表" searchPlaceholder="搜索表名…" />
             </div>
 
@@ -336,11 +349,11 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
             {/* 目标 */}
             <div style={diffCardStyle}>
               <div style={diffCardLabel}>目标</div>
-              <SearchableSelect value={dstConnId} onChange={setDstConnId} mono={false} searchPlaceholder="搜索连接…"
-                items={connections.filter(c => c.type !== 'ssh' && c.type !== 'local').map(c => ({ value: c.id, label: c.name }))} />
-              <SearchableSelect value={dstSchema} onChange={setDstSchema}
+              <SearchableSelect value={dstConnId} onChange={setDstConnId} disabled={running} mono={false} searchPlaceholder="搜索连接…"
+                items={connections.filter(c => ['mysql', 'mariadb', 'tidb', 'oceanBase'].includes(c.type)).map(c => ({ value: c.id, label: c.name }))} />
+              <SearchableSelect value={dstSchema} onChange={setDstSchema} disabled={running}
                 options={dstSchemas} placeholder="选择 Schema" searchPlaceholder="搜索 schema…" />
-              <SearchableSelect value={dstTable} onChange={setDstTable} disabled={loadingDstTables}
+              <SearchableSelect value={dstTable} onChange={setDstTable} disabled={running || loadingDstTables}
                 options={dstTables.map(t => t.name)} placeholder="选择表" searchPlaceholder="搜索表名…" />
             </div>
           </div>
@@ -350,7 +363,7 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
             const hasPk = srcCols.some(c => c.key === 'PRI')
             return (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                <label style={labelStyle}>对比键（按主键分块归并，无主键时可手动指定）</label>
+                <label style={labelStyle}>对比键（必须选择完整非空整数主键）</label>
                 {!srcTable ? (
                   <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '4px 2px' }}>请先选择源表</div>
                 ) : srcCols.length === 0 ? (
@@ -365,18 +378,18 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
                       </span>
                     ))}
                     <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>已自动识别主键</span>
-                    <button onClick={() => setPkPickerOpen(true)} style={{ fontSize: 12, color: 'var(--accent)', padding: '2px 4px' }}>选择其他列</button>
+                    <button disabled={running} onClick={() => setPkPickerOpen(true)} style={{ fontSize: 12, color: 'var(--accent)', padding: '2px 4px' }}>查看主键列</button>
                   </div>
                 ) : (
                   // 手动指定（无主键表 / 用户自定义）：列出所有列供多选
                   <>
-                    {!hasPk && <div style={{ fontSize: 11, color: 'var(--warning)' }}>未检测到主键，请手动选择用于分块对比的列</div>}
+                    {!hasPk && <div style={{ fontSize: 11, color: 'var(--warning)' }}>未检测到主键，当前无法安全执行精确对比</div>}
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, maxHeight: 96, overflowY: 'auto' }}>
                       {srcCols.map(c => {
                         const idx = pkCols.indexOf(c.name)
                         const on = idx >= 0
                         return (
-                          <button key={c.name}
+                          <button key={c.name} disabled={running || c.key !== 'PRI'}
                             onClick={() => setPkCols(prev => on ? prev.filter(n => n !== c.name) : [...prev, c.name])}
                             style={{
                               display: 'inline-flex', alignItems: 'center', gap: 5,
@@ -395,7 +408,7 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
                       })}
                     </div>
                     {hasPk && (
-                      <button onClick={() => { setPkCols(srcCols.filter(c => c.key === 'PRI').map(c => c.name)); setPkPickerOpen(false) }}
+                      <button disabled={running} onClick={() => { setPkCols(srcCols.filter(c => c.key === 'PRI').map(c => c.name)); setPkPickerOpen(false) }}
                         style={{ alignSelf: 'flex-start', fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
                         收起 · 恢复为主键
                       </button>
@@ -408,7 +421,7 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
 
           {/* 操作行 */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            {(() => { const dis = running || !srcTable || !dstTable || !pkCols.length; return (
+            {(() => { const dis = running || !metadataReady || !srcTable || !dstTable || !pkCols.length; return (
             <button
               onClick={runDiff}
               disabled={dis}
@@ -427,7 +440,7 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
             )})()}
 
             {/* 进度条 */}
-            {running && progress && (
+            {running && progress && progressSelectionKey.current === selectionKey && (
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text-muted)' }}>
                 <div style={{
                   width: 160, height: 4, background: 'var(--surface-2)',
@@ -452,7 +465,7 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
             {!running && result && (isClean ? (
               <div style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '6px 12px', borderRadius: 8, background: 'rgba(22,163,74,0.10)', border: '1px solid rgba(22,163,74,0.30)', fontSize: 12.5, color: '#16a34a', fontWeight: 500 }}>
                 <CheckCircle2 size={15} strokeWidth={2.2} />
-                两表数据完全一致 · 已比对 {result.rows_scanned.toLocaleString()} 行（双表合计）
+                各自快照中未发现差异 · 已比对 {result.rows_scanned.toLocaleString()} 行（双表合计）
               </div>
             ) : (
               <div style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '6px 12px', borderRadius: 8, background: 'rgba(234,88,12,0.10)', border: '1px solid rgba(234,88,12,0.28)', fontSize: 12.5, color: '#ea580c', fontWeight: 500 }}>
@@ -500,21 +513,21 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
               {result.sample_capped && (
                 <span style={{ marginLeft: 8, fontSize: 11, color: 'var(--warning)', display: 'flex', alignItems: 'center', gap: 4 }}>
                   <AlertTriangle size={11} />
-                  仅显示前 200 条样本，同步 SQL 不完整
+                  仅展示部分差异样本，受每类 200 条或内存上限限制
                 </span>
               )}
 
-              {/* 复制同步 SQL */}
-              {sql && (
+              {/* 复制只读差异样本 */}
+              {resultContext && (
                 <div style={{ marginLeft: 'auto', paddingRight: 12, display: 'flex', alignItems: 'center' }}>
-                  <button onClick={copySql} style={{
+                  <button onClick={copySamples} style={{
                     display: 'flex', alignItems: 'center', gap: 5, fontSize: 12,
                     color: copied ? '#16a34a' : 'var(--text-muted)',
                     padding: '4px 10px', borderRadius: 6,
                     border: '1px solid var(--border)', background: 'var(--surface-2)',
                   }}>
                     {copied ? <Check size={12} /> : <Copy size={12} />}
-                    {copied ? '已复制' : result.sample_capped ? '复制样本 SQL' : '复制同步 SQL'}
+                    {copied ? '已复制' : result.sample_capped ? '复制部分差异 JSON' : '复制差异 JSON'}
                   </button>
                 </div>
               )}
@@ -522,9 +535,12 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
 
             {/* 差异表格 */}
             <div style={{ flex: 1, overflow: 'auto' }}>
+              <div style={{ padding: '6px 10px', fontSize: 11, color: 'var(--text-muted)' }}>
+                {comparisonSampleSummary(totalCounts[activeTab], tabRows.length, result.sample_capped)}
+              </div>
               {tabRows.length === 0 ? (
                 <div style={{ padding: 32, textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
-                  此分类无差异
+                  {totalCounts[activeTab] > 0 ? '该分类存在差异，但未保留可展示样本，请查看差异总数' : '此分类无差异'}
                 </div>
               ) : activeTab === 'diff' ? (
                 // 不一致行：展开每列对比
@@ -540,9 +556,10 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
                   <tbody>
                     {tabRows.map((d, ri) =>
                       displayCols.map(col => {
-                        const sv = d.srcRow[col] !== undefined ? String(d.srcRow[col] ?? '') : null
-                        const dv = d.dstRow[col] !== undefined ? String(d.dstRow[col] ?? '') : null
-                        const differs = sv !== dv
+                        const binary = isBinaryDiffType(result.column_types[col])
+                        const sv = diffCell(d.srcRow, col, binary)
+                        const dv = diffCell(d.dstRow, col, binary)
+                        const differs = !equalDiffCells(sv, dv)
                         return (
                           <tr key={`${ri}-${col}`} style={{ background: differs ? 'rgba(234,88,12,0.07)' : undefined }}>
                             {col === displayCols[0] && (
@@ -552,8 +569,8 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
                               </td>
                             )}
                             <td style={{ ...tdStyle, color: differs ? '#ea580c' : 'var(--text-muted)', fontWeight: differs ? 600 : 400 }}>{col}</td>
-                            <td style={tdStyle}>{sv !== null ? sv : <NullTag />}</td>
-                            <td style={tdStyle}>{dv !== null ? dv : <NullTag />}</td>
+                            <td style={tdStyle}><DiffCellValue cell={sv} encoding={result.column_encodings[col]} /></td>
+                            <td style={tdStyle}><DiffCellValue cell={dv} encoding={result.column_encodings[col]} /></td>
                           </tr>
                         )
                       })
@@ -577,9 +594,7 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
                         }}>
                           {displayCols.map(c => (
                             <td key={c} style={tdStyle}>
-                              {row[c] !== undefined
-                                ? (row[c] ?? <NullTag />)
-                                : <span style={{ color: 'var(--text-muted)' }}>-</span>}
+                              <DiffCellValue cell={diffCell(row, c, isBinaryDiffType(result.column_types[c]))} encoding={result.column_encodings[c]} />
                             </td>
                           ))}
                         </tr>
@@ -599,6 +614,16 @@ export default function DataDiffPanel({ connectionId, connType, schema, onClose 
 
 function NullTag() {
   return <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>NULL</span>
+}
+
+function DiffCellValue({ cell, encoding }: { cell: DiffCell; encoding?: string }) {
+  if (cell.kind === 'null') return <NullTag />
+  if (cell.kind === 'missing') return <span style={{ color: 'var(--text-muted)' }}>缺失列</span>
+  const encodingLabel = diffEncodingLabel(encoding)
+  if (encodingLabel) return <span title={`${encodingLabel}：${cell.value}`}>{encodingLabel} · {cell.value}</span>
+  if (cell.kind === 'binary') return <span title={`二进制（十六进制）：${cell.value}`}>二进制 · {cell.value}</span>
+  if (cell.value === '') return <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>空字符串</span>
+  return <span title={`文本：${JSON.stringify(cell.value)}`}>{JSON.stringify(cell.value)}</span>
 }
 
 const labelStyle: React.CSSProperties = { fontSize: 12, color: 'var(--text-muted)', fontWeight: 500 }

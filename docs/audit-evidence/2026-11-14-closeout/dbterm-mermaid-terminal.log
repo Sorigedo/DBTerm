@@ -1,0 +1,2 @@
+6:06:18 AM [vite] (client) Re-optimizing dependencies because lockfile has changed
+PASS actual xterm: baseline reproduces lost-release selection; recovery stops unpressed movement; pressed drag, release and blur behave correctly

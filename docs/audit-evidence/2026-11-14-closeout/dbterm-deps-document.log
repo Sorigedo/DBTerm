@@ -1,0 +1,1 @@
+PASS production Markdown/Mermaid rendering keeps headings, text and SVG; raw HTML and javascript links stay inactive after dependency updates.

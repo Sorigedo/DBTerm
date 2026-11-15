@@ -98,7 +98,7 @@ pub async fn ss_kill_spid(
     if !(1..=32767).contains(&spid) {
         return Err(format!("SPID {spid} 超出有效范围"));
     }
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = super::load_write_conn(&id, &storage)?;
     let entry_arc = super::get_entry(&id, &pool, &config, password.as_deref()).await?;
     let mut entry = entry_arc.lock().await;
     // spid 已验证为正整数，无注入风险
@@ -434,7 +434,9 @@ pub async fn ss_explain(
     if sql_text.trim().is_empty() {
         return Err("SQL 不能为空".into());
     }
-    let (config, password) = load_conn(&id, &storage)?;
+    let config = super::load_config(&id, &storage)?;
+    super::require_sql(&config, &sql_text)?;
+    let password = crate::keychain::get_password(&id)?;
     let entry_arc = super::get_entry(&id, &pool, &config, password.as_deref()).await?;
     let mut entry = entry_arc.lock().await;
 

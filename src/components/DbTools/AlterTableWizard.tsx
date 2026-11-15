@@ -1,8 +1,10 @@
-﻿import { useState, useEffect } from 'react'
+﻿import { useState, useEffect, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { Plus, Trash2, X, AlertTriangle, Loader2, Eye } from 'lucide-react'
 import type { ConnType } from '../../types'
-import { qid, tableRef as tableRefDialect, isMysqlFamily, isPgFamily } from '../../utils/sqlDialect'
+import { qid, tableRef as tableRefDialect, isMysqlFamily, isPgFamily, sqlServerRename } from '../../utils/sqlDialect'
+import { mysqlExistingColumnAlter } from './alterTableSafety'
+import { executeDuckAlter, DuckAlterOutcomeUnknown } from './duckAlterExecution'
 
 interface ColumnDef {
   name: string
@@ -105,7 +107,7 @@ function buildSqlServerAlter(schema: string, table: string, cols: ColumnDef[], c
       if (col.defaultValue !== orig.defaultValue && col.defaultValue)
         stmts.push(`ALTER TABLE ${tref} ADD DEFAULT ${lit(col.defaultValue)} FOR ${q(orig.name)};`)
       if (col.name !== orig.name)
-        stmts.push(`EXEC sp_rename '${schema ? `${schema}.` : ''}${table}.${orig.name}', '${col.name}', 'COLUMN';`)
+        stmts.push(sqlServerRename(schema, table, col.name, orig.name))
     }
   }
   return stmts.length === 0 ? '-- 无变更' : stmts.join('\n')
@@ -167,12 +169,12 @@ function buildAlterSql(schema: string, table: string, cols: ColumnDef[], connTyp
         if (col.dataType !== orig.dataType)
           stmts.push(`ALTER TABLE ${tref} ALTER COLUMN ${q(orig.name)} TYPE ${col.dataType};`)
         if (col.nullable !== orig.nullable)
-          stmts.push(`ALTER TABLE ${tref} ALTER COLUMN ${q(col.name)} ${col.nullable ? 'DROP' : 'SET'} NOT NULL;`)
+          stmts.push(`ALTER TABLE ${tref} ALTER COLUMN ${q(orig.name)} ${col.nullable ? 'DROP' : 'SET'} NOT NULL;`)
         if (col.defaultValue !== orig.defaultValue) {
           if (col.defaultValue)
-            stmts.push(`ALTER TABLE ${tref} ALTER COLUMN ${q(col.name)} SET DEFAULT '${col.defaultValue.replace(/'/g, "''")}';`)
+            stmts.push(`ALTER TABLE ${tref} ALTER COLUMN ${q(orig.name)} SET DEFAULT '${col.defaultValue.replace(/'/g, "''")}';`)
           else
-            stmts.push(`ALTER TABLE ${tref} ALTER COLUMN ${q(col.name)} DROP DEFAULT;`)
+            stmts.push(`ALTER TABLE ${tref} ALTER COLUMN ${q(orig.name)} DROP DEFAULT;`)
         }
         if (col.name !== orig.name)
           stmts.push(`ALTER TABLE ${tref} RENAME COLUMN ${q(orig.name)} TO ${q(col.name)};`)
@@ -183,7 +185,7 @@ function buildAlterSql(schema: string, table: string, cols: ColumnDef[], connTyp
     return stmts.length === 0 ? '-- 无变更' : stmts.join('\n')
   }
 
-  // MySQL / MariaDB / 其它
+  // MySQL / MariaDB：列摘要不包含完整定义，现有列只允许无损重命名。
   const parts: string[] = []
   for (const col of cols) {
     const invSuffix = isMaria && col._invisible ? ' INVISIBLE' : ''
@@ -200,17 +202,9 @@ function buildAlterSql(schema: string, table: string, cols: ColumnDef[], connTyp
       const orig = col._original
       if (!orig) continue
       const invisibleChanged = isMaria && col._invisible !== col._invisibleOrig
-      const changed = col.name !== orig.name || col.dataType !== orig.dataType ||
-        col.nullable !== orig.nullable || col.defaultValue !== orig.defaultValue ||
-        col.comment !== orig.comment || invisibleChanged
-      if (changed) {
-        const colDef = `${q(col.name)} ${col.dataType || orig.dataType}` +
-          (col.nullable ? '' : ' NOT NULL') +
-          (col.defaultValue ? ` DEFAULT '${col.defaultValue.replace(/'/g, "''")}'` : '') +
-          (isMy && col.comment ? ` COMMENT '${col.comment.replace(/'/g, "''")}'` : '') +
-          (isMaria ? (col._invisible ? ' INVISIBLE' : '') : '')
-        parts.push(`  MODIFY COLUMN ${colDef}`)
-      }
+      const change = mysqlExistingColumnAlter(connType ?? 'mysql', orig, col, invisibleChanged)
+      if (change.error) return `-- ${change.error}`
+      if (change.sql) parts.push(`  ${change.sql}`)
     }
   }
 
@@ -218,7 +212,12 @@ function buildAlterSql(schema: string, table: string, cols: ColumnDef[], connTyp
   return `ALTER TABLE ${tref}\n${parts.join(',\n')};`
 }
 
-export default function AlterTableWizard({ connectionId, schema, table, connType, onClose, onDone }: Props) {
+export default function AlterTableWizard(props: Props) {
+  // 目标改变即建立新的编辑会话，列摘要、预览和确认状态不可跨表复用。
+  return <AlterTableWizardSession key={JSON.stringify([props.connectionId, props.connType, props.schema, props.table])} {...props} />
+}
+
+function AlterTableWizardSession({ connectionId, schema, table, connType, onClose, onDone }: Props) {
   const isSqlite = connType === 'sqlite'
   const isMaria  = connType === 'mariadb'
   const isDuck   = connType === 'duckdb'
@@ -233,6 +232,12 @@ export default function AlterTableWizard({ connectionId, schema, table, connType
   const [previewLoading, setPreviewLoading] = useState(false)
   const [previewErr, setPreviewErr] = useState('')
   const [confirmed, setConfirmed] = useState(false)
+  const sqliteChangeKey = JSON.stringify([connectionId, schema, table, cols])
+  const sqliteChangeRef = useRef(sqliteChangeKey)
+  sqliteChangeRef.current = sqliteChangeKey
+  const [sqlitePreviewKey, setSqlitePreviewKey] = useState<string | null>(null)
+  const currentSqlitePreview = sqlitePreviewKey === sqliteChangeKey ? sqlitePreview : null
+  useEffect(() => { setConfirmed(false) }, [sqliteChangeKey])
   // MariaDB extra info
   const [mariaExtra, setMariaExtra] = useState<MariaTableExtraInfo | null>(null)
   // MA4.3 — MariaDB 应用期 (PERIOD FOR)
@@ -240,8 +245,11 @@ export default function AlterTableWizard({ connectionId, schema, table, connType
 
   const sql = buildAlterSql(schema, table, cols, connType, isMaria)
   const duckSqls = isDuck ? buildDuckAlterStatements(schema, table, cols) : []
+  const duckExecutingRef = useRef(false)
+  const [duckOutcomeUnknown, setDuckOutcomeUnknown] = useState(false)
 
   useEffect(() => {
+    let active = true
     ;(async () => {
       setLoading(true); setError('')
       try {
@@ -249,24 +257,28 @@ export default function AlterTableWizard({ connectionId, schema, table, connType
         const data = await invoke<{ name: string; dataType: string; nullable: boolean; key: string; defaultValue: string | null }[]>(
           'table_columns', { id: connectionId, schema, table }
         )
+        if (!active) return
         setCols(data.map(c => ({
           _id: uid(), _deleted: false, _isNew: false,
           _original: { name: c.name, dataType: c.dataType, nullable: c.nullable, defaultValue: c.defaultValue ?? '', comment: '' },
           name: c.name, dataType: c.dataType, nullable: c.nullable,
           defaultValue: c.defaultValue ?? '', comment: '', key: c.key,
         })))
-      } catch (e) { setError(String(e)) }
-      finally { setLoading(false) }
+      } catch (e) { if (active) setError(String(e)) }
+      finally { if (active) setLoading(false) }
     })()
+    return () => { active = false }
   }, [connectionId, schema, table])
 
   // MariaDB 专属：加载引擎/系统版本化/INVISIBLE 列信息（只用于展示，不影响已有改表逻辑）
   useEffect(() => {
     if (!isMaria) return
+    let active = true
     ;(async () => {
       try {
         const { invoke } = await import('@tauri-apps/api/core')
         const extra = await invoke<MariaTableExtraInfo>('mariadb_table_extra_info', { id: connectionId, schema, table })
+        if (!active) return
         setMariaExtra(extra)
         // 把 INVISIBLE/PERSISTENT/VIRTUAL 标志合并到列上
         setCols(prev => prev.map(col => {
@@ -275,12 +287,14 @@ export default function AlterTableWizard({ connectionId, schema, table, connType
           return { ...col, _invisible: ex.isInvisible, _invisibleOrig: ex.isInvisible, _isPersistent: ex.isPersistent, _isVirtual: ex.isVirtual }
         }))
       } catch { /* 失败则不展示额外信息，不影响基础改表功能 */ }
+      if (!active) return
       // MA4.3 — 解析 PERIOD FOR（应用期表）
       try {
         const { invoke } = await import('@tauri-apps/api/core')
         type R = { columns: string[]; rows: (string | null)[][] }
         const tref = tableRefDialect(connType, schema, table)
         const res = await invoke<R>('execute_query', { id: connectionId, sql: `SHOW CREATE TABLE ${tref}` })
+        if (!active) return
         const ddl = res.rows[0]?.[1] ?? ''
         // PERIOD FOR apptime (start_col, end_col)
         const periodRe = /PERIOD\s+FOR\s+`?(\w+)`?\s*\(`?(\w+)`?,\s*`?(\w+)`?\)/gi
@@ -292,6 +306,7 @@ export default function AlterTableWizard({ connectionId, schema, table, connType
         setMariaPeriods(found)
       } catch { /* PERIOD FOR 解析失败不阻断流程 */ }
     })()
+    return () => { active = false }
   }, [isMaria, connectionId, schema, table])
 
   // 新增列默认类型按方言取（sqlServer→NVARCHAR、Oracle→VARCHAR2、其余→VARCHAR）
@@ -313,6 +328,7 @@ export default function AlterTableWizard({ connectionId, schema, table, connType
   }
 
   async function loadSqlitePreview() {
+    const requestedKey = sqliteChangeKey
     setPreviewLoading(true); setPreviewErr(''); setSqlitePreview(null); setConfirmed(false)
     try {
       const { invoke } = await import('@tauri-apps/api/core')
@@ -330,14 +346,14 @@ export default function AlterTableWizard({ connectionId, schema, table, connType
       const preview = await invoke<{ kind: string; sqlScript: string }>('sqlite_alter_table_preview', {
         id: connectionId, table, cols: alterCols,
       })
-      setSqlitePreview(preview)
+      if (sqliteChangeRef.current === requestedKey) { setSqlitePreview(preview); setSqlitePreviewKey(requestedKey) }
     } catch (e) { setPreviewErr(String(e)) }
     finally { setPreviewLoading(false) }
   }
 
   async function execute() {
     if (isSqlite) {
-      if (!confirmed) { setExecErr('请先预览并确认变更'); return }
+      if (!confirmed || !currentSqlitePreview) { setExecErr('请先预览并确认变更'); return }
       setExecuting(true); setExecErr('')
       try {
         const { invoke } = await import('@tauri-apps/api/core')
@@ -360,20 +376,22 @@ export default function AlterTableWizard({ connectionId, schema, table, connType
       return
     }
     if (isDuck) {
-      if (duckSqls.length === 0) return
+      if (duckSqls.length === 0 || duckExecutingRef.current || duckOutcomeUnknown) return
+      duckExecutingRef.current = true
       setExecuting(true); setExecErr('')
       try {
         const { invoke } = await import('@tauri-apps/api/core')
-        for (const stmt of duckSqls) {
-          await invoke('execute_query', { id: connectionId, sql: stmt })
-        }
+        await executeDuckAlter(invoke, connectionId, duckSqls)
         setExecOk(true)
         onDone()
-      } catch (e) { setExecErr(String(e)) }
-      finally { setExecuting(false) }
+      } catch (e) {
+        setExecErr(String(e))
+        if (e instanceof DuckAlterOutcomeUnknown) setDuckOutcomeUnknown(true)
+      }
+      finally { duckExecutingRef.current = false; setExecuting(false) }
       return
     }
-    if (sql === '-- 无变更') return
+    if (sql.startsWith('--')) return
     setExecuting(true); setExecErr('')
     try {
       const { invoke } = await import('@tauri-apps/api/core')
@@ -517,15 +535,15 @@ export default function AlterTableWizard({ connectionId, schema, table, connType
                     </button>
                   </div>
                   {previewErr && <div className="dbtool-badge dbtool-badge--err" style={{ marginBottom: 8, fontSize: 12 }}>{previewErr}</div>}
-                  {sqlitePreview && (
+                  {currentSqlitePreview && (
                     <>
-                      {sqlitePreview.kind === 'rebuild' && (
+                      {currentSqlitePreview.kind === 'rebuild' && (
                         <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 8px', background: 'rgba(234,88,12,0.08)', border: '1px solid rgba(234,88,12,0.25)', borderRadius: 6, marginBottom: 8, fontSize: 12, color: 'var(--warning)' }}>
                           <AlertTriangle size={13} />
                           此变更需要重建表（12步骤），含事务+外键检查。强烈建议先备份。
                         </div>
                       )}
-                      <pre className="alter-sql-block" style={{ maxHeight: 280, overflowY: 'auto', fontSize: 11 }}>{sqlitePreview.sqlScript}</pre>
+                      <pre className="alter-sql-block" style={{ maxHeight: 280, overflowY: 'auto', fontSize: 11 }}>{currentSqlitePreview.sqlScript}</pre>
                       <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, fontSize: 12, cursor: 'pointer', color: 'var(--text)' }}>
                         <input type="checkbox" checked={confirmed} onChange={e => setConfirmed(e.target.checked)} />
                         我已审阅上述 SQL，确认执行
@@ -536,7 +554,7 @@ export default function AlterTableWizard({ connectionId, schema, table, connType
               ) : isDuck ? (
                 <>
                   <div style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, marginBottom: 8 }}>
-                    DuckDB ALTER 语句（{duckSqls.length} 条，逐条执行）
+                    DuckDB ALTER 语句（{duckSqls.length} 条，同一事务执行）
                   </div>
                   <pre className="alter-sql-block" style={{ fontSize: 11 }}>
                     {duckSqls.length > 0 ? duckSqls.join('\n') : '-- 无变更'}
@@ -558,17 +576,17 @@ export default function AlterTableWizard({ connectionId, schema, table, connType
           <button className="dbtool-btn dbtool-btn--cancel" onClick={onClose}>关闭</button>
           {isSqlite ? (
             <button className="dbtool-btn dbtool-btn--primary" onClick={execute}
-              disabled={executing || loading || !sqlitePreview || !confirmed}>
+              disabled={executing || loading || !currentSqlitePreview || !confirmed}>
               {executing ? <><Loader2 size={12} className="spin" />执行中…</> : '确认执行'}
             </button>
           ) : isDuck ? (
             <button className="dbtool-btn dbtool-btn--primary" onClick={execute}
-              disabled={executing || loading || duckSqls.length === 0}>
+              disabled={executing || loading || duckOutcomeUnknown || duckSqls.length === 0}>
               {executing ? '执行中…' : `执行 ALTER（${duckSqls.length} 条）`}
             </button>
           ) : (
             <button className="dbtool-btn dbtool-btn--primary" onClick={execute}
-              disabled={executing || loading || sql === '-- 无变更'}>
+              disabled={executing || loading || sql.startsWith('--')}>
               {executing ? '执行中…' : '执行 ALTER'}
             </button>
           )}

@@ -1,0 +1,66 @@
+warning: use of deprecated method `futures_channel::mpsc::UnboundedReceiver::<T>::try_next`: please use `try_recv` instead
+   --> vendor/sqlx-postgres/src/listener.rs:335:56
+    |
+335 |         if let Ok(Some(notification)) = self.buffer_rx.try_next() {
+    |                                                        ^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: variant `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/mod.rs:78:5
+   |
+70 | pub enum FrontendMessageFormat {
+   |          --------------------- variant in this enum
+...
+78 |     Flush = b'H',
+   |     ^^^^^
+   |
+   = note: `FrontendMessageFormat` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/flush.rs:11:12
+   |
+11 | pub struct Flush;
+   |            ^^^^^
+
+warning: `sqlx-postgres` (lib) generated 3 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.67s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/app_lib-bccc94f7de71602a)
+
+running 7 tests
+test commands::duckdb::memory_tests::real_duckdb_alter_batch_rollback_preserves_original_definition ... ok
+test commands::duckdb::memory_tests::real_duckdb_cache_changes_files_without_redirecting_retained_transaction ... ok
+test commands::duckdb::memory_tests::real_duckdb_nested_formatting_preserves_transaction_and_reports_cost ... DBTERM_NESTED_2049_ROWS_MS=34
+ok
+test commands::duckdb::memory_tests::real_duckdb_preserves_embedded_zero_text_and_recovers_after_budget_error ... ok
+test commands::duckdb::memory_tests::real_duckdb_preserves_empty_blob_and_null_as_distinct_values ... ok
+test commands::duckdb::memory_tests::real_duckdb_repeated_results_and_budget_failures_release_native_memory ... DBTERM_MEMORY_CYCLE=0 ENGINE_BYTES=0 RSS_KIB=186352
+DBTERM_MEMORY_CYCLE=1 ENGINE_BYTES=0 RSS_KIB=186528
+DBTERM_MEMORY_CYCLE=2 ENGINE_BYTES=0 RSS_KIB=186528
+DBTERM_MEMORY_CYCLE=3 ENGINE_BYTES=0 RSS_KIB=186544
+DBTERM_MEMORY_CYCLE=4 ENGINE_BYTES=0 RSS_KIB=186576
+DBTERM_MEMORY_CYCLE=5 ENGINE_BYTES=0 RSS_KIB=186576
+DBTERM_MEMORY_CYCLE=6 ENGINE_BYTES=0 RSS_KIB=186592
+DBTERM_MEMORY_CYCLE=7 ENGINE_BYTES=0 RSS_KIB=186592
+DBTERM_MEMORY_CYCLE=8 ENGINE_BYTES=0 RSS_KIB=186592
+DBTERM_MEMORY_CYCLE=9 ENGINE_BYTES=0 RSS_KIB=186592
+DBTERM_MEMORY_CYCLE=10 ENGINE_BYTES=0 RSS_KIB=186592
+DBTERM_MEMORY_CYCLE=11 ENGINE_BYTES=0 RSS_KIB=186592
+DBTERM_MEMORY_CYCLE=12 ENGINE_BYTES=0 RSS_KIB=186592
+DBTERM_MEMORY_CYCLE=13 ENGINE_BYTES=0 RSS_KIB=186592
+DBTERM_MEMORY_CYCLE=14 ENGINE_BYTES=0 RSS_KIB=186592
+DBTERM_MEMORY_CYCLE=15 ENGINE_BYTES=0 RSS_KIB=186592
+DBTERM_MEMORY_CYCLE=16 ENGINE_BYTES=0 RSS_KIB=186592
+DBTERM_MEMORY_CYCLE=17 ENGINE_BYTES=0 RSS_KIB=186592
+DBTERM_MEMORY_CYCLE=18 ENGINE_BYTES=0 RSS_KIB=186592
+DBTERM_MEMORY_CYCLE=19 ENGINE_BYTES=0 RSS_KIB=186592
+DBTERM_MEMORY_CYCLE=20 ENGINE_BYTES=0 RSS_KIB=186592
+DBTERM_MEMORY_CYCLE=21 ENGINE_BYTES=0 RSS_KIB=186592
+DBTERM_MEMORY_CYCLE=22 ENGINE_BYTES=0 RSS_KIB=186592
+DBTERM_MEMORY_CYCLE=23 ENGINE_BYTES=0 RSS_KIB=186592
+ok
+test commands::duckdb::memory_tests::real_duckdb_vector_scalar_parity_and_cross_chunk_validity ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 461 filtered out; finished in 0.93s
+

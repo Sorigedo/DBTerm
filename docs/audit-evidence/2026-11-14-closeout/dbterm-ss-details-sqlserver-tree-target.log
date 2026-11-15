@@ -1,0 +1,1 @@
+PASS actual SQL Server tree: rename, truncate and drop retain selected schema with same-name objects in dbo and a quoted Unicode schema; simulated IPC only, no SQL Server service.

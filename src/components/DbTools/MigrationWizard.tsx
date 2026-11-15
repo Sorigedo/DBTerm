@@ -5,7 +5,10 @@ import type { ConnConfig } from '../../types'
 import SearchableSelect from './SearchableSelect'
 import { notifySchemaChanged } from '../../utils/schemaRefresh'
 import { recreateObject } from '../../utils/dbCopyPaste'
-import { MIGRATABLE_DB_TYPES, SAME_ENGINE_ONLY_MIGRATE } from '../../utils/sqlDialect'
+import { MIGRATABLE_DB_TYPES, isMysqlFamily } from '../../utils/sqlDialect'
+import { supportedMigrationStrategies, type MigrationStrategy } from '../../utils/migrationChoices'
+import { migrationResultFailure, migrationResultNotices, markMigrationUnexecuted, migrationVerificationLabel, MIGRATION_BATCH_BOUNDARY } from './migrationRunSafety'
+import type { MigrationVerificationResult } from './migrationRunSafety'
 
 interface Props {
   connections: ConnConfig[]
@@ -20,10 +23,8 @@ interface Props {
   onClose: () => void
 }
 
-type Strategy = 'replace' | 'truncate' | 'append' | 'skip' | 'mirror' | 'shadow'
-type ConflictMode = 'error' | 'ignore' | 'upsert'
+type Strategy = MigrationStrategy
 type ContentMode = 'both' | 'structure' | 'data'
-type ErrorMode = 'stop' | 'skip'
 
 interface TableInfo {
   name: string
@@ -52,7 +53,9 @@ interface TableProgress {
   totalRows: number
   migratedRows: number
   done: boolean
+  unexecuted?: boolean
   error?: string
+  notice?: string
 }
 
 const STRATEGY_LABELS: Record<Strategy, string> = {
@@ -60,29 +63,15 @@ const STRATEGY_LABELS: Record<Strategy, string> = {
   truncate: '清空重写',
   append: '追加',
   skip: '跳过',
-  mirror: '镜像同步',
-  shadow: '原子替换（影子表）',
 }
 
 const STRATEGY_DESCS: Record<Strategy, string> = {
-  replace: 'DROP + CREATE + INSERT：删除目标表再重建后插入。会丢失原表的权限/触发器/外键',
-  truncate: 'TRUNCATE + INSERT：保留表结构、权限、触发器、外键，仅清空数据后写入（目标表须已存在）',
-  append: 'INSERT ONLY：目标表须已存在，直接追加数据',
+  replace: '按源表 SHOW CREATE TABLE 定义创建目标表并校验；若目标表已存在，先改名备份，验证成功后再清理备份。遇到外键依赖或触发器会中止',
+  truncate: '仅数据模式：先验证目标表结构与源表一致，再清空数据并写入；目标表须已存在且支持事务',
+  append: '仅数据模式：先验证目标表结构与源表一致，再追加数据；目标表须已存在且支持事务',
   skip: '目标表已存在则跳过；不存在则自动建表后迁移',
-  mirror: '按主键 UPSERT 写入，并删除源中已不存在的行，使目标成为源的精确副本。要求目标表有主键（支持 MySQL / PostgreSQL / SQLite）',
-  shadow: '建影子表灌数据后原子切换，近零停机、切换前目标表始终可用（支持 MySQL / PostgreSQL / SQLite；SQLite 影子表不复制主键/索引）',
 }
 
-const CONFLICT_LABELS: Record<ConflictMode, string> = {
-  error: '报错中止',
-  ignore: '忽略冲突行',
-  upsert: '按主键更新（UPSERT）',
-}
-const CONFLICT_DESCS: Record<ConflictMode, string> = {
-  error: '主键/唯一键冲突时报错并停止（默认）',
-  ignore: '冲突行跳过：MySQL INSERT IGNORE / PG ON CONFLICT DO NOTHING / SQLite INSERT OR IGNORE',
-  upsert: '冲突则按主键更新已有行（增量同步）：ON DUPLICATE KEY UPDATE / ON CONFLICT DO UPDATE',
-}
 const CONTENT_LABELS: Record<ContentMode, string> = {
   both: '结构+数据',
   structure: '仅结构',
@@ -93,7 +82,6 @@ const STEPS = ['选择源', '选择目标', '配置选项', '确认预览', '执
 
 // 迁移类型白名单从 sqlDialect 单一真源引入（与 SchemaBrowser 迁移入口共用，避免清单分叉）
 const DB_TYPES = MIGRATABLE_DB_TYPES as string[]
-const SAME_ENGINE_ONLY = new Set<string>(SAME_ENGINE_ONLY_MIGRATE)
 
 function isDbConn(c: ConnConfig) {
   return DB_TYPES.includes(c.type)
@@ -126,7 +114,7 @@ function ProgressBar({ value, max, color = 'var(--accent)' }: { value: number; m
   const pct = max > 0 ? Math.min(100, Math.round((value / max) * 100)) : 0
   return (
     <div style={{ width: '100%', height: 6, background: 'var(--surface-2)', borderRadius: 3, overflow: 'hidden' }}>
-      <div style={{ width: `${pct}%`, height: '100%', background: color, borderRadius: 3, transition: 'width 0.2s' }} />
+      <div className={max > 0 ? undefined : 'migration-progress-indeterminate'} style={{ width: max > 0 ? `${pct}%` : '35%', height: '100%', background: color, borderRadius: 3, transition: 'width 0.2s' }} />
     </div>
   )
 }
@@ -172,7 +160,7 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
 
   // Step 0: source
   const dbConns = connections.filter(isDbConn)
-  const [srcId, setSrcId] = useState(defaultSrcId ?? dbConns[0]?.id ?? '')
+  const [srcId, setSrcId] = useState(dbConns.find(c => c.id === defaultSrcId)?.id ?? dbConns[0]?.id ?? '')
   const [srcSchema, setSrcSchema] = useState('')
   const [srcSchemas, setSrcSchemas] = useState<string[]>([])
   // 迁移对象类型：表(搬结构+数据) / 视图·函数·存储过程(重建定义)，支持多类型同时迁移
@@ -189,33 +177,21 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
   const objLabel = objTypes.size === 1 ? OBJ_LABELS[[...objTypes][0]] : '对象'
 
   // Step 1: destination
-  const [dstId, setDstId] = useState(defaultDstId ?? dbConns[0]?.id ?? '')
+  const [dstId, setDstId] = useState(dbConns.find(c => c.id === defaultDstId)?.id ?? dbConns[0]?.id ?? '')
   const [dstSchema, setDstSchema] = useState('')
   const [dstSchemas, setDstSchemas] = useState<string[]>([])
 
   // Step 2: options
   const [strategy, setStrategy] = useState<Strategy>('replace')
   const [batchSize, setBatchSize] = useState(1000)
-  // DBA 高级选项
-  const [conflictMode, setConflictMode] = useState<ConflictMode>('error')
   const [content, setContent] = useState<ContentMode>('both')
   const [whereClause, setWhereClause] = useState('')
   const [rowLimit, setRowLimit] = useState(0)
-  const [disableFk, setDisableFk] = useState(true) // 行业标准：迁移导入默认关闭外键检查（避免父子表顺序报错、提速），完成后恢复
-  const [useTransaction, setUseTransaction] = useState(false)
-  const [errorMode, setErrorMode] = useState<ErrorMode>('stop')
   const [advOpen, setAdvOpen] = useState(false)
-  // 单表列映射
-  const [mapEnabled, setMapEnabled] = useState(false)
-  const [mapLoading, setMapLoading] = useState(false)
-  const [srcColumns, setSrcColumns] = useState<string[]>([])
-  const [dstColumns, setDstColumns] = useState<string[]>([])
-  const [colMap, setColMap] = useState<Record<string, string>>({}) // 源列 → 目标列（''=不迁移）
 
-  // 源/目标连接类型，及是否走「同引擎」专用迁移路径（该路径暂不支持冲突合并）
+  // 仅完整定义复制后端支持的 MySQL 系连接可迁移
   const srcConnType = connections.find(c => c.id === srcId)?.type ?? ''
   const dstConnType = connections.find(c => c.id === dstId)?.type ?? ''
-  const usesSameEnginePath = srcConnType !== '' && srcConnType === dstConnType && SAME_ENGINE_ONLY.has(srcConnType)
 
   // 选中对象（含类型）及派生量
   const selectedObjs = srcObjects.filter(o => selected.has(objKey(o)))
@@ -223,42 +199,11 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
   const selectedTableNames = selectedObjs.filter(o => o.type === 'table').map(o => o.name)
   const hasTables = selectedObjs.some(o => o.type === 'table')
   const hasNonTable = selectedObjs.some(o => o.type !== 'table')
-  // 列映射仅在「恰好选中单张表」时可用
-  const singleTable = (selectedObjs.length === 1 && selectedObjs[0].type === 'table') ? selectedObjs[0].name : null
-
-  async function loadMapColumns() {
-    if (!singleTable) return
-    setMapLoading(true)
-    try {
-      const { invoke } = await import('@tauri-apps/api/core')
-      const src = await invoke<{ name: string }[]>('table_columns', { id: srcId, schema: srcSchema, table: singleTable })
-      const srcNames = src.map(c => c.name)
-      let dstNames: string[] = []
-      try {
-        const dst = await invoke<{ name: string }[]>('table_columns', { id: dstId, schema: dstSchema, table: singleTable })
-        dstNames = dst.map(c => c.name)
-      } catch { /* 目标表可能尚不存在：默认按同名映射 */ }
-      setSrcColumns(srcNames)
-      setDstColumns(dstNames)
-      // 默认：同名映射（目标存在同名列才映射，否则保持同名）
-      const init: Record<string, string> = {}
-      srcNames.forEach(s => {
-        init[s] = dstNames.length === 0 ? s : (dstNames.includes(s) ? s : '')
-      })
-      setColMap(init)
-    } catch (e) {
-      setError(`读取列信息失败：${e}`)
-      setMapEnabled(false)
-    } finally {
-      setMapLoading(false)
-    }
-  }
 
   // Step 4: execution
   const [tableProgress, setTableProgress] = useState<TableProgress[]>([])
   const [currentTableIdx, setCurrentTableIdx] = useState(0)
   const [migrating, setMigrating] = useState(false)
-  const [startTime, setStartTime] = useState(0)
   const [elapsed, setElapsed] = useState(0)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const unlistenRef = useRef<(() => void) | null>(null)
@@ -270,7 +215,7 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
 
   // Q6: post-migration verify
   const [verifying, setVerifying] = useState(false)
-  const [verifyResults, setVerifyResults] = useState<{ table: string; srcCount: number; dstCount: number; countMatch: boolean; error?: string }[] | null>(null)
+  const [verifyResults, setVerifyResults] = useState<MigrationVerificationResult[] | null>(null)
 
   const [error, setError] = useState('')
   const [loading] = useState(false)
@@ -403,9 +348,8 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
         setError(`目标与源为同一连接和 Schema，将覆盖同名${objLabel}自身。请选择不同的目标 Schema 或连接（同库复制请用「复制粘贴」）`)
         return false
       }
-      // Oracle / SQL Server / ClickHouse 后端仅支持同引擎迁移
-      if (srcConnType !== dstConnType && (SAME_ENGINE_ONLY.has(srcConnType) || SAME_ENGINE_ONLY.has(dstConnType))) {
-        setError('Oracle / SQL Server / ClickHouse 仅支持同引擎迁移（源与目标须为相同数据库类型），请重新选择目标连接')
+      if (!isMysqlFamily(srcConnType) || !isMysqlFamily(dstConnType)) {
+        setError('完整定义迁移目前仅支持 MySQL 系数据库，请重新选择连接')
         return false
       }
     }
@@ -423,15 +367,21 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
   }
 
   const runMigration = async () => {
+    if (!isMysqlFamily(srcConnType) || !isMysqlFamily(dstConnType)
+      || (hasTables && !supportedMigrationStrategies(content).includes(strategy))) {
+      setError('当前迁移组合不能保证源表定义一致，已取消执行')
+      return
+    }
     const objs = selectedSorted // 按 表→视图→函数→存储过程 顺序执行
     setStep(4)
     setMigrating(true)
     setCurrentTableIdx(0)
     setTotalMigrated(0)
     const t0 = Date.now()
-    setStartTime(t0)
+    setVerifyResults(null)
     const errors: string[] = []
     let totalRows = 0
+    let nextObject = 0
 
     const progress: TableProgress[] = objs.map(o => ({
       table: o.name, objType: o.type, stage: '等待中', totalRows: 0, migratedRows: 0, done: false,
@@ -445,6 +395,7 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
       const { listen } = await import('@tauri-apps/api/event')
 
       for (let i = 0; i < objs.length; i++) {
+        nextObject = i
         setCurrentTableIdx(i)
         const obj = objs[i]
         const tbl = obj.name
@@ -465,6 +416,11 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
             progress[i] = { ...progress[i], done: true, stage: '失败', error: String(e) }
           }
           setTableProgress([...progress])
+          nextObject = i + 1
+          if (errors.length > 0) {
+            setTableProgress(markMigrationUnexecuted(progress, nextObject))
+            break
+          }
           continue
         }
 
@@ -490,40 +446,50 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
             strategy,
             batchSize,
             options: {
-              conflictMode: usesSameEnginePath ? 'error' : conflictMode,
+              conflictMode: 'error',
               content,
               whereClause: whereClause.trim() || null,
               rowLimit: rowLimit > 0 ? rowLimit : null,
-              disableFk,
-              useTransaction,
-              errorMode,
-              columnMap: (singleTable && mapEnabled)
-                ? Object.entries(colMap).filter(([, d]) => d).map(([s, d]) => [s, d])
-                : null,
+              disableFk: false,
+              useTransaction: true,
+              errorMode: 'stop',
+              columnMap: null,
             },
           })
-          totalRows += result.migratedRows
-          setTotalMigrated(totalRows)
           // failedRows=插入报错的行；skippedRows=未处理的行（stop中止剩余）
           // tableSkipped=表级跳过（skip策略命中已存在表：migratedRows/totalRows均0且有说明）
-          const tableSkipped = result.migratedRows === 0 && result.totalRows === 0 && result.failedRows === 0 && result.errors.length > 0
-          if (result.failedRows > 0) errors.push(`${tbl}: ${result.failedRows} 行失败${result.errors[0] ? `（${result.errors[0]}）` : ''}`)
-          const tag = result.failedRows > 0 ? '部分失败' : (tableSkipped || result.skippedRows > 0 ? '已跳过' : '完成')
-          const tableErr = result.failedRows > 0 ? (result.errors[0] || `${result.failedRows} 行失败`) : (tableSkipped ? result.errors[0] : undefined)
-          progress[i] = { ...progress[i], done: true, stage: tag, error: tableErr, migratedRows: result.migratedRows, totalRows: result.totalRows }
+          const tableSkipped = strategy === 'skip' && result.migratedRows === 0 && result.totalRows === 0 && result.failedRows === 0 && result.errors.some(message => message === '目标表已存在，按「跳过」策略未迁移')
+          const failure = migrationResultFailure(result, strategy)
+          if (failure) errors.push(`${tbl}: ${failure}`)
+          if (!failure) {
+            totalRows += result.migratedRows
+            setTotalMigrated(totalRows)
+          }
+          const tag = failure ? '失败（状态需核查）' : (tableSkipped || result.skippedRows > 0 ? '已跳过' : '完成')
+          const tableErr = failure || (tableSkipped ? result.errors[0] : undefined)
+          progress[i] = { ...progress[i], done: true, stage: tag, error: tableErr, notice: migrationResultNotices(result).join('；') || undefined, migratedRows: result.migratedRows, totalRows: result.totalRows }
         } catch (e) {
           const msg = `${tbl}: ${e}`
           errors.push(msg)
           progress[i] = { ...progress[i], done: true, stage: '失败', error: String(e) }
         } finally {
           unlisten()
+          unlistenRef.current = null
         }
 
         setTableProgress([...progress])
+        nextObject = i + 1
+        if (errors.length > 0) {
+          setTableProgress(markMigrationUnexecuted(progress, nextObject))
+          break
+        }
       }
+    } catch (e) {
+      errors.push(`迁移流程已停止：${String(e)}`)
+      setTableProgress(markMigrationUnexecuted(progress, nextObject))
     } finally {
       if (timerRef.current) clearInterval(timerRef.current)
-      setElapsed(Date.now() - (startTime || Date.now()))
+      setElapsed(Date.now() - t0)
       setMigrating(false)
       setResultOk(errors.length === 0)
       setResultErrors(errors)
@@ -538,7 +504,7 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
     setVerifyResults(null)
     try {
       const { invoke } = await import('@tauri-apps/api/core')
-      const results = await invoke<{ table: string; srcCount: number; dstCount: number; countMatch: boolean; error?: string }[]>(
+      const results = await invoke<MigrationVerificationResult[]>(
         'db_verify_migration',
         { srcId, srcSchema, dstId, dstSchema, tables: selectedTableNames },
       )
@@ -696,19 +662,13 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
           background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 9,
         } as const
         const labelStyle = { fontSize: 11.5, color: 'var(--text-muted)', fontWeight: 500 } as const
-        const checkbox = (label: string, tip: string, val: boolean, set: (b: boolean) => void) => (
-          <label data-tip={tip} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 12.5, color: 'var(--text)' }}>
-            <input type="checkbox" checked={val} onChange={e => set(e.target.checked)} style={{ accentColor: 'var(--accent)' }} />
-            {label}
-          </label>
-        )
         // 非表对象重建说明（混合迁移时与表选项并存）
         const nonTableNote = hasNonTable && (
           <div style={{ padding: '14px 14px', display: 'flex', gap: 10, alignItems: 'flex-start',
             background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 10 }}>
             <AlertCircle size={16} style={{ color: 'var(--accent)', flexShrink: 0, marginTop: 1 }} />
             <div style={{ fontSize: 12.5, color: 'var(--text)', lineHeight: 1.7 }}>
-              所选<strong>视图 / 函数 / 存储过程</strong>按<strong>定义重建</strong>迁移：在目标重新创建定义（先 <code>DROP IF EXISTS</code> 再创建），不涉及数据搬运，不受下方数据选项影响。
+              所选<strong>视图 / 函数 / 存储过程</strong>按源端 SHOW CREATE 定义创建，仅修改声明中的目标名，保留 DEFINER 等原始属性。目标对象已存在时创建失败，不会删除原对象。
               <br />注意：定义体内对源库表的引用<strong>不会改写</strong>，跨连接迁移时被引用对象需在目标已存在。
             </div>
           </div>
@@ -723,7 +683,7 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               <div style={labelStyle}>迁移策略</div>
               <SearchableSelect value={strategy} onChange={v => setStrategy(v as Strategy)} mono={false}
-                items={(['replace', 'truncate', 'append', 'skip', 'mirror', 'shadow'] as Strategy[]).map(s => ({ value: s, label: STRATEGY_LABELS[s] }))} />
+                items={supportedMigrationStrategies(content).map(s => ({ value: s, label: STRATEGY_LABELS[s] }))} />
               {(() => {
                 // 破坏性策略（删除/清空/替换数据）用危险色提示，追加/跳过用普通信息提示
                 const danger = strategy !== 'append' && strategy !== 'skip'
@@ -742,31 +702,16 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
               })()}
             </div>
 
-            {/* 迁移内容 + 冲突处理：轨道分段控件 */}
-            <div style={{ display: 'grid', gridTemplateColumns: content !== 'structure' ? '1fr 1.3fr' : '1fr', gap: 20 }}>
+            {/* 迁移内容：仅支持后端校验过的保真模式 */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 20 }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 <div style={labelStyle}>迁移内容</div>
                 <div style={track}>
                   {(['both', 'structure', 'data'] as ContentMode[]).map(c => (
-                    <div key={c} onClick={() => setContent(c)} style={seg(content === c)}>{CONTENT_LABELS[c]}</div>
+                    <div key={c} onClick={() => { setContent(c); setStrategy('replace') }} style={seg(content === c)}>{CONTENT_LABELS[c]}</div>
                   ))}
                 </div>
               </div>
-              {content !== 'structure' && !usesSameEnginePath && (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  <div style={labelStyle}>主键 / 唯一键冲突</div>
-                  <div style={track}>
-                    {(['error', 'ignore', 'upsert'] as ConflictMode[]).map(c => (
-                      <div key={c} onClick={() => setConflictMode(c)} data-tip={CONFLICT_DESCS[c]} style={seg(conflictMode === c)}>{CONFLICT_LABELS[c]}</div>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {content !== 'structure' && usesSameEnginePath && (
-                <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5 }}>
-                  Oracle / SQL Server / ClickHouse 同引擎迁移暂不支持冲突合并，主键/唯一键冲突将直接报错中止。
-                </div>
-              )}
             </div>
 
             {/* 高级选项：默认折叠 */}
@@ -775,7 +720,7 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
                 <button onClick={() => setAdvOpen(o => !o)} style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 12.5, fontWeight: 600, color: 'var(--text-bright)' }}>
                   <ChevronDown size={14} style={{ transform: advOpen ? 'none' : 'rotate(-90deg)', transition: 'transform 0.15s', color: 'var(--text-muted)' }} />
                   高级选项
-                  {!advOpen && <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--text-muted)' }}>WHERE 过滤 · 批大小 · 外键 / 事务 · 列映射</span>}
+                  {!advOpen && <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--text-muted)' }}>WHERE 过滤 · 批大小 · 行数限制</span>}
                 </button>
 
                 {advOpen && (
@@ -803,31 +748,9 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
                       </div>
                     </div>
 
-                    {/* 高级开关：行内 */}
-                    <div style={{ display: 'flex', gap: 22, flexWrap: 'wrap', alignItems: 'center', padding: '13px 16px', borderRadius: 10, background: 'var(--surface-2)', border: '1px solid var(--border)' }}>
-                      {checkbox('禁用外键检查', '迁移期间关闭外键约束（MySQL / SQLite），完成后恢复', disableFk, setDisableFk)}
-                      {checkbox('事务回滚', '整表写入包在一个事务里，任一步失败则整体回滚', useTransaction, setUseTransaction)}
-                      {checkbox('跳过错误行', `遇到错误行不中止，跳过并记录${useTransaction ? '（与事务冲突，以事务为准）' : ''}`, errorMode === 'skip', b => setErrorMode(b ? 'skip' : 'stop'))}
-                      {singleTable && checkbox('自定义列映射', '将源列对应到目标列，选「不迁移」可排除该列；默认按同名映射', mapEnabled, on => { setMapEnabled(on); if (on) loadMapColumns() })}
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                      为保持源表定义和数据一致，迁移固定启用事务回滚、外键检查、冲突时报错中止；不提供列映射或忽略错误。
                     </div>
-
-                    {/* 单表列映射展开区 */}
-                    {singleTable && mapEnabled && (mapLoading ? (
-                      <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '6px 12px' }}>读取列信息…</div>
-                    ) : (
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: '10px 12px', background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 8, maxHeight: 180, overflowY: 'auto' }}>
-                        {srcColumns.map(sc => (
-                          <div key={sc} style={{ display: 'grid', gridTemplateColumns: '1fr auto 1fr', gap: 8, alignItems: 'center' }}>
-                            <span style={{ fontSize: 12.5, fontFamily: 'var(--font-mono)', color: 'var(--text-bright)', overflow: 'hidden', textOverflow: 'ellipsis' }}>{sc}</span>
-                            <ArrowRight size={13} color="var(--text-muted)" />
-                            <SearchableSelect value={colMap[sc] ?? ''} onChange={v => setColMap(m => ({ ...m, [sc]: v }))}
-                              items={dstColumns.length === 0
-                                ? [{ value: '', label: '（不迁移）' }, { value: sc, label: `${sc}（同名新建）` }]
-                                : [{ value: '', label: '（不迁移）' }, ...dstColumns.map(dc => ({ value: dc, label: dc }))]} />
-                          </div>
-                        ))}
-                      </div>
-                    ))}
                   </>
                 )}
               </div>
@@ -853,6 +776,9 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
               </div>
             </div>
 
+            <div style={{ fontSize: 12, color: 'var(--text)', background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 8, padding: 12, lineHeight: 1.6 }}>
+              {MIGRATION_BATCH_BOUNDARY}
+            </div>
             <div>
               <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 6 }}>
                 迁移对象（{selectedObjs.length} 个{hasNonTable ? `：${selectedTableNames.length} 表 · ${selectedObjs.length - selectedTableNames.length} 视图/函数/存储过程` : ''}）
@@ -871,12 +797,11 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
               {[
                 ['策略', STRATEGY_LABELS[strategy]],
                 ['内容', CONTENT_LABELS[content]],
-                ...(content !== 'structure' ? [['冲突处理', CONFLICT_LABELS[usesSameEnginePath ? 'error' : conflictMode]]] : []),
+                ...(content !== 'structure' ? [['冲突处理', '报错中止']] : []),
                 ['批大小', `${batchSize.toLocaleString()} 行`],
                 ...(content !== 'structure' && whereClause.trim() ? [['WHERE', whereClause.trim()]] : []),
                 ...(content !== 'structure' && rowLimit > 0 ? [['行数限制', `${rowLimit.toLocaleString()} 行`]] : []),
-                ...(content !== 'structure' && (disableFk || useTransaction || errorMode === 'skip')
-                  ? [['选项', [disableFk && '禁用外键', useTransaction && '事务回滚', errorMode === 'skip' && '跳过错误行'].filter(Boolean).join(' · ')]] : []),
+                ...(content !== 'structure' ? [['选项', '事务回滚 · 外键检查']] : []),
               ].map(([k, v]) => (
                 <div key={k} style={{ background: 'var(--surface-2)', borderRadius: 8, padding: '8px 12px', border: '1px solid var(--border)' }}>
                   <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{k}</div>
@@ -893,7 +818,7 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                已迁移 {currentTableIdx + (migrating ? 0 : 1)} / {selectedObjs.length} 个对象
+                已处理 {tableProgress.filter(t => t.done).length} / {selectedObjs.length} 个对象
               </span>
               <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
                 耗时 {(elapsed / 1000).toFixed(1)}s
@@ -932,6 +857,9 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
                   {tp.error && (
                     <div style={{ fontSize: 11, color: 'var(--error)', marginTop: 4 }}>{tp.error}</div>
                   )}
+                  {tp.notice && (
+                    <div style={{ fontSize: 12, color: 'var(--text-bright)', marginTop: 8, border: '1px solid var(--accent)', borderRadius: 8, padding: 10, lineHeight: 1.5 }}>{tp.notice}</div>
+                  )}
                 </div>
                 )
               })}
@@ -957,21 +885,32 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
               }
             </div>
             <div style={{ fontWeight: 600, fontSize: 16, color: 'var(--text-bright)' }}>
-              {resultOk ? '迁移完成' : '迁移部分失败'}
+              {resultOk ? '对象处理结束，请核查迁移结果' : '迁移已因错误停止'}
+            </div>
+            <div style={{ width: '100%', boxSizing: 'border-box', fontSize: 12, lineHeight: 1.6, color: 'var(--text)', background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 8, padding: 12 }}>
+              {MIGRATION_BATCH_BOUNDARY}
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, width: '100%' }}>
               <div style={{ background: 'var(--surface-2)', borderRadius: 8, padding: '10px 14px', textAlign: 'center', border: '1px solid var(--border)' }}>
-                <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--text-bright)' }}>{selectedObjs.length}</div>
-                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>迁移对象数</div>
+                <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--text-bright)' }}>{tableProgress.filter(t => t.done).length} / {selectedObjs.length}</div>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>已处理 / 所选对象</div>
               </div>
               <div style={{ background: 'var(--surface-2)', borderRadius: 8, padding: '10px 14px', textAlign: 'center', border: '1px solid var(--border)' }}>
                 <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--text-bright)' }}>{totalMigrated.toLocaleString()}</div>
-                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>总行数</div>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>未报错对象返回的迁移行数</div>
               </div>
               <div style={{ background: 'var(--surface-2)', borderRadius: 8, padding: '10px 14px', textAlign: 'center', border: '1px solid var(--border)' }}>
                 <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--text-bright)' }}>{(elapsed / 1000).toFixed(1)}s</div>
                 <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>耗时</div>
               </div>
+            </div>
+            <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {tableProgress.map(tp => (
+                <div key={`${tp.objType ?? 'table'}::${tp.table}`} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, fontSize: 12, color: tp.error ? 'var(--error)' : 'var(--text)' }}>
+                  <span style={{ fontFamily: 'var(--font-mono)' }}>{tp.table}</span>
+                  <span>{tp.stage}</span>
+                </div>
+              ))}
             </div>
             {resultErrors.length > 0 && (
               <div style={{ width: '100%', background: 'var(--error-bg)', borderRadius: 8, padding: 12, border: '1px solid rgba(220,38,38,0.2)' }}>
@@ -981,12 +920,21 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
                 ))}
               </div>
             )}
+            {tableProgress.some(tp => tp.notice) && (
+              <div style={{ width: '100%', boxSizing: 'border-box', background: 'var(--surface-2)', border: '1px solid var(--accent)', borderRadius: 8, padding: 12 }}>
+                <div style={{ color: 'var(--text-bright)', fontSize: 12, fontWeight: 600, marginBottom: 8 }}>旧目标备份已保留，请核查后手动清理</div>
+                {tableProgress.filter(tp => tp.notice).map(tp => <div key={tp.table} style={{ color: 'var(--text)', fontSize: 12, lineHeight: 1.6, wordBreak: 'break-all' }}>{tp.table}：{tp.notice}</div>)}
+              </div>
+            )}
 
             {/* Q6 迁移校验结果 */}
             {verifyResults && (
               <div style={{ width: '100%', borderRadius: 8, overflow: 'hidden', border: '1px solid var(--border)' }}>
                 <div style={{ padding: '8px 12px', background: 'var(--surface-2)', fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', borderBottom: '1px solid var(--border)' }}>
-                  校验结果（行数对比）
+                  校验结果（MySQL 兼容库：结构及全量内容指纹；其他类型：仅行数）
+                </div>
+                <div style={{ padding: '8px 12px', fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                  MySQL 兼容库逐表读取双方各自的只读一致性快照，比对原始表定义及所有字段的内容指纹（包含生成列和不可见列）；不共享跨库或迁移时点快照，也不代表整库同一时点。其他类型仅比行数。使用筛选、行数限制、追加或跳过策略时，校验当前整表不等同于验证本次迁移子集。
                 </div>
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
                   <thead>
@@ -999,12 +947,12 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
                   </thead>
                   <tbody>
                     {verifyResults.map((r, i) => (
-                      <tr key={i} style={{ borderBottom: '1px solid var(--border-subtle)', background: r.countMatch ? undefined : 'rgba(220,38,38,0.04)' }}>
+                      <tr key={i} style={{ borderBottom: '1px solid var(--border-subtle)' }}>
                         <td style={{ padding: '6px 10px', fontFamily: 'var(--font-mono)', fontSize: 11 }}>{r.table}</td>
                         <td style={{ padding: '6px 10px', textAlign: 'right', fontFamily: 'var(--font-mono)' }}>{r.srcCount.toLocaleString()}</td>
                         <td style={{ padding: '6px 10px', textAlign: 'right', fontFamily: 'var(--font-mono)' }}>{r.dstCount.toLocaleString()}</td>
-                        <td style={{ padding: '6px 10px', textAlign: 'center', fontWeight: 600, fontSize: 11, color: r.error ? '#dc2626' : r.countMatch ? '#16a34a' : '#dc2626' }}>
-                          {r.error ? '错误' : r.countMatch ? '✓ 一致' : '✗ 不一致'}
+                        <td title={r.error || r.snapshotBoundary} style={{ padding: '6px 10px', textAlign: 'center', fontWeight: 600, fontSize: 11, color: migrationVerificationLabel(r) === '校验失败' || !r.countMatch || r.contentMatch === false || r.structureMatch === false ? 'var(--error)' : 'var(--text-muted)' }}>
+                          {migrationVerificationLabel(r)}
                         </td>
                       </tr>
                     ))}
@@ -1124,7 +1072,7 @@ export default function MigrationWizard({ connections, defaultSrcId, defaultSrcS
                     disabled={verifying}
                     style={{ padding: '7px 16px', borderRadius: 8, fontSize: 13, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--text)' }}
                   >
-                    {verifying ? '校验中…' : '验证迁移'}
+                    {verifying ? '核对中…' : '核对当前行数'}
                   </button>
                 )}
                 <button

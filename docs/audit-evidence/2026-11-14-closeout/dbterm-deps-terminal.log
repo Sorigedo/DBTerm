@@ -1,0 +1,1 @@
+PASS actual xterm: baseline reproduces lost-release selection; recovery stops unpressed movement; pressed drag, release and blur behave correctly

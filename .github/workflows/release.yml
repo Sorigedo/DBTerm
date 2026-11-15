@@ -114,10 +114,37 @@ jobs:
       - name: Test
         run: npm test -- --runInBand
 
+      - name: Rust test suite
+        if: matrix.label == 'macOS Apple Silicon'
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+
       - name: Build release assets
+        if: startsWith(matrix.os, 'windows-')
+        run: npm run tauri -- build ${{ matrix.args }}
+
+      - name: Build macOS release assets
+        if: startsWith(matrix.os, 'macos-')
         env:
           APPLE_SIGNING_IDENTITY: '-'
         run: npm run tauri -- build ${{ matrix.args }}
+
+      - name: Verify macOS release assets
+        if: startsWith(matrix.os, 'macos-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="src-tauri/target/${{ matrix.rust-target }}/release/bundle/macos/DBTerm.app"
+          dmg_dir="src-tauri/target/${{ matrix.rust-target }}/release/bundle/dmg"
+          test -d "$app"
+          test -n "$(find "$dmg_dir" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+
+      - name: Verify Windows release assets
+        if: startsWith(matrix.os, 'windows-')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $assets = Get-ChildItem "src-tauri/target/${{ matrix.rust-target }}/release/bundle" -Recurse -File | Where-Object { $_.Extension -in '.msi', '.exe' }
+          if (-not $assets) { throw 'No Windows installer assets found' }
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -203,7 +230,23 @@ jobs:
 
       - name: List release assets
         shell: bash
-        run: find renamed-assets -type f -maxdepth 1 -print | sort
+        run: |
+          set -euo pipefail
+          find renamed-assets -type f -maxdepth 1 -print | sort
+          version="${{ steps.app-version.outputs.version }}"
+          expected=(
+            "DBTerm-v${version}-macos-aarch64.dmg"
+            "DBTerm-v${version}-macos-x86_64.dmg"
+            "DBTerm-v${version}-windows-x86_64.msi"
+            "DBTerm-v${version}-windows-x86_64-setup.exe"
+            "DBTerm-v${version}-windows-aarch64-setup.exe"
+          )
+          for asset in "${expected[@]}"; do
+            if [[ ! -f "renamed-assets/${asset}" ]]; then
+              echo "Missing required release asset: ${asset}" >&2
+              exit 1
+            fi
+          done
 
       - name: Write release notes
         env:
@@ -247,8 +290,8 @@ jobs:
           ## 发布说明
 
           - 本版本安装包由 GitHub Actions 自动构建。
-          - macOS 未接入 Apple Developer 正式签名和公证前，首次打开可能需要在系统安全设置中允许。
-          - Windows 未接入代码签名证书前，首次安装可能出现系统安全提示。
+          - macOS 安装包未使用 Apple Developer ID 签名或公证；首次打开时 macOS 可能拦截，可在“系统设置 → 隐私与安全性”中允许打开。
+          - Windows 安装包未使用代码签名；Windows SmartScreen 可能显示未知发布者提示，请仅从本项目 GitHub Release 下载。
           - 发布前请下载对应平台安装包完成启动、连接、SSH、SQL 编辑器和设置页基础回归。
           EOF
 

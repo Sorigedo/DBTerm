@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/Users/Nico/workSpace/claude/DBterm/scripts/acceptance/sqlserver-ddl-triggers.py", line 5, in <module>
+    assert 'ddl_triggers::read_triggers' in source, 'table DDL silently omits trigger definitions and enabled/order state'
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: table DDL silently omits trigger definitions and enabled/order state

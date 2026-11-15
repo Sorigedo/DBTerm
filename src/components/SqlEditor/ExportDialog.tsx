@@ -37,8 +37,8 @@ interface DuckCopyResult {
 }
 
 const FORMAT_OPTS: { value: Format; label: string; ext: string; duckOnly?: boolean }[] = [
-  { value: 'csv',     label: 'CSV（逗号分隔）',         ext: 'csv'     },
-  { value: 'tsv',     label: 'TSV（制表符分隔）',        ext: 'tsv'     },
+  { value: 'csv',     label: 'CSV（极速，逗号分隔）',     ext: 'csv'     },
+  { value: 'tsv',     label: 'TSV（极速，制表符分隔）',    ext: 'tsv'     },
   { value: 'xlsx',    label: 'Excel（.xlsx）',          ext: 'xlsx'    },
   { value: 'json',    label: 'JSON（数组）',            ext: 'json'    },
   { value: 'jsonl',   label: 'JSON Lines（每行一条）',   ext: 'jsonl'   },
@@ -406,7 +406,7 @@ export default function ExportDialog({ connectionId, sqlText, schema, onClose, c
                         <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>
                           {resultSets.length > 1
                             ? `将按 ${resultSets.length} 个查询结果写入独立 Sheet`
-                            : '后端流式写入 Excel'}；Excel 单个工作表最多支持 1,048,576 行，超大数据建议用 CSV / TSV / JSON Lines
+                            : '后端流式写入 Excel'}；超过 1,048,576 行会自动拆分到新的 Sheet
                         </div>
                       )}
                     </div>

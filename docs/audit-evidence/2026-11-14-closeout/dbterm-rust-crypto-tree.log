@@ -1,0 +1,25 @@
+crypto-bigint v0.5.5
+└── elliptic-curve v0.13.8
+    ├── ecdsa v0.16.9
+    │   ├── p256 v0.13.2
+    │   │   ├── russh v0.46.0
+    │   │   │   └── app v0.1.23 (/Users/Nico/workSpace/claude/DBterm/src-tauri)
+    │   │   └── russh-keys v0.46.0
+    │   │       ├── app v0.1.23 (/Users/Nico/workSpace/claude/DBterm/src-tauri)
+    │   │       └── russh v0.46.0 (*)
+    │   ├── p384 v0.13.1
+    │   │   ├── russh v0.46.0 (*)
+    │   │   └── russh-keys v0.46.0 (*)
+    │   ├── p521 v0.13.3
+    │   │   ├── russh v0.46.0 (*)
+    │   │   └── russh-keys v0.46.0 (*)
+    │   └── russh-keys v0.46.0 (*)
+    ├── p256 v0.13.2 (*)
+    ├── p384 v0.13.1 (*)
+    ├── p521 v0.13.3 (*)
+    ├── primeorder v0.13.6
+    │   ├── p256 v0.13.2 (*)
+    │   ├── p384 v0.13.1 (*)
+    │   └── p521 v0.13.3 (*)
+    ├── russh v0.46.0 (*)
+    └── russh-keys v0.46.0 (*)

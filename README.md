@@ -116,9 +116,9 @@ DBTerm 基于 Tauri v2 + React + TypeScript + Rust 构建。前端负责高效�
 
 ### 环境要求
 
-- Node.js 18 或更高版本
+- Node.js 22.12 或更高版本；推荐当前 LTS，与 Vite / Mermaid 构建要求一致
 - npm
-- Rust stable
+- Rust stable（最低1.88，Excel安全解析依赖要求）
 - Tauri v2 所需系统依赖
 - 如需连接 Oracle、SQL Server、达梦、DuckDB，请按应用内驱动管理提示安装对应驱动
 

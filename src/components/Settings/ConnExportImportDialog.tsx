@@ -20,6 +20,7 @@ export default function ConnExportImportDialog({ onClose }: Props) {
 
   async function doExport() {
     if (!password) { toast.error('请输入加密口令'); return }
+    if ([...password].length < 12) { toast.error('加密口令至少需要 12 个字符'); return }
     if (password !== password2) { toast.error('两次口令不一致'); return }
     setBusy(true)
     try {
@@ -106,7 +107,7 @@ export default function ConnExportImportDialog({ onClose }: Props) {
                 <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 4 }}>加密口令</div>
                 <div style={{ position: 'relative' }}>
                   <input type={showPw ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)}
-                    placeholder="设置加密口令" style={{ ...INPUT, paddingRight: 36 }} />
+                    placeholder="至少 12 个字符" style={{ ...INPUT, paddingRight: 36 }} />
                   <button onClick={() => setShowPw(v => !v)}
                     style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex' }}>
                     {showPw ? <EyeOff size={14} /> : <Eye size={14} />}

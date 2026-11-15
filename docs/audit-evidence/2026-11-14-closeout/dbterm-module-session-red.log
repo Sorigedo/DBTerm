@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/Users/Nico/workSpace/claude/DBterm/scripts/acceptance/sqlserver-module-session.py", line 4, in <module>
+    assert 'sm.uses_ansi_nulls' in source and 'sm.uses_quoted_identifier' in source, 'module export omits creation session flags'
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: module export omits creation session flags

@@ -6,22 +6,54 @@
 //   // t 超出作用域时自动关闭隧道
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::{info, warn, instrument};
 use crate::tracing_utils::Timer;
 
 /// 全局隧道池：key = 连接 ID。复用已建立的 SSH 连接，避免每次查询都重新登录跳板机
-static POOL: OnceLock<Mutex<HashMap<String, Arc<DbTunnel>>>> = OnceLock::new();
-fn pool() -> &'static Mutex<HashMap<String, Arc<DbTunnel>>> {
+struct CachedTunnel { tunnel: Arc<DbTunnel>, last_used: std::time::Instant }
+static POOL: OnceLock<Mutex<HashMap<String, CachedTunnel>>> = OnceLock::new();
+fn pool() -> &'static Mutex<HashMap<String, CachedTunnel>> {
     POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn tunnel_cache_entry_expired(last_used: std::time::Instant, now: std::time::Instant, owners: usize) -> bool {
+    // Every caller and cached SQL client retains its own Arc<DbTunnel>. Only
+    // the registry owner remaining means no native connection depends on it.
+    owners == 1 && now.saturating_duration_since(last_used) >= std::time::Duration::from_secs(300)
+}
+
+fn start_tunnel_maintenance() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        tokio::spawn(async {
+            let mut interval=tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let now=std::time::Instant::now();
+                pool().lock().await.retain(|_, cached| !tunnel_cache_entry_expired(cached.last_used,now,Arc::strong_count(&cached.tunnel)));
+            }
+        });
+    });
+}
+
 /// 每个 key 的建连锁：防止并发首次建连时重复握手（TOCTOU 修复）
-static BUILD_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
-fn build_locks() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
+static BUILD_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+fn build_locks() -> &'static Mutex<HashMap<String, Weak<Mutex<()>>>> {
     BUILD_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn shared_build_lock(key: &str) -> Arc<Mutex<()>> {
+    let mut locks = build_locks().lock().await;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(key).and_then(Weak::upgrade) { return lock; }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key.to_string(), Arc::downgrade(&lock));
+    lock
 }
 
 /// SSH 隧道连接参数（由调用方直接构造）
@@ -43,9 +75,37 @@ impl DbTunnelCfg {
     }
 }
 
+/// Process-local salted digest: credential material is neither retained in the
+/// cache identity nor logged. A matching ID alone never authorizes tunnel reuse.
+fn tunnel_identity(cfg: &DbTunnelCfg, db_host: &str, db_port: u16) -> Result<[u8; 32], String> {
+    use std::io::Read;
+    static SALT: OnceLock<[u8; 16]> = OnceLock::new();
+    let mut digest = Sha256::new();
+    digest.update(SALT.get_or_init(|| *uuid::Uuid::new_v4().as_bytes()));
+    let key_path = crate::tester::expand_home(&cfg.key_path);
+    for value in [cfg.host.as_bytes(), cfg.user.as_bytes(), cfg.auth_type.as_bytes(), cfg.password.as_bytes(),
+        key_path.as_os_str().as_encoded_bytes(), db_host.as_bytes()] {
+        digest.update((value.len() as u64).to_le_bytes());
+        digest.update(value);
+    }
+    digest.update(cfg.effective_port().to_le_bytes());
+    digest.update(db_port.to_le_bytes());
+    if cfg.auth_type == "key" && !cfg.key_path.is_empty() {
+        const MAX_KEY_BYTES: u64 = 1024 * 1024;
+        let file = std::fs::File::open(&key_path).map_err(|e| format!("SSH 隧道：读取私钥身份失败: {e}"))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_KEY_BYTES + 1).read_to_end(&mut bytes).map_err(|e| format!("SSH 隧道：读取私钥身份失败: {e}"))?;
+        if bytes.len() as u64 > MAX_KEY_BYTES { return Err("SSH 隧道：私钥文件超过 1 MiB，已拒绝加载".into()); }
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+    Ok(digest.finalize().into())
+}
+
 /// 活跃的 DB SSH 隧道（RAII：drop 时自动停止代理并关闭 SSH 连接）
 pub struct DbTunnel {
     pub local_port: u16,
+    identity: [u8; 32],
     _task:   tokio::task::JoinHandle<()>,
     // Arc 持有引用，保证 SSH 连接在整个测试/查询期间不被关闭
     _handle: Arc<russh::client::Handle<crate::ssh::SshHandler>>,
@@ -64,48 +124,58 @@ impl DbTunnel {
         -> Result<Arc<Self>, String>
     {
         let _timer = Timer::new("open_shared_tunnel");
+        start_tunnel_maintenance();
+        let requested_identity = tunnel_identity(cfg, db_host, db_port)?;
         // 快速路径：池中已有活跃隧道直接返回
         {
-            let p = pool().lock().await;
-            if let Some(t) = p.get(key) {
-                if t.is_alive() {
+            let mut p = pool().lock().await;
+            if let Some(cached) = p.get_mut(key) {
+                let t=&cached.tunnel;
+                if t.identity == requested_identity && t.is_alive() {
                     info!("Reusing existing SSH tunnel");
+                    cached.last_used=std::time::Instant::now();
                     return Ok(t.clone());
                 }
             }
         }
 
         // 获取（或创建）该 key 的建连锁，序列化并发首次建连
-        let build_lock = {
-            let mut locks = build_locks().lock().await;
-            locks.entry(key.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
-        };
+        let build_lock = shared_build_lock(key).await;
         let _guard = build_lock.lock().await;
 
         // 再次检查：前一个等待者可能已建好并入池
         {
             let mut p = pool().lock().await;
-            if let Some(t) = p.get(key) {
-                if t.is_alive() {
+            if let Some(cached) = p.get_mut(key) {
+                let t=&cached.tunnel;
+                if t.identity == requested_identity && t.is_alive() {
                     info!("SSH tunnel built by concurrent request");
+                    cached.last_used=std::time::Instant::now();
                     return Ok(t.clone());
                 }
                 p.remove(key);
-                warn!("DB SSH tunnel disconnected, rebuilding");
+                warn!("DB SSH tunnel disconnected or configuration changed, rebuilding");
             }
         }
 
         // 耗时的 SSH 握手在池锁外执行（但在 build_lock 内，保证唯一性）
         let t = Arc::new(Self::open(cfg, db_host, db_port).await?);
         info!(local_port = t.local_port, "SSH tunnel established");
-        pool().lock().await.insert(key.to_string(), t.clone());
+        pool().lock().await.insert(key.to_string(), CachedTunnel { tunnel: t.clone(), last_used: std::time::Instant::now() });
         Ok(t)
+    }
+
+    pub async fn invalidate_shared(key: &str) {
+        let build_lock = shared_build_lock(key).await;
+        let _guard = build_lock.lock().await;
+        pool().lock().await.remove(key);
     }
 
     /// 建立 SSH 连接，绑定本地随机端口，代理到 db_host:db_port
     #[instrument(skip(cfg), fields(ssh_host = %cfg.host, ssh_port = cfg.effective_port(), db_host = %db_host, db_port = db_port))]
     pub async fn open(cfg: &DbTunnelCfg, db_host: &str, db_port: u16) -> Result<Self, String> {
         let _timer = Timer::new("open_tunnel");
+        let identity = tunnel_identity(cfg, db_host, db_port)?;
         // 统一展开私钥路径中的 ~（覆盖所有调用方：query/db_tx/redis/mongo/sqlserver…）
         let owned;
         let cfg = if cfg.key_path.starts_with("~/") {
@@ -135,6 +205,10 @@ impl DbTunnel {
         // ── 1. 建立 SSH 连接并认证 ──────────────────────────
         let handle = crate::ssh::connect_for_db_tunnel(cfg).await
             .map_err(|e| format!("SSH 隧道认证失败: {e}"))?;
+        if tunnel_identity(cfg, db_host, db_port)? != identity {
+            let _ = handle.disconnect(russh::Disconnect::ByApplication, "", "").await;
+            return Err("SSH 隧道：认证期间私钥发生变化，请重新连接".into());
+        }
         let handle = Arc::new(handle);
 
         // ── 2. OS 分配随机本地端口（绑定 127.0.0.1:0）──────
@@ -176,7 +250,7 @@ impl DbTunnel {
 
         log::info!("DB SSH 隧道就绪: 127.0.0.1:{local_port} → {db_host}:{db_port} (via {}:{})",
             cfg.host, cfg.effective_port());
-        Ok(DbTunnel { local_port, _task: task, _handle: handle })
+        Ok(DbTunnel { local_port, identity, _task: task, _handle: handle })
     }
 }
 
@@ -192,6 +266,67 @@ impl Drop for DbTunnel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_tunnel_cache_eviction_requires_no_external_or_cached_pool_owner() {
+        let cached=Arc::new(());
+        let pool_guard=cached.clone();
+        let now=std::time::Instant::now();
+        let old=now-std::time::Duration::from_secs(301);
+        assert!(!tunnel_cache_entry_expired(old,now,Arc::strong_count(&cached)));
+        drop(pool_guard);
+        assert!(tunnel_cache_entry_expired(old,now,Arc::strong_count(&cached)));
+        assert!(!tunnel_cache_entry_expired(now,now,Arc::strong_count(&cached)));
+    }
+
+    #[test]
+    fn shared_tunnel_identity_tracks_endpoint_and_credentials() {
+        let cfg = DbTunnelCfg { host: "jump-a".into(), user: "user-a".into(), auth_type: "password".into(), password: "secret-a".into(), ..Default::default() };
+        let original = tunnel_identity(&cfg, "database-a", 3306).unwrap();
+        assert_eq!(original, tunnel_identity(&cfg.clone(), "database-a", 3306).unwrap());
+        let mut changed = cfg.clone();
+        changed.port = 22;
+        assert_eq!(original, tunnel_identity(&changed, "database-a", 3306).unwrap());
+        for (field, value) in [("host", "jump-b"), ("user", "user-b"), ("auth", "agent"), ("password", "secret-b")] {
+            let mut changed = cfg.clone();
+            match field {
+                "host" => changed.host = value.into(),
+                "user" => changed.user = value.into(),
+                "auth" => changed.auth_type = value.into(),
+                _ => changed.password = value.into(),
+            }
+            assert_ne!(original, tunnel_identity(&changed, "database-a", 3306).unwrap(), "{field}");
+        }
+        assert_ne!(original, tunnel_identity(&cfg, "database-b", 3306).unwrap());
+        assert_ne!(original, tunnel_identity(&cfg, "database-a", 3307).unwrap());
+    }
+
+    #[test]
+    fn shared_tunnel_identity_tracks_key_rotation_and_rejects_unreadable_key() {
+        let path = std::env::temp_dir().join(format!("dbterm-tunnel-key-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"first-key").unwrap();
+        let cfg = DbTunnelCfg { host: "jump".into(), user: "user".into(), auth_type: "key".into(), key_path: path.to_string_lossy().into_owned(), ..Default::default() };
+        let first = tunnel_identity(&cfg, "database", 3306).unwrap();
+        std::fs::write(&path, b"other-key").unwrap();
+        assert_ne!(first, tunnel_identity(&cfg, "database", 3306).unwrap());
+        std::fs::remove_file(path).unwrap();
+        assert!(tunnel_identity(&cfg, "database", 3306).is_err());
+    }
+
+    #[tokio::test]
+    async fn build_locks_reuse_live_lock_and_release_unused_entries() {
+        let key = format!("lock-test-{}", uuid::Uuid::new_v4());
+        let first = shared_build_lock(&key).await;
+        let second = shared_build_lock(&key).await;
+        assert!(Arc::ptr_eq(&first, &second));
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        drop(second);
+        assert!(weak.upgrade().is_none());
+        let other = shared_build_lock("lock-cleanup-trigger").await;
+        assert!(!build_locks().lock().await.contains_key(&key));
+        drop(other);
+    }
 
     #[test]
     fn test_db_tunnel_cfg_default() {

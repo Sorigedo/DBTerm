@@ -13,7 +13,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "dist": "node build.js"
+    "dist": "node build.js",
+    "acceptance:gates": "python3 scripts/acceptance/platform-release-gates.py --local-only && python3 scripts/acceptance/cross-platform-build.py && python3 scripts/acceptance/desktop-startup-smoke.py && python3 scripts/acceptance/signing-install-gate.py && python3 scripts/acceptance/local-matrix.py"
   },
   "dependencies": {
     "@codemirror/lang-sql": "^6.10.0",
@@ -38,21 +39,24 @@
     "jspdf": "^4.2.1",
     "lucide-react": "^0.400.0",
     "markdown-it": "^15.0.0",
-    "mermaid": "^11.17.0",
+    "mermaid": "^12.3.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-icons": "^5.6.0",
     "sql-formatter": "^15.8.1",
     "trzsz": "^1.1.6",
-    "xlsx": "^0.18.5",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz",
     "zustand": "^4.5.4"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
-    "@vitejs/plugin-react": "^4.3.1",
+    "@vitejs/plugin-react": "^5.2.0",
     "typescript": "^5.5.2",
-    "vite": "^5.3.1"
+    "vite": "^7.3.8"
+  },
+  "engines": {
+    "node": ">=22.12.0"
   }
 }

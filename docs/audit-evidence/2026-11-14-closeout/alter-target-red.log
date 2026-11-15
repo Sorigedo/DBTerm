@@ -1,0 +1,20 @@
+node:internal/modules/run_main:107
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: late metadata from old table must not overwrite current table
++ actual - expected
+
++ 'older_field'
+- 'current_field'
+
+    at file:///Users/Nico/workSpace/claude/DBterm/scripts/acceptance/alter-wizard.mjs:55:9 {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: 'older_field',
+  expected: 'current_field',
+  operator: 'strictEqual',
+  diff: 'simple'
+}
+
+Node.js v26.8.2

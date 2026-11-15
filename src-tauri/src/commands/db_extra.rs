@@ -9,12 +9,14 @@ use crate::{
     storage::StorageState,
 };
 use super::duckdb::{DuckPool, dispatch_duck_query};
-use super::sqlserver::{SsPool, dispatch_ss_query, dispatch_ss_columns, dispatch_ss_ddl};
+use super::sqlserver::{SsPool, dispatch_ss_query, dispatch_ss_columns};
 use super::driver::DriverRegistry;
 
 // ── 客户端标识 ────────────────────────────────────────────────────────────────
 
 const CLIENT_TAG: &str = "/* DBTerm */";
+#[path = "sql_file_reader.rs"]
+mod sql_file_reader;
 fn tag_sql(sql: &str) -> String { format!("{CLIENT_TAG} {sql}") }
 
 // ── 扩展连接配置（与前端 DbExtra 对应）────────────────────────────────────────
@@ -37,9 +39,13 @@ struct DbConnCfg {
     #[serde(rename = "pgAppName",    default)] pg_app_name:    String,
 }
 
+
 impl DbConnCfg {
-    fn from_config(c: &ConnConfig) -> Self {
-        c.extra_json.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default()
+    fn from_config(c:&ConnConfig)->Result<Self,String>{
+        let Some(raw)=c.extra_json.as_deref().filter(|s|!s.trim().is_empty())else{return Ok(Self::default())};
+        let value:serde_json::Value=serde_json::from_str(raw).map_err(|_|"数据库连接配置格式错误，已拒绝连接".to_string())?;
+        if !value.is_object(){return Err("数据库连接配置格式错误，已拒绝连接".into())}
+        serde_json::from_value(value).map_err(|_|"数据库连接配置格式错误，已拒绝连接".to_string())
     }
     fn timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
@@ -47,10 +53,11 @@ impl DbConnCfg {
         )
     }
     /// 取 SSH 隧道密码：优先 extra_json 中的值，若为空则从 keychain 读取。
-    fn tunnel_password(&self, conn_id: &str) -> String {
-        if !self.ssh_password.is_empty() { return self.ssh_password.clone(); }
-        crate::keychain::get_password(&format!("{conn_id}::ssh-tunnel"))
-            .ok().flatten().unwrap_or_default()
+    fn tunnel_password(&self,conn_id:&str)->Result<String,String>{self.tunnel_password_with(conn_id,crate::keychain::get_password)}
+    fn tunnel_password_with(&self,conn_id:&str,lookup:impl FnOnce(&str)->Result<Option<String>,String>)->Result<String,String>{
+        if matches!(self.ssh_auth_type.as_str(),"agent"|"none"){return Ok(String::new())}
+        if !self.ssh_password.is_empty(){return Ok(self.ssh_password.clone())}
+        lookup(&format!("{conn_id}::ssh-tunnel")).map_err(|_|"读取数据库 SSH 隧道凭据失败，已拒绝连接".to_string()).map(Option::unwrap_or_default)
     }
 }
 
@@ -100,21 +107,18 @@ fn validate_where(w: &str) -> Result<(), String> {
     if w.trim().is_empty() {
         return Ok(());
     }
-    use sqlparser::{dialect::GenericDialect, parser::Parser};
-    use sqlparser::ast::{Statement, SetExpr};
-
-    let dummy = format!("SELECT 1 WHERE {w}");
-    let stmts = Parser::parse_sql(&GenericDialect {}, &dummy)
+    use sqlparser::{dialect::GenericDialect, parser::Parser, tokenizer::{Token, Tokenizer, Whitespace}};
+    let dialect = GenericDialect {};
+    let tokens = Tokenizer::new(&dialect, w).tokenize()
         .map_err(|e| format!("WHERE 子句语法错误: {e}"))?;
-
-    let expr = match stmts.first() {
-        Some(Statement::Query(q)) => match q.body.as_ref() {
-            SetExpr::Select(sel) => sel.selection.clone(),
-            _ => None,
-        },
-        _ => None,
-    }.ok_or("WHERE 子句解析失败")?;
-
+    if tokens.iter().any(|t| matches!(t, Token::Whitespace(Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_)))) {
+        return Err("WHERE 条件不允许注释，以免截断后续生成的语句".into());
+    }
+    let mut parser = Parser::new(&dialect).with_tokens(tokens);
+    let expr = parser.parse_expr().map_err(|e| format!("WHERE 子句语法错误: {e}"))?;
+    if parser.peek_token().token != Token::EOF {
+        return Err("WHERE 只能包含单个条件表达式，不能追加 SQL 语句或查询子句".into());
+    }
     check_safe_expr(&expr, 0)
 }
 
@@ -276,12 +280,13 @@ pub(crate) fn validate_path(path: &str) -> Result<(), String> {
 async fn mysql_connect(config: &ConnConfig, password: Option<&str>)
     -> Result<(sqlx::mysql::MySqlConnection, Option<std::sync::Arc<crate::db_tunnel::DbTunnel>>), String>
 {
-    use sqlx::{ConnectOptions, mysql::{MySqlConnectOptions, MySqlSslMode}};
+    use sqlx::{ConnectOptions, mysql::{MySqlConnectOptions}};
     use crate::commands::query::MySqlPwdExt;
     use crate::db_tunnel::{DbTunnel, DbTunnelCfg};
     use crate::tester::expand_home;
 
-    let cfg  = DbConnCfg::from_config(config);
+    let cfg  = DbConnCfg::from_config(config)?;
+    let tls_mode = crate::commands::query::mysql_tls_mode(config, &cfg.ssl_mode)?;
     let user = config.username.as_deref().unwrap_or("root");
     let db   = config.database.as_deref().unwrap_or("");
     let pwd  = password.unwrap_or("");
@@ -291,7 +296,7 @@ async fn mysql_connect(config: &ConnConfig, password: Option<&str>)
         let tcfg = DbTunnelCfg {
             host: cfg.ssh_host.clone(), port: cfg.ssh_port,
             user: cfg.ssh_user.clone(), auth_type: cfg.ssh_auth_type.clone(),
-            password: cfg.tunnel_password(&config.id), key_path: cfg.ssh_key_path.clone(),
+            password: cfg.tunnel_password(&config.id)?, key_path: cfg.ssh_key_path.clone(),
         };
         let t = DbTunnel::open_shared(&config.id, &tcfg,
             config.host.as_deref().unwrap_or("127.0.0.1"),
@@ -307,12 +312,7 @@ async fn mysql_connect(config: &ConnConfig, password: Option<&str>)
     let mut opts = MySqlConnectOptions::new().host(&h).port(p).username(user).password_opt(pwd);
     if !db.is_empty() { opts = opts.database(db); }
 
-    opts = opts.ssl_mode(match cfg.ssl_mode.as_str() {
-        "require"     => MySqlSslMode::Required,
-        "verify-ca"   => MySqlSslMode::VerifyCa,
-        "verify-full" => MySqlSslMode::VerifyIdentity,
-        _             => MySqlSslMode::Disabled,
-    });
+    opts = opts.ssl_mode(tls_mode);
     if !cfg.ssl_ca.is_empty()   { opts = opts.ssl_ca(expand_home(&cfg.ssl_ca)); }
     if !cfg.ssl_cert.is_empty() { opts = opts.ssl_client_cert(expand_home(&cfg.ssl_cert)); }
     if !cfg.ssl_key.is_empty()  { opts = opts.ssl_client_key(expand_home(&cfg.ssl_key)); }
@@ -328,11 +328,12 @@ async fn mysql_connect(config: &ConnConfig, password: Option<&str>)
 async fn pg_connect(config: &ConnConfig, password: Option<&str>)
     -> Result<(sqlx::postgres::PgConnection, Option<std::sync::Arc<crate::db_tunnel::DbTunnel>>), String>
 {
-    use sqlx::{ConnectOptions, postgres::{PgConnectOptions, PgSslMode}};
+    use sqlx::{ConnectOptions, postgres::{PgConnectOptions}};
     use crate::db_tunnel::{DbTunnel, DbTunnelCfg};
     use crate::tester::expand_home;
 
-    let cfg  = DbConnCfg::from_config(config);
+    let cfg  = DbConnCfg::from_config(config)?;
+    let tls_mode = crate::commands::query::pg_tls_mode(config, &cfg.ssl_mode)?;
     let user = config.username.as_deref().unwrap_or("postgres");
     let db   = config.database.as_deref().unwrap_or("postgres");
     let pwd  = password.unwrap_or("");
@@ -342,7 +343,7 @@ async fn pg_connect(config: &ConnConfig, password: Option<&str>)
         let tcfg = DbTunnelCfg {
             host: cfg.ssh_host.clone(), port: cfg.ssh_port,
             user: cfg.ssh_user.clone(), auth_type: cfg.ssh_auth_type.clone(),
-            password: cfg.tunnel_password(&config.id), key_path: cfg.ssh_key_path.clone(),
+            password: cfg.tunnel_password(&config.id)?, key_path: cfg.ssh_key_path.clone(),
         };
         let t = DbTunnel::open_shared(&config.id, &tcfg,
             config.host.as_deref().unwrap_or("127.0.0.1"),
@@ -360,12 +361,7 @@ async fn pg_connect(config: &ConnConfig, password: Option<&str>)
         .host(&h).port(p).username(user).password(pwd).database(db)
         .application_name(app_name);
 
-    opts = opts.ssl_mode(match cfg.ssl_mode.as_str() {
-        "require"     => PgSslMode::Require,
-        "verify-ca"   => PgSslMode::VerifyCa,
-        "verify-full" => PgSslMode::VerifyFull,
-        _             => PgSslMode::Disable,
-    });
+    opts = opts.ssl_mode(tls_mode);
     if !cfg.ssl_ca.is_empty()   { opts = opts.ssl_root_cert(expand_home(&cfg.ssl_ca)); }
     if !cfg.ssl_cert.is_empty() { opts = opts.ssl_client_cert(expand_home(&cfg.ssl_cert)); }
     if !cfg.ssl_key.is_empty()  { opts = opts.ssl_client_key(expand_home(&cfg.ssl_key)); }
@@ -557,27 +553,6 @@ fn csv_escape(v: &Option<String>) -> String {
     }
 }
 
-/// SQL INSERT VALUES 中的字符串转义（MySQL 风格：反斜杠 + 单引号 + 控制字符）
-/// 0xABCD 格式的 hex 字面量直接透传，不加引号（BLOB 导出）
-fn sql_escape_value(v: &Option<String>) -> String {
-    match v {
-        None => "NULL".to_string(),
-        Some(s) => {
-            // hex 字面量（BLOB 二进制）：0x 后全为十六进制字符，直接透传
-            if s.starts_with("0x") && s.len() > 2 && s[2..].chars().all(|c| c.is_ascii_hexdigit()) {
-                return s.clone();
-            }
-            let escaped = s.replace('\\', "\\\\")
-                .replace('\'', "\\'")
-                .replace('\0', "\\0")
-                .replace('\n', "\\n")
-                .replace('\r', "\\r")
-                .replace('\x1a', "\\Z");
-            format!("'{escaped}'")
-        }
-    }
-}
-
 /// 标准 SQL 字符串转义（PG / SQLite / Oracle / SQLServer / DuckDB / ClickHouse）：
 /// 仅把单引号翻倍，不用 MySQL 的反斜杠转义（这些库默认不识别反斜杠转义，会损坏数据）。
 fn sql_escape_value_std(v: &Option<String>) -> String {
@@ -683,6 +658,13 @@ pub struct ProcessEntry {
 }
 
 // ── 1. db_insert_rows ─────────────────────────────────────────────────────────
+#[path="draft_insert.rs"]
+mod draft_insert;
+pub(crate) use draft_insert::InsertDraft;
+#[tauri::command]
+pub async fn db_insert_drafts(id:String,schema:String,table:String,ss_schema:Option<String>,rows:Vec<InsertDraft>,storage:State<'_,StorageState>,registry:State<'_,DriverRegistry>)->Result<u64,String>{
+    draft_insert::db_insert_drafts(id,schema,table,ss_schema,rows,storage,registry).await
+}
 
 #[tauri::command]
 pub async fn db_insert_rows(
@@ -718,7 +700,7 @@ pub async fn db_insert_rows(
             super::oracle::insert_rows_impl(config, password, schema, table, columns, rows, &*registry).await
         }
         ConnType::Duckdb => {
-            duck_insert_rows_impl(&id, &config, &table, &columns, &rows, &duck_pool, &*registry).await
+            duck_insert_rows_impl(&id, &config, &schema, &table, &columns, &rows, &duck_pool, &*registry).await
         }
         ConnType::SqlServer => {
             ss_insert_rows_impl(&id, &config, &schema, &table, &columns, &rows, &ss_pool).await
@@ -727,48 +709,197 @@ pub async fn db_insert_rows(
     }
 }
 
+#[cfg(test)]
+mod batch_insert_atomicity_tests {
+    use super::*;
+
+    pub(super) async fn sqlite_fixture() -> (ConnConfig, sqlx::SqlitePool, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("dbterm-batch-{}.sqlite", uuid::Uuid::new_v4().simple()));
+        std::fs::File::create(&path).unwrap();
+        let config = serde_json::from_value(serde_json::json!({
+            "id":"batch-test","name":"batch-test","type":"sqlite","filePath":path.to_str().unwrap(),
+            "useSsl":false,"createdAt":0,"updatedAt":0
+        })).unwrap();
+        let pool = sqlx::SqlitePool::connect(&super::super::query::sqlite_url(&config).unwrap()).await.unwrap();
+        sqlx::query("CREATE TABLE batch_rows(id TEXT PRIMARY KEY, value TEXT)").execute(&pool).await.unwrap();
+        (config, pool, path)
+    }
+
+    #[tokio::test]
+    async fn sqlite_later_duplicate_rolls_back_every_insert() {
+        let (config, pool, path) = sqlite_fixture().await;
+        let result = sqlite_insert_rows_impl(&config, "main", "batch_rows",
+            &["id".into(), "value".into()],
+            &[vec![Some("1".into()), Some("first".into())], vec![Some("1".into()), Some("second".into())]]).await;
+        assert!(result.is_err());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM batch_rows").fetch_one(&pool).await.unwrap();
+        pool.close().await;
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(count, 0, "failed batch must leave no earlier inserted rows");
+    }
+
+    #[tokio::test]
+    async fn sqlite_valid_batch_commits_every_row() {
+        let (config, pool, path) = sqlite_fixture().await;
+        let inserted = sqlite_insert_rows_impl(&config, "main", "batch_rows",
+            &["id".into(), "value".into()],
+            &[vec![Some("1".into()), None], vec![Some("2".into()), Some("".into())]]).await.unwrap();
+        assert_eq!(inserted, 2);
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as("SELECT id,value FROM batch_rows ORDER BY id").fetch_all(&pool).await.unwrap();
+        assert_eq!(rows, vec![("1".into(), None), ("2".into(), Some("".into()))]);
+        pool.close().await;
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_malformed_later_row_leaves_existing_rows_untouched() {
+        let (config, pool, path) = sqlite_fixture().await;
+        sqlx::query("INSERT INTO batch_rows VALUES('existing','keep')").execute(&pool).await.unwrap();
+        let result = sqlite_insert_rows_impl(&config, "main", "batch_rows",
+            &["id".into(), "value".into()],
+            &[vec![Some("1".into()), None], vec![Some("2".into())]]).await;
+        assert!(result.is_err());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM batch_rows").fetch_one(&pool).await.unwrap();
+        pool.close().await;
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicitly selected disposable local MySQL: DBTERM_TEST_MYSQL_PORT"]
+    async fn mysql_rejects_nontransactional_target_and_rolls_back_later_chunk() {
+        let port: u16 = std::env::var("DBTERM_TEST_MYSQL_PORT").unwrap().parse().unwrap();
+        let config: ConnConfig = serde_json::from_value(serde_json::json!({
+            "id":"batch-local-test","name":"batch-local-test","type":"mysql","host":"127.0.0.1",
+            "port":port,"username":"root","useSsl":false,"createdAt":0,"updatedAt":0
+        })).unwrap();
+        let db = format!("dbterm_batch_{}", uuid::Uuid::new_v4().simple());
+        let (mut conn, _) = mysql_connect(&config, None).await.unwrap();
+        sqlx::query(&format!("CREATE DATABASE `{db}`")).execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("CREATE TABLE `{db}`.legacy(id VARCHAR(20) PRIMARY KEY) ENGINE=MyISAM")).execute(&mut conn).await.unwrap();
+        let legacy = mysql_insert_rows(&config, None, &db, "legacy", &["id".into()], &[vec![Some("1".into())]]).await;
+        let legacy_count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM `{db}`.legacy")).fetch_one(&mut conn).await.unwrap();
+        sqlx::query(&format!("CREATE TABLE `{db}`.safe(id VARCHAR(20) PRIMARY KEY) ENGINE=InnoDB")).execute(&mut conn).await.unwrap();
+        let mut rows: Vec<_> = (0..201).map(|i| vec![Some(i.to_string())]).collect();
+        rows.push(vec![Some("0".into())]);
+        let duplicate = mysql_insert_rows(&config, None, &db, "safe", &["id".into()], &rows).await;
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM `{db}`.safe")).fetch_one(&mut conn).await.unwrap();
+        let import_result = import_rows_stop(&config, None, &db, "safe", &["id".into()], &rows).await;
+        let import_count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {}.safe", q_mysql(&db))).fetch_one(&mut conn).await.unwrap();
+        assert!(import_result.is_err());
+        assert_eq!(import_count, 0, "stop-mode file import must roll back all chunks");
+        let valid = mysql_insert_rows(&config, None, &db, "safe", &["id".into()],
+            &[vec![Some("valid".into())],vec![Some("also-valid".into())]]).await;
+        sqlx::query(&format!("CREATE TABLE `{db}`.fractional(value DECIMAL(4,1)) ENGINE=InnoDB")).execute(&mut conn).await.unwrap();
+        let conversion = mysql_insert_rows(&config, None, &db, "fractional", &["value".into()], &[vec![Some("1.25".into())]]).await;
+        let fractional_count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM `{db}`.fractional")).fetch_one(&mut conn).await.unwrap();
+        sqlx::query(&format!("DROP DATABASE `{db}`")).execute(&mut conn).await.unwrap();
+        assert!(legacy.is_err(), "nontransactional target must be refused");
+        assert_eq!(legacy_count, 0);
+        assert!(duplicate.is_err());
+        assert_eq!(count, 0);
+        assert_eq!(valid.unwrap(), 2);
+        assert!(conversion.is_err(), "warning-producing coercion must roll back");
+        assert_eq!(fractional_count, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicitly selected disposable local PostgreSQL: DBTERM_TEST_PG_PORT"]
+    async fn pg_later_chunk_duplicate_rolls_back_first_chunk() {
+        let port: u16 = std::env::var("DBTERM_TEST_PG_PORT").unwrap().parse().unwrap();
+        let config: ConnConfig = serde_json::from_value(serde_json::json!({
+            "id":"batch-local-test","name":"batch-local-test","type":"postgres","host":"127.0.0.1",
+            "port":port,"username":"postgres","database":"postgres","useSsl":false,"createdAt":0,"updatedAt":0
+        })).unwrap();
+        let schema = format!("dbterm_batch_{}", uuid::Uuid::new_v4().simple());
+        let (mut conn, _) = pg_connect(&config, None).await.unwrap();
+        sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("CREATE TABLE {schema}.batch_rows(id TEXT PRIMARY KEY)")).execute(&mut conn).await.unwrap();
+        let mut rows: Vec<_> = (0..201).map(|i| vec![Some(i.to_string())]).collect();
+        rows.push(vec![Some("0".into())]);
+        let result = pg_insert_rows(&config, None, &schema, "batch_rows", &["id".into()], &rows).await;
+        let import_result = import_rows_stop(&config, None, &schema, "batch_rows", &["id".into()], &rows).await;
+        assert!(import_result.is_err());
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {schema}.batch_rows")).fetch_one(&mut conn).await.unwrap();
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&mut conn).await.unwrap();
+        assert!(result.is_err());
+        assert_eq!(count, 0);
+    }
+}
+
 async fn mysql_insert_rows(
     config: &ConnConfig, password: Option<&str>,
     schema: &str, table: &str,
     columns: &[String], rows: &[Vec<Option<String>>],
 ) -> Result<u64, String> {
+    use sqlx::{Connection, Row};
+    let n_cols = columns.len();
+    if n_cols == 0 || n_cols > 65_535 || rows.iter().any(|row| row.len() != n_cols) {
+        return Err("插入列数无效或行数据列数不一致，未执行写入".into());
+    }
+    if rows.is_empty() { return Ok(0); }
     let (mut conn, _tunnel) = mysql_connect(config, password).await?;
     let target = if schema.is_empty() { q_mysql(table) }
                  else { format!("{}.{}", q_mysql(schema), q_mysql(table)) };
+    let mut tx = conn.begin().await.map_err(|e| format!("开启插入事务失败: {e}"))?;
+    super::query::mysql_require_atomic_table(&mut *tx, schema, table).await?;
     let col_list = columns.iter().map(|c| q_mysql(c)).collect::<Vec<_>>().join(", ");
-    let n_cols = columns.len();
-    // 构建 VALUES (?,?,...), (?,?,...)
     let row_placeholders = (0..n_cols).map(|_| "?").collect::<Vec<_>>().join(", ");
-    let all_placeholders = rows.iter().map(|_| format!("({row_placeholders})")).collect::<Vec<_>>().join(", ");
-    let sql = tag_sql(&format!("INSERT INTO {target} ({col_list}) VALUES {all_placeholders}"));
-
-    let mut q = sqlx::query(&sql);
-    for row in rows {
-        for val in row {
-            q = q.bind(val.as_deref());
+    let mut total = 0;
+    for chunk in rows.chunks((65_535 / n_cols).min(200)) {
+        let all_placeholders = chunk.iter().map(|_| format!("({row_placeholders})")).collect::<Vec<_>>().join(", ");
+        let sql = tag_sql(&format!("INSERT INTO {target} ({col_list}) VALUES {all_placeholders}"));
+        let mut q = sqlx::query(&sql);
+        for row in chunk { for val in row { q = q.bind(val.as_deref()); } }
+        match q.execute(&mut *tx).await {
+            Ok(res) => total += res.rows_affected(),
+            Err(e) => {
+                tx.rollback().await.map_err(|r| format!("插入失败: {e}；回滚未确认: {r}"))?;
+                return Err(format!("插入失败，整批已回滚: {e}"));
+            }
+        }
+        let warning_row = sqlx::Executor::fetch_one(&mut *tx, "SHOW COUNT(*) WARNINGS").await
+            .map_err(|e| format!("核验插入警告失败，事务未提交: {e}"))?;
+        let warnings: u64 = warning_row.try_get(0).map_err(|e| format!("解析插入警告失败，事务未提交: {e}"))?;
+        if warnings > 0 {
+            tx.rollback().await.map_err(|e| format!("写入出现警告，回滚未确认: {e}"))?;
+            return Err("写入出现数据库警告，可能存在值转换，整批已回滚".into());
         }
     }
-    let res = q.execute(&mut conn).await.map_err(|e| format!("插入失败: {e}"))?;
-    Ok(res.rows_affected())
+    tx.commit().await.map_err(|e| format!("插入提交未获确认，结果未知，请核对目标，禁止自动重试: {e}"))?;
+    Ok(total)
 }
+
+#[path="pg_write_types.rs"]
+mod pg_write_types;
+
+#[cfg(test)]
+#[path="pg_insert_fidelity_tests.rs"]
+mod pg_insert_fidelity_tests;
 
 async fn pg_insert_rows(
     config: &ConnConfig, password: Option<&str>,
     schema: &str, table: &str,
     columns: &[String], rows: &[Vec<Option<String>>],
 ) -> Result<u64, String> {
+    use sqlx::Connection;
+    let n_cols = columns.len();
+    if n_cols == 0 || n_cols > 65_535 || rows.iter().any(|row| row.len() != n_cols) {
+        return Err("插入列数无效或行数据列数不一致，未执行写入".into());
+    }
+    if rows.is_empty() { return Ok(0); }
     let (mut conn, _tunnel) = pg_connect(config, password).await?;
     let schema_name = if schema.is_empty() { "public" } else { schema };
     let target = format!("{}.{}", q_dq(schema_name), q_dq(table));
     let col_list = columns.iter().map(|c| q_dq(c)).collect::<Vec<_>>().join(", ");
-    let n_cols = columns.len();
-
-    const PG_BATCH: usize = 200;
+    let mut tx = conn.begin().await.map_err(|e| format!("开启插入事务失败: {e}"))?;
+    let types=pg_write_types::target_types(&mut tx,schema_name,table).await?;
+    let types=columns.iter().map(|name|types.get(name).cloned().ok_or_else(||format!("目标字段不存在: {name}"))).collect::<Result<Vec<_>,_>>()?;
     let mut total: u64 = 0;
-    for chunk in rows.chunks(PG_BATCH) {
+    for chunk in rows.chunks((65_535 / n_cols).min(200)) {
         let mut idx = 1usize;
         let all_ph = chunk.iter().map(|_| {
-            let row_ph = (0..n_cols).map(|_| { let s = format!("${idx}"); idx += 1; s }).collect::<Vec<_>>().join(", ");
+            let row_ph = types.iter().map(|kind| { let s = format!("CAST(${idx}::text AS {kind})"); idx += 1; s }).collect::<Vec<_>>().join(", ");
             format!("({row_ph})")
         }).collect::<Vec<_>>().join(", ");
         let sql = tag_sql(&format!("INSERT INTO {target} ({col_list}) VALUES {all_ph}"));
@@ -778,11 +909,31 @@ async fn pg_insert_rows(
                 q = q.bind(val.as_deref());
             }
         }
-        let res = q.execute(&mut conn).await.map_err(|e| format!("插入失败: {e}"))?;
-        total += res.rows_affected();
+        match q.execute(&mut *tx).await {
+            Ok(res) => total += res.rows_affected(),
+            Err(e) => {
+                tx.rollback().await.map_err(|r| format!("插入失败: {e}；回滚未确认: {r}"))?;
+                return Err(format!("插入失败，整批已回滚: {e}"));
+            }
+        }
     }
+    tx.commit().await.map_err(|e| format!("插入提交未获确认，结果未知，请核对目标，禁止自动重试: {e}"))?;
     Ok(total)
 }
+
+#[derive(Clone,serde::Deserialize)]
+#[serde(rename_all="camelCase")]
+pub(crate) struct DeleteBaseline { pub(crate) columns:Vec<String>, pub(crate) rows:Vec<Vec<Option<String>>> }
+impl DeleteBaseline {
+ fn validate(&self,keys:&[String],values:&[Vec<Option<String>>])->Result<(),String>{
+  validate_native_insert_rows(&self.columns,&self.rows)?;
+  if self.rows.len()!=values.len()||self.rows.len()>10000||self.columns.iter().collect::<std::collections::HashSet<_>>().len()!=self.columns.len(){return Err("删除基线数量无效".into());}
+  for name in &self.columns{validate_ident(name)?;}
+  for (row,pk) in self.rows.iter().zip(values){if pk.len()!=keys.len(){return Err("删除定位数量无效".into());}for (key,value)in keys.iter().zip(pk){let i=self.columns.iter().position(|c|c==key).ok_or("删除基线缺少定位字段")?;if row[i]!=*value{return Err("删除定位值与原始结果不一致".into());}}}Ok(())
+ }
+}
+#[path="optimistic_delete.rs"]
+mod optimistic_delete;
 
 // ── 2. db_delete_rows ─────────────────────────────────────────────────────────
 
@@ -791,93 +942,194 @@ pub async fn db_delete_rows(
     id: String,
     schema: String,
     table: String,
+    ss_schema: Option<String>,
     pk_columns: Vec<String>,
     pk_values_list: Vec<Vec<Option<String>>>,
+    baseline: Option<DeleteBaseline>,
     storage: State<'_, StorageState>,
     duck_pool: State<'_, DuckPool>,
     ss_pool: State<'_, SsPool>,
     registry: State<'_, DriverRegistry>,
 ) -> Result<u64, String> {
+    let _=(&duck_pool,&ss_pool);
     if pk_columns.is_empty() { return Err("主键列名不能为空".to_string()); }
     if pk_values_list.is_empty() { return Ok(0); }
     validate_ident(&table)?;
     if !schema.is_empty() { validate_ident(&schema)?; }
     for c in &pk_columns { validate_ident(c)?; }
 
+    let baseline=baseline.ok_or("缺少删除原始行基线，请刷新后重试")?;baseline.validate(&pk_columns,&pk_values_list)?;
     let (config, password) = load_conn(&id, &storage).await?;
     ensure_writable(&config)?;
     match config.conn_type {
         ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => {
-            mysql_delete_rows(&config, password.as_deref(), &schema, &table, &pk_columns, &pk_values_list).await
+            optimistic_delete::mysql_delete_rows(&config, password.as_deref(), &schema, &table, &pk_columns, &pk_values_list, &baseline).await
         }
         ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
-            pg_delete_rows(&config, password.as_deref(), &schema, &table, &pk_columns, &pk_values_list).await
+            optimistic_delete::pg_delete_rows(&config, password.as_deref(), &schema, &table, &pk_columns, &pk_values_list, &baseline).await
         }
         ConnType::Sqlite => {
-            sqlite_delete_rows_impl(&config, &schema, &table, &pk_columns, &pk_values_list).await
+            optimistic_delete::sqlite_delete_rows_impl(&config, &schema, &table, &pk_columns, &pk_values_list, &baseline).await
         }
         ConnType::Oracle => {
-            super::oracle::delete_rows_impl(config, password, schema, table, pk_columns, pk_values_list, &*registry).await
+            super::oracle::delete_rows_impl(config, password, schema, table, pk_columns, pk_values_list, Some(baseline), &*registry).await
         }
         ConnType::Duckdb => {
-            duck_delete_rows_impl(&id, &config, &table, &pk_columns, &pk_values_list, &duck_pool, &*registry).await
+            optimistic_delete::duck_delete_rows(&id, &config, &table, &schema, &pk_columns, &pk_values_list, &baseline, &*registry).await
         }
         ConnType::SqlServer => {
-            ss_delete_rows_impl(&id, &config, &schema, &table, &pk_columns, &pk_values_list, &ss_pool).await
+            optimistic_delete::ss_delete_rows(&id, &config, &schema, &table, &pk_columns, &pk_values_list, &baseline, ss_schema.as_deref()).await
         }
         _ => Err("此连接类型不支持行删除操作".into()),
     }
 }
 
+#[cfg(test)]
+#[path = "optimistic_delete_tests.rs"]
+mod optimistic_delete_tests;
+
+#[cfg(test)]
+#[path = "pg_delete_fidelity_tests.rs"]
+mod pg_delete_fidelity_tests;
+
+#[cfg(test)]
+mod delete_atomicity_tests {
+    use super::*;
+
+    async fn fixture() -> (ConnConfig, sqlx::SqlitePool, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("dbterm-delete-{}.sqlite", uuid::Uuid::new_v4().simple()));
+        std::fs::File::create(&path).unwrap();
+        let config = serde_json::from_value(serde_json::json!({
+            "id":"delete-test","name":"delete-test","type":"sqlite","filePath":path.to_str().unwrap(),
+            "useSsl":false,"createdAt":0,"updatedAt":0
+        })).unwrap();
+        let pool = sqlx::SqlitePool::connect(&super::super::query::sqlite_url(&config).unwrap()).await.unwrap();
+        sqlx::query("CREATE TABLE delete_rows(id TEXT UNIQUE, value TEXT); INSERT INTO delete_rows VALUES('1','first'),('2','second'),(NULL,'null-key')").execute(&pool).await.unwrap();
+        (config, pool, path)
+    }
+
+    #[tokio::test]
+    async fn sqlite_later_trigger_failure_restores_earlier_deleted_row() {
+        let (config, pool, path) = fixture().await;
+        sqlx::query("CREATE TRIGGER block_second BEFORE DELETE ON delete_rows WHEN OLD.id='2' BEGIN SELECT RAISE(ABORT,'blocked'); END").execute(&pool).await.unwrap();
+        let result = sqlite_delete_rows_impl(&config, "main", "delete_rows", &["id".into()],
+            &[vec![Some("1".into())],vec![Some("2".into())]]).await;
+        assert!(result.is_err());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delete_rows").fetch_one(&pool).await.unwrap();
+        pool.close().await; std::fs::remove_file(path).unwrap();
+        assert_eq!(count, 3, "failed delete batch must restore earlier deletion");
+    }
+
+    #[tokio::test]
+    async fn sqlite_malformed_later_key_leaves_all_rows() {
+        let (config, pool, path) = fixture().await;
+        let result = sqlite_delete_rows_impl(&config, "main", "delete_rows", &["id".into()],
+            &[vec![Some("1".into())],vec![]]).await;
+        assert!(result.is_err());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delete_rows").fetch_one(&pool).await.unwrap();
+        pool.close().await; std::fs::remove_file(path).unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn sqlite_null_key_predicate_deletes_the_selected_row() {
+        let (config, pool, path) = fixture().await;
+        let result = sqlite_delete_rows_impl(&config, "main", "delete_rows", &["id".into()], &[vec![None]]).await;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delete_rows WHERE id IS NULL").fetch_one(&pool).await.unwrap();
+        pool.close().await; std::fs::remove_file(path).unwrap();
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_nonunique_locator_rolls_back_instead_of_deleting_multiple_rows() {
+        let (config, pool, path) = fixture().await;
+        sqlx::query("UPDATE delete_rows SET value='duplicate' WHERE id IS NOT NULL").execute(&pool).await.unwrap();
+        let result = sqlite_delete_rows_impl(&config, "main", "delete_rows", &["value".into()], &[vec![Some("duplicate".into())]]).await;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delete_rows").fetch_one(&pool).await.unwrap();
+        pool.close().await; std::fs::remove_file(path).unwrap();
+        assert!(result.is_err());
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable local MySQL DBTERM_TEST_MYSQL_PORT"]
+    async fn mysql_later_fk_failure_restores_earlier_delete_and_null_matches() {
+        let port: u16 = std::env::var("DBTERM_TEST_MYSQL_PORT").unwrap().parse().unwrap();
+        let config: ConnConfig = serde_json::from_value(serde_json::json!({
+            "id":"delete-local-test","name":"delete-local-test","type":"mysql","host":"127.0.0.1",
+            "port":port,"username":"root","useSsl":false,"createdAt":0,"updatedAt":0
+        })).unwrap();
+        let db = format!("dbterm_delete_{}", uuid::Uuid::new_v4().simple());
+        let (mut conn, _) = mysql_connect(&config, None).await.unwrap();
+        sqlx::query(&format!("CREATE DATABASE `{db}`")).execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("CREATE TABLE `{db}`.parent(id INT PRIMARY KEY, tag VARCHAR(8)) ENGINE=InnoDB")).execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("CREATE TABLE `{db}`.child(id INT PRIMARY KEY,parent_id INT,FOREIGN KEY(parent_id) REFERENCES `{db}`.parent(id)) ENGINE=InnoDB")).execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("INSERT INTO `{db}`.parent VALUES(1,'same'),(2,'same'),(3,NULL)")).execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("INSERT INTO `{db}`.child VALUES(1,2)")).execute(&mut conn).await.unwrap();
+        let blocked = mysql_delete_rows(&config, None, &db, "parent", &["id".into()], &[vec![Some("1".into())],vec![Some("2".into())]]).await;
+        let after_block: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM `{db}`.parent")).fetch_one(&mut conn).await.unwrap();
+        let conversion = mysql_delete_rows(&config, None, &db, "parent", &["id".into()], &[vec![Some("1garbage".into())]]).await;
+        let after_conversion: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM `{db}`.parent")).fetch_one(&mut conn).await.unwrap();
+        let null = mysql_delete_rows(&config, None, &db, "parent", &["tag".into()], &[vec![None]]).await;
+        let ambiguous = mysql_delete_rows(&config, None, &db, "parent", &["tag".into()], &[vec![Some("same".into())]]).await;
+        let final_count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM `{db}`.parent")).fetch_one(&mut conn).await.unwrap();
+        sqlx::query(&format!("DROP DATABASE `{db}`")).execute(&mut conn).await.unwrap();
+        assert!(blocked.is_err()); assert_eq!(after_block, 3);
+        assert!(conversion.is_err()); assert_eq!(after_conversion, 3);
+        assert_eq!(null.unwrap(), 1); assert!(ambiguous.is_err()); assert_eq!(final_count, 2);
+    }
+}
+
+#[cfg(test)]
 async fn mysql_delete_rows(
     config: &ConnConfig, password: Option<&str>,
     schema: &str, table: &str,
     pk_columns: &[String], pk_values_list: &[Vec<Option<String>>],
 ) -> Result<u64, String> {
+    use sqlx::{Connection, Row};
+    if pk_columns.is_empty() || pk_columns.len() > 65_535 || pk_values_list.iter().any(|values| values.len() != pk_columns.len()) {
+        return Err("删除定位列为空或定位值列数不一致，未执行删除".into());
+    }
+    if pk_values_list.is_empty() { return Ok(0); }
     let (mut conn, _tunnel) = mysql_connect(config, password).await?;
     let target = if schema.is_empty() { q_mysql(table) }
                  else { format!("{}.{}", q_mysql(schema), q_mysql(table)) };
     let where_template: Vec<String> = pk_columns.iter()
-        .map(|c| format!("{} = ?", q_mysql(c)))
+        .map(|c| format!("{} <=> ?", q_mysql(c)))
         .collect();
     let where_clause = where_template.join(" AND ");
     let sql = tag_sql(&format!("DELETE FROM {target} WHERE {where_clause}"));
-
+    let mut tx = conn.begin().await.map_err(|e| format!("开启删除事务失败: {e}"))?;
+    super::query::mysql_require_atomic_table(&mut *tx, schema, table).await?;
     let mut total: u64 = 0;
     for pk_values in pk_values_list {
         let mut q = sqlx::query(&sql);
         for val in pk_values {
             q = q.bind(val.as_deref());
         }
-        let res = q.execute(&mut conn).await.map_err(|e| format!("删除失败: {e}"))?;
-        total += res.rows_affected();
-    }
-    Ok(total)
-}
-
-async fn pg_delete_rows(
-    config: &ConnConfig, password: Option<&str>,
-    schema: &str, table: &str,
-    pk_columns: &[String], pk_values_list: &[Vec<Option<String>>],
-) -> Result<u64, String> {
-    let (mut conn, _tunnel) = pg_connect(config, password).await?;
-    let schema_name = if schema.is_empty() { "public" } else { schema };
-    let target = format!("{}.{}", q_dq(schema_name), q_dq(table));
-    let where_template: Vec<String> = pk_columns.iter().enumerate()
-        .map(|(i, c)| format!("{}::text = ${}", q_dq(c), i + 1))
-        .collect();
-    let where_clause = where_template.join(" AND ");
-    let sql = tag_sql(&format!("DELETE FROM {target} WHERE {where_clause}"));
-
-    let mut total: u64 = 0;
-    for pk_values in pk_values_list {
-        let mut q = sqlx::query(&sql);
-        for val in pk_values {
-            q = q.bind(val.as_deref());
+        match q.execute(&mut *tx).await {
+            Ok(res) => {
+                if res.rows_affected() > 1 {
+                    tx.rollback().await.map_err(|e| format!("删除定位匹配多行，回滚未确认: {e}"))?;
+                    return Err("删除定位匹配多行，整批已回滚，请使用唯一键定位".into());
+                }
+                total += res.rows_affected();
+            }
+            Err(e) => {
+                tx.rollback().await.map_err(|r| format!("删除失败: {e}；回滚未确认: {r}"))?;
+                return Err(format!("删除失败，整批已回滚: {e}"));
+            }
         }
-        let res = q.execute(&mut conn).await.map_err(|e| format!("删除失败: {e}"))?;
-        total += res.rows_affected();
+        let warning_row = sqlx::Executor::fetch_one(&mut *tx, "SHOW COUNT(*) WARNINGS").await
+            .map_err(|e| format!("核验删除警告失败，事务未提交: {e}"))?;
+        let warnings: u64 = warning_row.try_get(0).map_err(|e| format!("解析删除警告失败，事务未提交: {e}"))?;
+        if warnings > 0 {
+            tx.rollback().await.map_err(|e| format!("删除条件出现转换警告，回滚未确认: {e}"))?;
+            return Err("删除条件出现数据库警告，整批已回滚以防隐式转换误删".into());
+        }
     }
+    tx.commit().await.map_err(|e| format!("删除提交未获确认，结果未知，请核对目标，禁止自动重试: {e}"))?;
     Ok(total)
 }
 
@@ -887,73 +1139,378 @@ async fn sqlite_insert_rows_impl(
     config: &ConnConfig, schema: &str, table: &str,
     columns: &[String], rows: &[Vec<Option<String>>],
 ) -> Result<u64, String> {
+    let n_cols = columns.len();
+    if n_cols == 0 || rows.iter().any(|row| row.len() != n_cols) {
+        return Err("插入列数无效或行数据列数不一致，未执行写入".into());
+    }
+    if rows.is_empty() { return Ok(0); }
     let url = super::query::sqlite_url(config)?;
-    let pool = sqlx::sqlite::SqlitePool::connect(&url).await.map_err(|e| format!("SQLite 连接失败: {e}"))?;
+    let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect(&url).await.map_err(|e| format!("SQLite 连接失败: {e}"))?;
     let target = if schema.is_empty() || schema == "main" { q_dq(table) }
                  else { format!("{}.{}", q_dq(schema), q_dq(table)) };
     let col_list = columns.iter().map(|c| q_dq(c)).collect::<Vec<_>>().join(", ");
+    let placeholders = (0..n_cols).map(|_| "?").collect::<Vec<_>>().join(", ");
+    let sql = format!("INSERT INTO {target} ({col_list}) VALUES ({placeholders})");
+    let mut tx = pool.begin().await.map_err(|e| format!("开启插入事务失败: {e}"))?;
     let mut total: u64 = 0;
     for row in rows {
-        let placeholders = (0..row.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
-        let sql = format!("INSERT INTO {target} ({col_list}) VALUES ({placeholders})");
         let mut q = sqlx::query(&sql);
         for val in row { q = q.bind(val.as_deref()); }
-        let res = q.execute(&pool).await.map_err(|e| format!("插入失败: {e}"))?;
-        total += res.rows_affected();
+        match q.execute(&mut *tx).await {
+            Ok(res) => total += res.rows_affected(),
+            Err(e) => {
+                tx.rollback().await.map_err(|r| format!("插入失败: {e}；回滚未确认: {r}"))?;
+                return Err(format!("插入失败，整批已回滚: {e}"));
+            }
+        }
     }
+    tx.commit().await.map_err(|e| format!("插入提交未获确认，结果未知，请核对目标，禁止自动重试: {e}"))?;
     Ok(total)
 }
 
+#[cfg(test)]
 async fn sqlite_delete_rows_impl(
     config: &ConnConfig, schema: &str, table: &str,
     pk_columns: &[String], pk_values_list: &[Vec<Option<String>>],
 ) -> Result<u64, String> {
+    if pk_columns.is_empty() || pk_values_list.iter().any(|values| values.len() != pk_columns.len()) {
+        return Err("删除定位列为空或定位值列数不一致，未执行删除".into());
+    }
+    if pk_values_list.is_empty() { return Ok(0); }
     let url = super::query::sqlite_url(config)?;
-    let pool = sqlx::sqlite::SqlitePool::connect(&url).await.map_err(|e| format!("SQLite 连接失败: {e}"))?;
+    let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect(&url).await.map_err(|e| format!("SQLite 连接失败: {e}"))?;
     let target = if schema.is_empty() || schema == "main" { q_dq(table) }
                  else { format!("{}.{}", q_dq(schema), q_dq(table)) };
     let where_clause = pk_columns.iter()
-        .map(|c| format!("{} = ?", q_dq(c)))
+        .map(|c| format!("{} IS ?", q_dq(c)))
         .collect::<Vec<_>>().join(" AND ");
     let sql = format!("DELETE FROM {target} WHERE {where_clause}");
+    let mut tx = pool.begin().await.map_err(|e| format!("开启删除事务失败: {e}"))?;
     let mut total: u64 = 0;
     for pk_values in pk_values_list {
         let mut q = sqlx::query(&sql);
         for val in pk_values { q = q.bind(val.as_deref()); }
-        let res = q.execute(&pool).await.map_err(|e| format!("删除失败: {e}"))?;
-        total += res.rows_affected();
+        match q.execute(&mut *tx).await {
+            Ok(res) => {
+                if res.rows_affected() > 1 {
+                    tx.rollback().await.map_err(|e| format!("删除定位匹配多行，回滚未确认: {e}"))?;
+                    return Err("删除定位匹配多行，整批已回滚，请使用唯一键定位".into());
+                }
+                total += res.rows_affected();
+            }
+            Err(e) => {
+                tx.rollback().await.map_err(|r| format!("删除失败: {e}；回滚未确认: {r}"))?;
+                return Err(format!("删除失败，整批已回滚: {e}"));
+            }
+        }
     }
+    tx.commit().await.map_err(|e| format!("删除提交未获确认，结果未知，请核对目标，禁止自动重试: {e}"))?;
     Ok(total)
 }
 
 // ── DuckDB insert/delete helpers ──────────────────────────────────────────────
+pub(super) fn validate_native_insert_rows(columns: &[String], rows: &[Vec<Option<String>>]) -> Result<(), String> {
+    if columns.is_empty() { return Err("列名列表不能为空".into()); }
+    if let Some((index, row)) = rows.iter().enumerate().find(|(_, row)| row.len() != columns.len()) {
+        return Err(format!("第 {} 行字段数量 {} 与列数 {} 不一致，未执行写入", index + 1, row.len(), columns.len()));
+    }
+    Ok(())
+}
+
+/// Execute on one dedicated, locked session. Never retry an ambiguous COMMIT.
+pub(super) fn run_atomic_native_batch(
+    begin: &str, statements: impl Iterator<Item = String>,
+    mut execute: impl FnMut(&str) -> Result<u64, String>,
+) -> Result<u64, String> {
+    execute(begin).map_err(|e| format!("开始批量事务失败: {e}"))?;
+    let mut total = 0;
+    for sql in statements {
+        match execute(&sql) {
+            Ok(count) => total += count,
+            Err(error) => return match execute("ROLLBACK") {
+                Ok(_) => Err(format!("批量操作失败，已回滚: {error}")),
+                Err(rollback) => Err(format!("批量操作失败: {error}；回滚失败，事务结果未知: {rollback}")),
+            },
+        }
+    }
+    execute("COMMIT").map_err(|e| format!("批量操作提交失败，提交结果未知；请核实数据库状态，勿重复提交: {e}"))?;
+    Ok(total)
+}
+#[cfg(test)]
+mod native_insert_atomicity_tests {
+    use super::*;
+    #[test]
+    fn native_delete_runner_restores_earlier_deletes_after_later_failure() {
+        use sqlx::Connection;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let mut db = runtime.block_on(sqlx::SqliteConnection::connect("sqlite::memory:")).unwrap();
+        for sql in [
+            "CREATE TABLE target(id INT)",
+            "INSERT INTO target VALUES(1),(2)",
+            "CREATE TRIGGER reject_second BEFORE DELETE ON target WHEN old.id=2 BEGIN SELECT RAISE(ABORT,'blocked'); END",
+        ] { runtime.block_on(sqlx::query(sql).execute(&mut db)).unwrap(); }
+        let error = run_atomic_native_batch("BEGIN", [
+            "DELETE FROM target WHERE id=1".into(), "DELETE FROM target WHERE id=2".into(),
+        ].into_iter(), |sql| runtime.block_on(sqlx::query(sql).execute(&mut db)).map(|r| r.rows_affected()).map_err(|e| e.to_string())).unwrap_err();
+        assert!(error.contains("已回滚"));
+        let count: i64 = runtime.block_on(sqlx::query_scalar("SELECT COUNT(*) FROM target").fetch_one(&mut db)).unwrap();
+        assert_eq!(count, 2);
+    }
+    #[tokio::test]
+    async fn malformed_native_deletes_reject_before_driver_or_credentials() {
+        let config: ConnConfig = serde_json::from_value(serde_json::json!({
+            "id":"never-connect","name":"test","type":"duckdb",
+            "useSsl":false,"createdAt":0,"updatedAt":0
+        })).unwrap();
+        let duck: DuckPool = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let ss: SsPool = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let registry: DriverRegistry = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let keys = vec!["id".into()];
+        let tuples = vec![vec![None], vec![]];
+        assert!(duck_delete_rows_impl("never-connect", &config, "table", &keys, &tuples, &duck, &registry).await.unwrap_err().contains("第 2 行"));
+        assert!(ss_delete_rows_impl("never-connect", &config, "dbo", "table", &keys, &tuples, &ss).await.unwrap_err().contains("第 2 行"));
+        assert!(duck_delete_rows_impl("never-connect", &config, "table", &[], &[vec![]], &duck, &registry).await.unwrap_err().contains("不能为空"));
+        assert!(ss_delete_rows_impl("never-connect", &config, "dbo", "table", &[], &[vec![]], &ss).await.unwrap_err().contains("不能为空"));
+    }
+    #[tokio::test]
+    async fn malformed_native_batches_fail_before_driver_or_credentials() {
+        let config: ConnConfig = serde_json::from_value(serde_json::json!({
+            "id":"never-connect","name":"test","type":"duckdb",
+            "useSsl":false,"createdAt":0,"updatedAt":0
+        })).unwrap();
+        let duck: DuckPool = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let ss: SsPool = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let registry: DriverRegistry = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let columns = vec!["id".into()];
+        let rows = vec![vec![Some("first".into())], vec![]];
+        assert!(duck_insert_rows_impl("never-connect", &config, "", "table", &columns, &rows, &duck, &registry).await.unwrap_err().contains("第 2 行"));
+        assert!(ss_insert_rows_impl("never-connect", &config, "dbo", "table", &columns, &rows, &ss).await.unwrap_err().contains("第 2 行"));
+        assert!(super::super::oracle::insert_rows_impl(config, None, "SCHEMA".into(), "TABLE".into(), columns, rows, &registry).await.unwrap_err().contains("第 2 行"));
+    }
+    #[test]
+    fn native_transaction_runner_rolls_back_actual_constraint_failure() {
+        use sqlx::Connection;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let mut db = runtime.block_on(sqlx::SqliteConnection::connect("sqlite::memory:")).unwrap();
+        runtime.block_on(sqlx::query("CREATE TABLE batch_rows(id INTEGER PRIMARY KEY)").execute(&mut db)).unwrap();
+        let error = run_atomic_native_batch("BEGIN", [
+            "INSERT INTO batch_rows VALUES(1)".into(),
+            "INSERT INTO batch_rows VALUES(1)".into(),
+        ].into_iter(), |sql| runtime.block_on(sqlx::query(sql).execute(&mut db)).map(|r| r.rows_affected()).map_err(|e| e.to_string())).unwrap_err();
+        assert!(error.contains("已回滚"));
+        let count: i64 = runtime.block_on(sqlx::query_scalar("SELECT COUNT(*) FROM batch_rows").fetch_one(&mut db)).unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(run_atomic_native_batch("BEGIN", [
+            "INSERT INTO batch_rows VALUES(1)".into(),
+            "INSERT INTO batch_rows VALUES(2)".into(),
+        ].into_iter(), |sql| runtime.block_on(sqlx::query(sql).execute(&mut db)).map(|r| r.rows_affected()).map_err(|e| e.to_string())).unwrap(), 2);
+    }
+    #[tokio::test]
+    async fn sqlserver_batch_rolls_back_later_failure_and_does_not_retry_commit() {
+        struct Fake { calls: Vec<String>, fail_commit: bool, fail_rollback: bool }
+        fn execute<'a>(state: &'a mut Fake, sql: &'a str) -> futures::future::BoxFuture<'a, Result<u64, String>> {
+            Box::pin(async move {
+                state.calls.push(sql.into());
+                if state.fail_rollback && sql == "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION" { return Err("rollback lost".into()); }
+                if sql == "bad" || (state.fail_commit && sql == "COMMIT TRANSACTION") { Err("injected".into()) } else { Ok(1) }
+            })
+        }
+        let mut failure = Fake { calls: vec![], fail_commit: false, fail_rollback: false };
+        assert!(run_atomic_ss_batch(&mut failure, ["first".into(), "bad".into()].into_iter(), execute).await.is_err());
+        assert_eq!(failure.calls, ["SET XACT_ABORT ON; BEGIN TRANSACTION", "first", "bad", "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION"]);
+        let mut rollback = Fake { calls: vec![], fail_commit: false, fail_rollback: true };
+        let error = run_atomic_ss_batch(&mut rollback, ["bad".into()].into_iter(), execute).await.unwrap_err();
+        assert!(error.contains("injected") && error.contains("rollback lost") && error.contains("未知"));
+        let mut commit = Fake { calls: vec![], fail_commit: true, fail_rollback: false };
+        let error = run_atomic_ss_batch(&mut commit, ["first".into()].into_iter(), execute).await.unwrap_err();
+        assert!(error.contains("未知"));
+        assert_eq!(commit.calls, ["SET XACT_ABORT ON; BEGIN TRANSACTION", "first", "COMMIT TRANSACTION"]);
+    }
+    #[test]
+    fn later_native_insert_failure_rolls_back_and_reports_rollback_failure() {
+        let mut calls = Vec::new();
+        let error = run_atomic_native_batch("BEGIN", ["first".into(), "bad".into()].into_iter(), |sql| {
+            calls.push(sql.to_string());
+            match sql { "bad" => Err("duplicate".into()), "ROLLBACK" => Err("lost connection".into()), _ => Ok(1) }
+        }).unwrap_err();
+        assert_eq!(calls, ["BEGIN", "first", "bad", "ROLLBACK"]);
+        assert!(error.contains("duplicate") && error.contains("lost connection"));
+    }
+    #[test]
+    fn uncertain_native_commit_is_not_retried() {
+        let mut calls = Vec::new();
+        let error = run_atomic_native_batch("BEGIN", ["first".into()].into_iter(), |sql| {
+            calls.push(sql.to_string());
+            if sql == "COMMIT" { Err("connection lost".into()) } else { Ok(1) }
+        }).unwrap_err();
+        assert_eq!(calls, ["BEGIN", "first", "COMMIT"]);
+        assert!(error.contains("未知"));
+    }
+    #[test]
+    fn native_batch_rejects_any_malformed_row_before_writing() {
+        assert!(validate_native_insert_rows(&["id".into()], &[vec![Some("ok".into())], vec![]]).is_err());
+        assert!(validate_native_insert_rows(&[], &[vec![]]).is_err());
+        assert!(validate_native_insert_rows(&["id".into()], &[vec![None]]).is_ok());
+    }
+}
 
 async fn duck_insert_rows_impl(
-    id: &str, config: &ConnConfig, table: &str,
+    id: &str, config: &ConnConfig, schema: &str, table: &str,
     columns: &[String], rows: &[Vec<Option<String>>],
     duck_pool: &DuckPool, registry: &DriverRegistry,
 ) -> Result<u64, String> {
-    let col_list = columns.iter().map(|c| format!("\"{}\"", c.replace('"', "\"\""))).collect::<Vec<_>>().join(", ");
-    let mut total: u64 = 0;
-    for row in rows {
-        let val_list = row.iter().map(|v| match v {
-            None => "NULL".to_string(),
-            Some(s) => format!("'{}'", s.replace('\'', "''")),
-        }).collect::<Vec<_>>().join(", ");
-        let sql = format!("INSERT INTO \"{}\" ({col_list}) VALUES ({val_list})", table.replace('"', "\"\""));
-        let res = dispatch_duck_query(id, config, &sql, duck_pool, registry).await?;
-        total += res.rows_affected;
-    }
-    Ok(total)
+    validate_native_insert_rows(columns, rows)?;
+    if rows.is_empty() { return Ok(0); }
+    use super::duckdb::{get_duck_lib_path_pub, get_or_open_pub, run_query_sync_pub};
+    let library = get_duck_lib_path_pub(registry).await?;
+    let handle = get_or_open_pub(id, config, duck_pool, &library).await?;
+    let table = table.to_string();
+    let schema = schema.to_string();
+    let columns = columns.to_vec();
+    let rows = rows.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let guard = handle.blocking_lock();
+        let col_list = columns.iter().map(|c| q_dq(c)).collect::<Vec<_>>().join(", ");
+        let target = if schema.is_empty() { q_dq(&table) } else { format!("{}.{}", q_dq(&schema), q_dq(&table)) };
+        let statements = rows.iter().map(|row| {
+            let val_list = row.iter().map(|v| match v {
+                None => "NULL".to_string(),
+                Some(s) => format!("'{}'", s.replace('\'', "''")),
+            }).collect::<Vec<_>>().join(", ");
+            format!("INSERT INTO {target} ({col_list}) VALUES ({val_list})")
+        });
+        run_atomic_native_batch("BEGIN", statements, |sql| run_query_sync_pub(&guard, sql, 0).map(|r| r.rows_affected))
+    }).await.map_err(|e| format!("DuckDB 批量插入线程失败: {e}"))?
 }
 
+/// Import parsed records through DBterm's explicit field mapping. Stop mode is
+/// file-atomic; skip mode commits valid rows independently and reports rejects.
+async fn duck_import_rows_impl(
+    id: &str, config: &ConnConfig, schema: &str, table: &str,
+    columns: &[String], rows: &[Vec<Option<String>>], header_rows: usize, on_error: &str,
+    duck_pool: &DuckPool, registry: &DriverRegistry,
+) -> Result<ImportResult, String> {
+    if !matches!(on_error, "stop" | "skip") { return Err("无效的导入错误处理策略，未执行写入".into()); }
+    validate_native_insert_rows(columns, rows)?;
+    if rows.is_empty() { return Ok(ImportResult { inserted: 0, skipped: 0, errors: Vec::new() }); }
+    use super::duckdb::{get_duck_lib_path_pub, get_or_open_pub, run_query_sync_pub};
+    let library = get_duck_lib_path_pub(registry).await?;
+    // Reuse the connection registered for this connection ID. Opening a second
+    // DuckDB instance for the same file can leave the workspace's cached session
+    // observing stale state after a successful import.
+    let handle = get_or_open_pub(id, config, duck_pool, &library).await?;
+    let table = table.to_string();
+    let schema = schema.to_string();
+    let columns = columns.to_vec();
+    let rows = rows.to_vec();
+    let on_error = on_error.to_string();
+    tokio::task::spawn_blocking(move || {
+        let guard = handle.blocking_lock();
+        let col_list = columns.iter().map(|c| q_dq(c)).collect::<Vec<_>>().join(", ");
+        let target = if schema.is_empty() { q_dq(&table) } else { format!("{}.{}", q_dq(&schema), q_dq(&table)) };
+        let preflight = format!("SELECT {col_list} FROM {target} LIMIT 0");
+        run_query_sync_pub(&guard, &preflight, 0).map_err(|e| format!("DuckDB 导入目标校验失败，未写入: {e}"))?;
+        let statement = |row: &[Option<String>]| {
+            let values = row.iter().map(|v| match v {
+                None => "NULL".to_string(),
+                Some(s) => format!("'{}'", s.replace('\'', "''")),
+            }).collect::<Vec<_>>().join(", ");
+            format!("INSERT INTO {target} ({col_list}) VALUES ({values})")
+        };
+        if on_error == "stop" {
+            let total = run_atomic_native_batch("BEGIN", rows.iter().map(|r| statement(r)), |sql| {
+                run_query_sync_pub(&guard, sql, 0).map(|r| r.rows_affected)
+            })?;
+            return Ok(ImportResult { inserted: total, skipped: 0, errors: Vec::new() });
+        }
+        let mut result = ImportResult { inserted: 0, skipped: 0, errors: Vec::new() };
+        for (index, row) in rows.iter().enumerate() {
+            let line = index + 1 + header_rows;
+            run_query_sync_pub(&guard, "BEGIN", 0).map_err(|e| format!("第 {line} 行前开启事务失败: {e}"))?;
+            match run_query_sync_pub(&guard, &statement(row), 0) {
+                Ok(inserted) => {
+                    run_query_sync_pub(&guard, "COMMIT", 0).map_err(|e| format!("第 {line} 行提交未获确认，结果未知，请核对目标，禁止自动重试: {e}"))?;
+                    result.inserted += inserted.rows_affected;
+                }
+                Err(error) => {
+                    if let Err(rollback) = run_query_sync_pub(&guard, "ROLLBACK", 0) {
+                        return Err(format!("第 {line} 行导入失败: {error}；回滚未确认，结果未知: {rollback}"));
+                    }
+                    result.skipped += 1;
+                    result.errors.push(format!("第 {line} 行插入失败: {error}"));
+                }
+            }
+        }
+        Ok(result)
+    }).await.map_err(|e| format!("DuckDB 文件导入线程失败: {e}"))?
+}
+
+#[cfg(test)]
+mod duck_import_native_tests {
+    use super::*;
+
+    fn fixture() -> (ConnConfig, DuckPool, DriverRegistry) {
+        let config: ConnConfig = serde_json::from_value(serde_json::json!({
+            "id":"duck-import-test", "name":"duck-import-test", "type":"duckdb",
+            "filePath":std::env::temp_dir().join(format!("dbterm-duck-import-{}.duckdb", uuid::Uuid::new_v4().simple())).to_string_lossy(),
+            "useSsl":false, "createdAt":0, "updatedAt":0
+        })).unwrap();
+        let pool = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let library = std::env::var("DBTERM_TEST_DUCKDB_LIBRARY").expect("verified local DuckDB library required");
+        let meta = super::super::driver::builtin_registry().into_iter().find(|m| m.driver_type == "duckdb").unwrap();
+        let state = super::super::driver::DriverState { meta, status: super::super::driver::DriverStatus::Ready,
+            custom_path: Some(library), installed_version: Some("1.5.3".into()), load_error: None };
+        let registry = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([("duckdb".into(), state)])));
+        (config, pool, registry)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires verified local DBTERM_TEST_DUCKDB_LIBRARY"]
+    async fn parsed_format_import_respects_schema_mapping_and_atomic_modes() {
+        let (config, pool, registry) = fixture();
+        let db_path = config.file_path.clone().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        super::super::duckdb::dispatch_duck_query(&id, &config, "CREATE SCHEMA target", &pool, &registry).await.unwrap();
+        super::super::duckdb::dispatch_duck_query(&id, &config, "CREATE TABLE target.rows(id INTEGER PRIMARY KEY, value VARCHAR)", &pool, &registry).await.unwrap();
+        let columns = vec!["value".into(), "id".into()];
+        let good_then_bad = vec![vec![Some("中文,\nvalue".into()), Some("1".into())], vec![Some("duplicate".into()), Some("1".into())], vec![Some("last".into()), Some("2".into())]];
+        let stop = duck_import_rows_impl(&id, &config, "target", "rows", &columns, &good_then_bad, 1, "stop", &pool, &registry).await;
+        assert!(stop.is_err(), "stop must reject a duplicate and roll back the preceding row");
+        let count = super::super::duckdb::dispatch_duck_query(&id, &config, "SELECT count(*) FROM target.rows", &pool, &registry).await.unwrap();
+        assert_eq!(count.rows[0][0].as_deref(), Some("0"));
+        let skip = duck_import_rows_impl(&id, &config, "target", "rows", &columns, &good_then_bad, 1, "skip", &pool, &registry).await.unwrap();
+        assert_eq!((skip.inserted, skip.skipped), (2, 1));
+        assert!(skip.errors[0].contains("第 3 行"));
+        let rows = super::super::duckdb::dispatch_duck_query(&id, &config, "SELECT id,value FROM target.rows ORDER BY id", &pool, &registry).await.unwrap();
+        assert_eq!(rows.rows, vec![vec![Some("1".into()), Some("中文,\nvalue".into())], vec![Some("2".into()), Some("last".into())]]);
+        let inserted = duck_insert_rows_impl(&id, &config, "target", "rows", &["value".into(), "id".into()], &[vec![Some("regular insert".into()), Some("3".into())]], &pool, &registry).await.unwrap();
+        assert_eq!(inserted, 1);
+        let rows = super::super::duckdb::dispatch_duck_query(&id, &config, "SELECT value FROM target.rows WHERE id=3", &pool, &registry).await.unwrap();
+        assert_eq!(rows.rows[0][0].as_deref(), Some("regular insert"));
+        assert!(duck_import_rows_impl(&id, &config, "missing", "rows", &columns, &good_then_bad[..1], 1, "skip", &pool, &registry).await.err().expect("unknown schema must fail before insert").contains("目标校验"));
+        pool.lock().await.clear();
+        std::fs::remove_file(db_path).unwrap();
+    }
+}
+
+#[cfg(test)]
 async fn duck_delete_rows_impl(
     id: &str, config: &ConnConfig, table: &str,
     pk_columns: &[String], pk_values_list: &[Vec<Option<String>>],
-    duck_pool: &DuckPool, registry: &DriverRegistry,
+    _duck_pool: &DuckPool, registry: &DriverRegistry,
 ) -> Result<u64, String> {
-    let mut total: u64 = 0;
-    for pk_values in pk_values_list {
+    validate_native_insert_rows(pk_columns, pk_values_list)?;
+    if pk_values_list.is_empty() { return Ok(0); }
+    use super::duckdb::{get_duck_lib_path_pub, get_or_open_pub, run_query_sync_pub};
+    let dedicated: DuckPool = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let library = get_duck_lib_path_pub(registry).await?;
+    let handle = get_or_open_pub(id, config, &dedicated, &library).await?;
+    let table = table.to_string();
+    let pk_columns = pk_columns.to_vec();
+    let pk_values_list = pk_values_list.to_vec();
+    tokio::task::spawn_blocking(move || {
+    let guard = handle.blocking_lock();
+    let statements = pk_values_list.iter().map(|pk_values| {
         let where_clause = pk_columns.iter().zip(pk_values.iter())
             .map(|(col, val)| {
                 let lhs = format!("\"{}\"", col.replace('"', "\"\""));
@@ -963,47 +1520,81 @@ async fn duck_delete_rows_impl(
                 }
             })
             .collect::<Vec<_>>().join(" AND ");
-        let sql = format!("DELETE FROM \"{}\" WHERE {where_clause}", table.replace('"', "\"\""));
-        let res = dispatch_duck_query(id, config, &sql, duck_pool, registry).await?;
-        total += res.rows_affected;
-    }
-    Ok(total)
+        format!("DELETE FROM {} WHERE {where_clause}", q_dq(&table))
+    });
+    run_atomic_native_batch("BEGIN", statements, |sql| run_query_sync_pub(&guard, sql, 0).map(|r| r.rows_affected))
+    }).await.map_err(|e| format!("DuckDB 批量删除线程失败: {e}"))?
 }
 
 // ── SQL Server insert/delete helpers ─────────────────────────────────────────
+async fn run_atomic_ss_batch<S>(
+    session: &mut S, statements: impl Iterator<Item = String>,
+    mut execute: impl for<'a> FnMut(&'a mut S, &'a str) -> futures::future::BoxFuture<'a, Result<u64, String>>,
+) -> Result<u64, String> {
+    execute(session, "SET XACT_ABORT ON; BEGIN TRANSACTION").await
+        .map_err(|e| format!("开始批量操作事务失败: {e}"))?;
+    let mut total = 0;
+    for sql in statements {
+        match execute(session, &sql).await {
+            Ok(count) => total += count,
+            Err(error) => return match execute(session, "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION").await {
+                Ok(_) => Err(format!("批量操作失败，已回滚: {error}")),
+                Err(rollback) => Err(format!("批量操作失败: {error}；回滚失败，事务结果未知: {rollback}")),
+            },
+        }
+    }
+    execute(session, "COMMIT TRANSACTION").await
+        .map_err(|e| format!("批量操作提交失败，提交结果未知；请核实数据库状态，勿重复提交: {e}"))?;
+    Ok(total)
+}
+
+fn execute_ss_batch_statement<'a>(
+    entry: &'a mut super::sqlserver::SsEntry, sql: &'a str,
+) -> futures::future::BoxFuture<'a, Result<u64, String>> {
+    Box::pin(async move { super::sqlserver::query_on_locked_entry(entry, sql).await.map(|r| r.rows_affected) })
+}
 
 async fn ss_insert_rows_impl(
     id: &str, config: &ConnConfig, schema: &str, table: &str,
     columns: &[String], rows: &[Vec<Option<String>>],
-    ss_pool: &SsPool,
+    _ss_pool: &SsPool,
 ) -> Result<u64, String> {
-    use super::sqlserver::dispatch_ss_query;
-    let target = if schema.is_empty() { format!("[{}]", table.replace(']', "]]")) }
-                 else { format!("[{}].[{}]", schema.replace(']', "]]"), table.replace(']', "]]")) };
+    validate_native_insert_rows(columns, rows)?;
+    if rows.is_empty() { return Ok(0); }
+    use super::sqlserver::{get_entry, table_write_config, resolve_table_target};
+    let dedicated: SsPool = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let password = crate::keychain::get_password(id)?;
+    let effective = table_write_config(config, schema);
+    let handle = get_entry(id, &dedicated, &effective, password.as_deref()).await?;
+    let mut entry = handle.lock().await;
+    let target = resolve_table_target(&mut entry, table).await?;
     let col_list = columns.iter().map(|c| format!("[{}]", c.replace(']', "]]"))).collect::<Vec<_>>().join(", ");
-    let mut total: u64 = 0;
-    for row in rows {
+    let statements = rows.iter().map(|row| {
         let val_list = row.iter().map(|v| match v {
             None => "NULL".to_string(),
             Some(s) => format!("N'{}'", s.replace('\'', "''")),
         }).collect::<Vec<_>>().join(", ");
-        let sql = format!("INSERT INTO {target} ({col_list}) VALUES ({val_list})");
-        let res = dispatch_ss_query(id, config, &sql, ss_pool).await?;
-        total += res.rows_affected;
-    }
-    Ok(total)
+        format!("INSERT INTO {target} ({col_list}) VALUES ({val_list})")
+    });
+    run_atomic_ss_batch(&mut *entry, statements, execute_ss_batch_statement).await
 }
 
+#[cfg(test)]
 async fn ss_delete_rows_impl(
     id: &str, config: &ConnConfig, schema: &str, table: &str,
     pk_columns: &[String], pk_values_list: &[Vec<Option<String>>],
-    ss_pool: &SsPool,
+    _ss_pool: &SsPool,
 ) -> Result<u64, String> {
-    use super::sqlserver::dispatch_ss_query;
-    let target = if schema.is_empty() { format!("[{}]", table.replace(']', "]]")) }
-                 else { format!("[{}].[{}]", schema.replace(']', "]]"), table.replace(']', "]]")) };
-    let mut total: u64 = 0;
-    for pk_values in pk_values_list {
+    validate_native_insert_rows(pk_columns, pk_values_list)?;
+    if pk_values_list.is_empty() { return Ok(0); }
+    use super::sqlserver::{get_entry, table_write_config, resolve_table_target};
+    let dedicated: SsPool = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let password = crate::keychain::get_password(id)?;
+    let effective = table_write_config(config, schema);
+    let handle = get_entry(id, &dedicated, &effective, password.as_deref()).await?;
+    let mut entry = handle.lock().await;
+    let target = resolve_table_target(&mut entry, table).await?;
+    let statements = pk_values_list.iter().map(|pk_values| {
         let where_clause = pk_columns.iter().zip(pk_values.iter())
             .map(|(col, val)| {
                 let lhs = format!("[{}]", col.replace(']', "]]"));
@@ -1013,11 +1604,9 @@ async fn ss_delete_rows_impl(
                 }
             })
             .collect::<Vec<_>>().join(" AND ");
-        let sql = format!("DELETE FROM {target} WHERE {where_clause}");
-        let res = dispatch_ss_query(id, config, &sql, ss_pool).await?;
-        total += res.rows_affected;
-    }
-    Ok(total)
+        format!("DELETE FROM {target} WHERE {where_clause}")
+    });
+    run_atomic_ss_batch(&mut *entry, statements, execute_ss_batch_statement).await
 }
 
 // ── 3. db_truncate_table ──────────────────────────────────────────────────────
@@ -1244,39 +1833,109 @@ pub async fn db_copy_table(
     ensure_writable(&config)?;
     match config.conn_type {
         ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => {
-            let (mut conn, _t) = mysql_connect(&config, password.as_deref()).await?;
-            let src = if schema.is_empty() { q_mysql(&src_table) }
-                      else { format!("{}.{}", q_mysql(&schema), q_mysql(&src_table)) };
-            let dst = if schema.is_empty() { q_mysql(&dst_table) }
-                      else { format!("{}.{}", q_mysql(&schema), q_mysql(&dst_table)) };
-            sqlx::query(&tag_sql(&format!("CREATE TABLE {dst} LIKE {src}")))
-                .execute(&mut conn).await
-                .map_err(|e| format!("复制表结构失败: {e}"))?;
-            if copy_data {
-                sqlx::query(&tag_sql(&format!("INSERT INTO {dst} SELECT * FROM {src}")))
-                    .execute(&mut conn).await
-                    .map_err(|e| format!("复制表数据失败: {e}"))?;
-            }
-            Ok(())
+            mysql_copy_table_atomic(&config, password.as_deref(), &schema, &src_table, &dst_table, copy_data, &|_| {}).await
         }
         ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
-            let (mut conn, _t) = pg_connect(&config, password.as_deref()).await?;
-            let schema_name = if schema.is_empty() { "public" } else { &schema };
-            let src = format!("{}.{}", q_dq(schema_name), q_dq(&src_table));
-            let dst = format!("{}.{}", q_dq(schema_name), q_dq(&dst_table));
-            if copy_data {
-                sqlx::query(&tag_sql(&format!("CREATE TABLE {dst} AS SELECT * FROM {src}")))
-                    .execute(&mut conn).await
-                    .map_err(|e| format!("复制表失败: {e}"))?;
-            } else {
-                sqlx::query(&tag_sql(&format!("CREATE TABLE {dst} AS SELECT * FROM {src} LIMIT 0")))
-                    .execute(&mut conn).await
-                    .map_err(|e| format!("复制表结构失败: {e}"))?;
-            }
-            Ok(())
+            Err("此引擎的完整表定义复制尚未实现，已拒绝执行，避免 CREATE TABLE AS 丢失索引、约束和默认值；请使用原生备份恢复工具".into())
         }
         _ => Err("此连接类型不支持复制表操作".into()),
     }
+}
+
+async fn mysql_copy_table_atomic(
+    config: &ConnConfig, password: Option<&str>, schema: &str,
+    src_table: &str, dst_table: &str, copy_data: bool,
+    before_publish: &(dyn Fn(&str) + Send + Sync),
+) -> Result<(), String> {
+    use sqlx::Row;
+    if src_table.eq_ignore_ascii_case(dst_table) { return Err("源表与目标表同名，已拒绝复制".into()); }
+    let (mut source, _source_tunnel) = mysql_connect(config, password).await?;
+    let schema = if schema.is_empty() {
+        sqlx::query_scalar::<_, Option<String>>("SELECT DATABASE()").fetch_one(&mut source).await
+            .map_err(|e| format!("读取数据库失败: {e}"))?.ok_or("必须明确选择数据库")?
+    } else { schema.to_string() };
+    let src = mysql_qualified(&schema, src_table);
+    let dst = mysql_qualified(&schema, dst_table);
+    sqlx::query("SET SESSION lock_wait_timeout=30").execute(&mut source).await.map_err(|e| e.to_string())?;
+    sqlx::query("SET time_zone = '+00:00'").execute(&mut source).await.map_err(|e| format!("设置复制源时区失败: {e}"))?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").execute(&mut source).await.map_err(|e| format!("设置复制源快照隔离级别失败: {e}"))?;
+    sqlx::Executor::execute(&mut source, sqlx::raw_sql("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")).await
+        .map_err(|e| format!("建立复制源快照失败: {e}"))?;
+    // Keep source metadata fixed on a separate connection; target DDL cannot implicitly commit this lock.
+    super::query::mysql_require_atomic_table(&mut source, &schema, src_table).await?;
+    let self_refs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND REFERENCED_TABLE_SCHEMA=TABLE_SCHEMA AND REFERENCED_TABLE_NAME=TABLE_NAME")
+        .bind(&schema).bind(src_table).fetch_one(&mut source).await.map_err(|e| e.to_string())?;
+    if self_refs > 0 { return Err("源表含自引用外键，无法保证改名后定义一致，已拒绝复制".into()); }
+    let source_sql_mode: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut source).await.map_err(|e| format!("读取复制源会话模式失败: {e}"))?;
+    let raw = mysql_read_ddl(&mut source, &src).await?;
+    let meta = sqlx::query("SELECT COLUMN_NAME,EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION")
+        .bind(&schema).bind(src_table).fetch_all(&mut source).await.map_err(|e| format!("读取完整源字段失败: {e}"))?;
+    let mut columns = Vec::new();
+    let mut digest_columns = Vec::new();
+    for row in meta {
+        let name: String = row.try_get(0).map_err(|e| e.to_string())?;
+        let extra: String = row.try_get(1).map_err(|e| e.to_string())?;
+        digest_columns.push(name.clone());
+        if !extra.to_ascii_uppercase().contains("GENERATED") || extra.to_ascii_uppercase().contains("DEFAULT_GENERATED") {
+            columns.push(name);
+        }
+    }
+    if columns.is_empty() { return Err("源表无可复制字段，已拒绝复制".into()); }
+    let expected_source = if copy_data { mysql_raw_content_digest(&mut source, &src, &digest_columns).await? } else { TransferDigest::default() };
+    let (mut target, _target_tunnel) = mysql_connect(config, password).await?;
+    let target_sql_mode: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut target).await.map_err(|e| format!("读取复制目标会话模式失败: {e}"))?;
+    validate_schema_sql_modes(&source_sql_mode, &target_sql_mode)?;
+    sqlx::query("SET time_zone = '+00:00'").execute(&mut target).await.map_err(|e| format!("设置复制目标时区失败: {e}"))?;
+    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?")
+        .bind(&schema).bind(dst_table).fetch_one(&mut target).await.map_err(|e| e.to_string())?;
+    if exists != 0 { return Err("目标表已存在，已拒绝复制，不覆盖已有表".into()); }
+    sqlx::query("SET SESSION lock_wait_timeout=30, SESSION innodb_lock_wait_timeout=30").execute(&mut target).await.map_err(|e| e.to_string())?;
+    sqlx::query("SET SESSION FOREIGN_KEY_CHECKS=1").execute(&mut target).await.map_err(|e| e.to_string())?;
+    sqlx::query("SET SESSION sql_mode=CONCAT(@@SESSION.sql_mode, ',NO_AUTO_VALUE_ON_ZERO')").execute(&mut target).await.map_err(|e| e.to_string())?;
+    let stage_name = format!("__dbterm_copy_{}", uuid::Uuid::new_v4().simple());
+    let stage = mysql_qualified(&schema, &stage_name);
+    let expected_ddl = mysql_apply_ddl(&raw, src_table, &stage)?;
+    create_mysql_verified(&mut target, &expected_ddl, &stage, &stage_name).await?;
+    let prepared: Result<u64, String> = async {
+        sqlx::Executor::execute(&mut target, sqlx::raw_sql("START TRANSACTION")).await.map_err(|e| format!("开启复制写事务失败: {e}"))?;
+        super::query::mysql_require_atomic_table(&mut target, &schema, &stage_name).await?;
+        let n = if copy_data {
+            let list = columns.iter().map(|c| q_mysql(c)).collect::<Vec<_>>().join(",");
+            let result = sqlx::query(&tag_sql(&format!("INSERT INTO {stage} ({list}) SELECT {list} FROM {src}")))
+                .execute(&mut target).await.map_err(|e| format!("复制数据失败: {e}"))?;
+            let warnings: u64 = sqlx::Executor::fetch_one(&mut target, "SHOW COUNT(*) WARNINGS").await
+                .map_err(|e| format!("核验复制警告失败: {e}"))?.try_get(0).map_err(|e| e.to_string())?;
+            if warnings != 0 { return Err("复制产生数据库警告，拒绝提交以防静默转换".into()); }
+            result.rows_affected()
+        } else { 0 };
+        if mysql_apply_ddl(&mysql_read_ddl(&mut target, &stage).await?, &stage_name, &stage)? != expected_ddl {
+            return Err("复制后的完整 DDL 不一致，已拒绝发布".into());
+        }
+        let actual = mysql_raw_content_digest(&mut target, &stage, &digest_columns).await?;
+        if actual != expected_source { return Err("复制内容与源快照不一致（源数据可能在复制期间变化），已拒绝发布".into()); }
+        Ok(n)
+    }.await;
+    let expected_rows = match prepared {
+        Ok(n) => n,
+        Err(error) => {
+            sqlx::Executor::execute(&mut target, sqlx::raw_sql("ROLLBACK")).await
+                .map_err(|e| format!("{error}；回滚未确认，暂存表 {stage} 保留供核查: {e}"))?;
+            sqlx::query(&format!("DROP TABLE {stage}")).execute(&mut target).await
+                .map_err(|e| format!("{error}；暂存表 {stage} 清理失败: {e}"))?;
+            return Err(format!("{error}；尚未发布正式目标"));
+        }
+    };
+    let expected_raw = expected_source;
+    // A lost COMMIT reply is ambiguous. Never clean up a final table or retry automatically.
+    sqlx::Executor::execute(&mut target, sqlx::raw_sql("COMMIT")).await
+        .map_err(|e| format!("复制暂存提交未确认，暂存表 {stage} 保留；勿自动重试: {e}"))?;
+    before_publish(&stage);
+    let publication = MySqlPublication {
+        final_q: dst, final_name: dst_table.to_string(), stage_name, backup_q: None,
+        expected_ddl, original_ddl: None, schema, content: None,
+        expected_rows: Some(expected_rows), raw_content: Some((digest_columns, expected_raw)),
+    };
+    mysql_publish(&mut target, &stage, &publication).await
 }
 
 // ── 7. db_export_table ────────────────────────────────────────────────────────
@@ -1292,6 +1951,7 @@ pub async fn db_export_table(
     // 结构导出（仅 format="sql" 生效）："only"=仅结构 / "with"=结构+数据 / None=仅数据
     structure: Option<String>,
     task_id: Option<String>,
+    cancel_map: State<'_, super::db_export::ExportCancelMap>,
     storage: State<'_, StorageState>,
     duck_pool: State<'_, super::duckdb::DuckPool>,
     ss_pool: State<'_, super::sqlserver::SsPool>,
@@ -1303,6 +1963,32 @@ pub async fn db_export_table(
     if let Some(ref w) = where_clause { validate_where(w)?; }
     validate_path(&path)?;
 
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    struct ExportCleanup {
+        map: super::db_export::ExportCancelMap,
+        task_id: Option<String>,
+        flag: Arc<AtomicBool>,
+        path: Option<String>,
+        completed: bool,
+    }
+    impl Drop for ExportCleanup {
+        fn drop(&mut self) {
+            if let Some(id) = &self.task_id {
+                let mut map = self.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if map.get(id).is_some_and(|flag| Arc::ptr_eq(flag, &self.flag)) { map.remove(id); }
+            }
+            if !self.completed {
+                if let Some(path) = &self.path { let _ = std::fs::remove_file(path); }
+            }
+        }
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    if let Some(id) = &task_id {
+        let mut map = cancel_map.lock().map_err(|_| "导出取消状态不可用")?;
+        if map.contains_key(id) { return Err("导出任务 ID 已在使用中".into()); }
+        map.insert(id.clone(), Arc::clone(&cancel));
+    }
+    let mut cleanup = ExportCleanup { map: Arc::clone(&cancel_map), task_id: task_id.clone(), flag: Arc::clone(&cancel), path: None, completed: false };
     let (config, password) = load_conn(&id, &storage).await?;
     let export_started = Instant::now();
     let progress_event = task_id.as_ref().map(|tid| format!("export_progress_{tid}"));
@@ -1372,6 +2058,57 @@ pub async fn db_export_table(
         _ => format!("SELECT * FROM {where_prefix}"),
     };
     let tagged_sql = tag_sql(&select_sql);
+    // SQL rows must retain native types. The stream exporter owns the strict
+    // serializers; display-only CSV/JSON conversions remain below.
+    if format == "sql" && !matches!(config.conn_type, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase) {
+        if structure.is_some() { return Err("结构导出目前仅支持 MySQL 系数据库".into()); }
+        let names: Vec<String> = match config.conn_type {
+            ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
+                let (mut conn, _t) = pg_connect(&config, password.as_deref()).await?;
+                sqlx::query_scalar("SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name=$2 AND is_generated='NEVER' ORDER BY ordinal_position")
+                    .bind(if schema.is_empty() { "public" } else { &schema }).bind(&table)
+                    .fetch_all(&mut conn).await.map_err(|e| format!("读取导出列失败: {e}"))?
+            }
+            ConnType::Sqlite => {
+                use sqlx::{ConnectOptions, Connection};
+                use std::str::FromStr;
+                let opts = sqlx::sqlite::SqliteConnectOptions::from_str(&super::query::sqlite_url(&config)?).map_err(|e| e.to_string())?.log_statements(log::LevelFilter::Off);
+                let mut conn = sqlx::sqlite::SqliteConnection::connect_with(&opts).await.map_err(|e| e.to_string())?;
+                sqlx::query_scalar("SELECT name FROM pragma_table_xinfo(?) WHERE hidden=0 ORDER BY cid").bind(&table)
+                    .fetch_all(&mut conn).await.map_err(|e| format!("读取导出列失败: {e}"))?
+            }
+            ConnType::SqlServer => {
+                let db = if schema.is_empty() { String::new() } else { format!("USE [{}]; ", schema.replace(']', "]]")) };
+                let object = format!("[dbo].[{}]", table.replace(']', "]]"));
+                let sql = format!("{db}SELECT name FROM sys.columns WHERE object_id=OBJECT_ID(N'{}') AND is_computed=0 AND generated_always_type=0 AND system_type_id<>189 ORDER BY column_id", object.replace('\'', "''"));
+                dispatch_ss_query(&id, &config, &sql, &ss_pool).await?.rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect()
+            }
+            ConnType::ClickHouse => {
+                let db = if schema.is_empty() { config.database.as_deref().unwrap_or("default") } else { &schema };
+                let sql = format!("SELECT name FROM system.columns WHERE database=unhex('{}') AND table=unhex('{}') AND default_kind NOT IN ('ALIAS','MATERIALIZED') ORDER BY position", hex::encode(db), hex::encode(&table));
+                let result = if super::clickhouse_tcp::use_tcp(&config) {
+                    super::clickhouse_tcp::query(&config, password.as_deref(), &sql).await?
+                } else { super::clickhouse::query(&config, password.as_deref(), &sql).await? };
+                result.rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect()
+            }
+            _ => return Err("此驱动尚无无损 SQL 值编码器；请使用 CSV/JSON 导出或数据库原生备份工具".into()),
+        };
+        if names.is_empty() { return Err("未找到可导出的非生成列".into()); }
+        let projection = names.iter().map(|name| match config.conn_type {
+            ConnType::SqlServer => format!("[{}]", name.replace(']', "]]")),
+            ConnType::ClickHouse => q_mysql(name),
+            _ => q_dq(name),
+        }).collect::<Vec<_>>().join(", ");
+        let filter = where_clause.as_deref().filter(|w| !w.trim().is_empty()).map(|w| format!(" WHERE {w}")).unwrap_or_default();
+        let select_sql = format!("SELECT {projection} FROM {where_prefix}{filter}");
+        cleanup.completed = true;
+        drop(cleanup);
+        return super::db_export::db_stream_export(
+            id, select_sql, path, format, "utf8".into(), table,
+            task_id.unwrap_or_else(|| format!("table-export-{}", uuid::Uuid::new_v4())), None,
+            storage, ss_pool, duck_pool, registry, cancel_map, app_handle,
+        ).await;
+    }
 
     let sqlserver_has_identity = if matches!(config.conn_type, ConnType::SqlServer) && format == "sql" {
         let db_context = if schema.is_empty() { String::new() } else {
@@ -1393,7 +2130,39 @@ pub async fn db_export_table(
         return Err("结构导出目前仅支持 MySQL 系数据库".into());
     }
     let structure_only = structure.as_deref() == Some("only");
-    let ddl_str: Option<String> = None;
+    // SQL archive context and raw DDL must come from the exact row session.
+    let mut mysql_export_session = if matches!(config.conn_type, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase) {
+        Some(mysql_connect(&config,password.as_deref()).await?)
+    } else { None };
+    if format=="sql" {
+        if let Some((conn,_t))=mysql_export_session.as_mut() {
+            sqlx::Executor::execute(&mut *conn,"SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ").await.map_err(|e|format!("设置导出快照失败: {e}"))?;
+            sqlx::Executor::execute(&mut *conn,"START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY").await.map_err(|e|format!("建立导出快照失败: {e}"))?;
+            sqlx::Executor::execute(&mut *conn,format!("SELECT * FROM {where_prefix} LIMIT 0").as_str()).await.map_err(|e|format!("锁定导出表定义失败: {e}"))?;
+            if !structure_only {
+                let engine:Option<String>=sqlx::query_scalar("SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=COALESCE(NULLIF(?,''),DATABASE()) AND TABLE_NAME=? AND TABLE_TYPE='BASE TABLE'")
+                    .bind(&schema).bind(&table).fetch_optional(&mut *conn).await.map_err(|e|e.to_string())?.flatten();
+                if engine.as_deref()!=Some("InnoDB") { return Err("可靠 SQL 数据导出要求 InnoDB 基础表，已停止导出".into()); }
+            }
+        }
+    }
+    // 在创建输出文件前读取源定义：读取失败必须终止，不能输出缺少结构的“成功”文件。
+    let ddl_str: Option<String> = if format == "sql" && structure.is_some() {
+        use sqlx::Row;
+        let (conn, _t) = mysql_export_session.as_mut().ok_or("MySQL 导出会话不存在")?;
+        let row = sqlx::query(&format!("SHOW CREATE TABLE {where_prefix}"))
+            .fetch_one(&mut *conn).await
+            .map_err(|e| format!("读取源表建表语句失败: {e}"))?;
+        let ddl = row.try_get::<String, _>(1)
+            .map_err(|e| format!("读取源表建表语句失败: {e}"))?;
+        if ddl.trim().is_empty() { return Err("源表建表语句为空，已终止导出".into()); }
+        Some(ddl)
+    } else { None };
+
+    let mysql_session_header = if format == "sql" && matches!(conn_type, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase) {
+        let (conn,_t) = mysql_export_session.as_mut().ok_or("MySQL 导出会话不存在")?;
+        Some(super::db_export::mysql_export_session_header(&mut *conn).await?)
+    } else { None };
 
     // 辅助：XML/Excel 转义
     fn xml_esc(s: &str) -> String {
@@ -1422,7 +2191,9 @@ pub async fn db_export_table(
 
     // 流式写入：避免大表全量加载到内存
     // 1. 建立文件写入器
-    let file = std::fs::File::create(&path).map_err(|e| format!("创建文件失败: {e}"))?;
+    let mut staged = super::db_export::StagedExport::new(&path)?;
+    let file = std::fs::File::create(&staged.path).map_err(|e| format!("创建文件失败: {e}"))?;
+    cleanup.path = Some(staged.path.clone());
     let mut w = std::io::BufWriter::new(file);
     use std::io::Write as IoWrite;
 
@@ -1431,41 +2202,41 @@ pub async fn db_export_table(
         "sql" => {
             let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
             let schema_disp = if schema.is_empty() { "-" } else { schema.as_str() };
-            write!(w, "/*\n DBTerm SQL Dump\n Schema  : {schema_disp}\n Table   : {table}\n\n Date    : {now}\n*/\n\n").ok();
+            write!(w, "/*\n DBTerm SQL Dump\n Schema  : {schema_disp}\n Table   : {table}\n\n Date    : {now}\n*/\n\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
             // SET NAMES / FOREIGN_KEY_CHECKS 为 MySQL 专有，其它方言不输出，避免导回报错
             if matches!(conn_type, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase) {
-                write!(w, "SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS = 0;\n\n").ok();
+                write!(w, "{}SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS = 0;\n\n", mysql_session_header.as_deref().unwrap_or("")).map_err(|e| format!("写入失败: {e}"))?;
             }
             if let Some(ref d) = ddl_str {
                 let tbl_ref = q_mysql(&table);
-                write!(w, "-- ----------------------------\n-- Table structure for {table}\n-- ----------------------------\n").ok();
-                write!(w, "DROP TABLE IF EXISTS {tbl_ref};\n").ok();
+                write!(w, "-- ----------------------------\n-- Table structure for {table}\n-- ----------------------------\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
+                write!(w, "DROP TABLE IF EXISTS {tbl_ref};\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
                 let ddl = d.trim_end();
-                write!(w, "{ddl}").ok();
-                if !ddl.ends_with(';') { write!(w, ";").ok(); }
-                write!(w, "\n\n").ok();
+                write!(w, "{ddl}").map_err(|e| format!("写入导出文件失败: {e}"))?;
+                if !ddl.ends_with(';') { write!(w, ";").map_err(|e| format!("写入导出文件失败: {e}"))?; }
+                write!(w, "\n\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
             }
         }
         "html" => {
             let t_name = html_esc(&table);
-            write!(w, "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>{t_name}</title>\n").ok();
+            write!(w, "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>{t_name}</title>\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
             write!(w, "<style>table{{border-collapse:collapse;font-family:-apple-system,Segoe UI,sans-serif;font-size:13px}}\
                        th,td{{border:1px solid #ccc;padding:6px 10px;text-align:left;white-space:nowrap}}\
-                       th{{background:#f2f2f2;font-weight:600}}tr:nth-child(even) td{{background:#fafafa}}</style>\n").ok();
-            write!(w, "</head>\n<body>\n<table>\n<thead>\n<tr>").ok();
+                       th{{background:#f2f2f2;font-weight:600}}tr:nth-child(even) td{{background:#fafafa}}</style>\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
+            write!(w, "</head>\n<body>\n<table>\n<thead>\n<tr>").map_err(|e| format!("写入导出文件失败: {e}"))?;
         }
         "excel" | "xls" | "xlsx" => {
             write!(w, "<?xml version=\"1.0\"?>\n<?mso-application progid=\"Excel.Sheet\"?>\n\
                        <Workbook xmlns=\"urn:schemas-microsoft-com:office:spreadsheet\" \
                        xmlns:ss=\"urn:schemas-microsoft-com:office:spreadsheet\">\n\
-                       <Worksheet ss:Name=\"Sheet1\">\n<Table>\n").ok();
+                       <Worksheet ss:Name=\"Sheet1\">\n<Table>\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
         }
         "xml" => {
             let root = xml_tag(&table);
-            write!(w, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<{root}>\n").ok();
+            write!(w, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<{root}>\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
         }
         "json" => {
-            write!(w, "[\n").ok();
+            write!(w, "[\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
         }
         _ => {} // csv / tsv / txt / markdown：列头在知道列名后写
     }
@@ -1474,37 +2245,39 @@ pub async fn db_export_table(
     let mut row_count: u64 = 0;
     let mut col_names: Vec<String> = Vec::new();
     let mut first_json_row = true;
+    let mut mysql_sql_row: Option<Vec<String>> = None;
 
     macro_rules! write_row {
         ($row_vals:expr) => {{
+            if cancel.load(Ordering::Relaxed) { return Err("导出已取消".into()); }
             let vals: &[Option<String>] = $row_vals;
             match format.as_str() {
                 "csv" => {
                     if row_count == 0 {
                         let hdr = col_names.iter().map(|c| csv_escape(&Some(c.clone()))).collect::<Vec<_>>().join(",");
-                        write!(w, "{hdr}\n").ok();
+                        write!(w, "{hdr}\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
                     }
                     let line = vals.iter().map(csv_escape).collect::<Vec<_>>().join(",");
-                    write!(w, "{line}\n").ok();
+                    write!(w, "{line}\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
                 }
                 "tsv" | "txt" => {
                     if row_count == 0 {
                         let hdr = col_names.iter().map(|c| c.replace('\t', " ")).collect::<Vec<_>>().join("\t");
-                        write!(w, "{hdr}\n").ok();
+                        write!(w, "{hdr}\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
                     }
                     let line = vals.iter().map(|v| match v {
                         None => String::new(),
                         Some(s) => s.replace('\t', " ").replace(['\n', '\r'], " "),
                     }).collect::<Vec<_>>().join("\t");
-                    write!(w, "{line}\n").ok();
+                    write!(w, "{line}\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
                 }
                 "markdown" => {
                     if row_count == 0 {
-                        write!(w, "| {} |\n", col_names.join(" | ")).ok();
-                        write!(w, "| {} |\n", col_names.iter().map(|_| "---").collect::<Vec<_>>().join(" | ")).ok();
+                        write!(w, "| {} |\n", col_names.join(" | ")).map_err(|e| format!("写入导出文件失败: {e}"))?;
+                        write!(w, "| {} |\n", col_names.iter().map(|_| "---").collect::<Vec<_>>().join(" | ")).map_err(|e| format!("写入导出文件失败: {e}"))?;
                     }
                     let cells = vals.iter().map(|v| v.as_deref().unwrap_or("").replace('|', "\\|")).collect::<Vec<_>>().join(" | ");
-                    write!(w, "| {cells} |\n").ok();
+                    write!(w, "| {cells} |\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
                 }
                 "sql" => {
                     // 标识符引号与值转义按方言走，避免对 PG/SQLite/Oracle/MSSQL 等生成 MySQL 反引号+反斜杠的非法 dump
@@ -1515,21 +2288,21 @@ pub async fn db_export_table(
                     };
                     let is_my = matches!(conn_type, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase);
                     if row_count == 0 {
-                        write!(w, "-- ----------------------------\n-- Records of {table}\n-- ----------------------------\n").ok();
+                        write!(w, "-- ----------------------------\n-- Records of {table}\n-- ----------------------------\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
                         // Oracle 的 BEGIN 是 PL/SQL 块起始；SQL Server 需明确写 BEGIN TRANSACTION。
                         if matches!(conn_type, ConnType::SqlServer) {
-                            write!(w, "BEGIN TRANSACTION;\n").ok();
+                            write!(w, "BEGIN TRANSACTION;\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
                         } else if !matches!(conn_type, ConnType::Oracle) {
-                            write!(w, "BEGIN;\n").ok();
+                            write!(w, "BEGIN;\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
                         }
                         if sqlserver_has_identity {
-                            write!(w, "SET IDENTITY_INSERT [{}] ON;\n", table.replace(']', "]]" )).ok();
+                            write!(w, "SET IDENTITY_INSERT [{}] ON;\n", table.replace(']', "]]" )).map_err(|e| format!("写入导出文件失败: {e}"))?;
                         }
                     }
                     let tbl_ref = q(&table);
                     let col_list = col_names.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
-                    let vstr = vals.iter().map(|v| if is_my { sql_escape_value(v) } else { sql_escape_value_std(v) }).collect::<Vec<_>>().join(", ");
-                    write!(w, "INSERT INTO {tbl_ref} ({col_list}) VALUES ({vstr});\n").ok();
+                    let vstr = if is_my { mysql_sql_row.take().ok_or("缺少无损 SQL 导出数据")?.join(", ") } else { vals.iter().map(sql_escape_value_std).collect::<Vec<_>>().join(", ") };
+                    write!(w, "INSERT INTO {tbl_ref} ({col_list}) VALUES ({vstr});\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
                 }
                 "json" => {
                     let mut obj = serde_json::Map::new();
@@ -1540,55 +2313,55 @@ pub async fn db_export_table(
                         });
                     }
                     let line = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_default();
-                    if !first_json_row { write!(w, ",\n").ok(); }
-                    write!(w, "  {line}").ok();
+                    if !first_json_row { write!(w, ",\n").map_err(|e| format!("写入导出文件失败: {e}"))?; }
+                    write!(w, "  {line}").map_err(|e| format!("写入导出文件失败: {e}"))?;
                     first_json_row = false;
                 }
                 "html" => {
                     if row_count == 0 {
-                        for c in &col_names { write!(w, "<th>{}</th>", html_esc(c)).ok(); }
-                        write!(w, "</tr>\n</thead>\n<tbody>\n").ok();
+                        for c in &col_names { write!(w, "<th>{}</th>", html_esc(c)).map_err(|e| format!("写入导出文件失败: {e}"))?; }
+                        write!(w, "</tr>\n</thead>\n<tbody>\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
                     }
-                    write!(w, "<tr>").ok();
+                    write!(w, "<tr>").map_err(|e| format!("写入导出文件失败: {e}"))?;
                     for v in vals {
                         match v {
-                            None    => write!(w, "<td></td>").ok(),
-                            Some(s) => write!(w, "<td>{}</td>", html_esc(s)).ok(),
+                            None    => write!(w, "<td></td>").map_err(|e| format!("写入导出文件失败: {e}"))?,
+                            Some(s) => write!(w, "<td>{}</td>", html_esc(s)).map_err(|e| format!("写入导出文件失败: {e}"))?,
                         };
                     }
-                    write!(w, "</tr>\n").ok();
+                    write!(w, "</tr>\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
                 }
                 "excel" | "xls" | "xlsx" => {
                     if row_count == 0 {
-                        write!(w, "<Row>").ok();
+                        write!(w, "<Row>").map_err(|e| format!("写入导出文件失败: {e}"))?;
                         for c in &col_names {
-                            write!(w, "<Cell><Data ss:Type=\"String\">{}</Data></Cell>", xml_esc(c)).ok();
+                            write!(w, "<Cell><Data ss:Type=\"String\">{}</Data></Cell>", xml_esc(c)).map_err(|e| format!("写入导出文件失败: {e}"))?;
                         }
-                        write!(w, "</Row>\n").ok();
+                        write!(w, "</Row>\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
                     }
-                    write!(w, "<Row>").ok();
+                    write!(w, "<Row>").map_err(|e| format!("写入导出文件失败: {e}"))?;
                     for v in vals {
                         match v {
-                            None => write!(w, "<Cell/>").ok(),
+                            None => write!(w, "<Cell/>").map_err(|e| format!("写入导出文件失败: {e}"))?,
                             Some(s) => if is_plain_number(s) {
-                                write!(w, "<Cell><Data ss:Type=\"Number\">{}</Data></Cell>", xml_esc(s)).ok()
+                                write!(w, "<Cell><Data ss:Type=\"Number\">{}</Data></Cell>", xml_esc(s)).map_err(|e| format!("写入导出文件失败: {e}"))?
                             } else {
-                                write!(w, "<Cell><Data ss:Type=\"String\">{}</Data></Cell>", xml_esc(s)).ok()
+                                write!(w, "<Cell><Data ss:Type=\"String\">{}</Data></Cell>", xml_esc(s)).map_err(|e| format!("写入导出文件失败: {e}"))?
                             },
                         };
                     }
-                    write!(w, "</Row>\n").ok();
+                    write!(w, "</Row>\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
                 }
                 "xml" => {
                     let tags: Vec<String> = col_names.iter().map(|c| xml_tag(c)).collect();
-                    write!(w, "  <row>\n").ok();
+                    write!(w, "  <row>\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
                     for (t, v) in tags.iter().zip(vals.iter()) {
                         match v {
-                            None    => write!(w, "    <{t}/>\n").ok(),
-                            Some(s) => write!(w, "    <{t}>{}</{t}>\n", xml_esc_val(s)).ok(),
+                            None    => write!(w, "    <{t}/>\n").map_err(|e| format!("写入导出文件失败: {e}"))?,
+                            Some(s) => write!(w, "    <{t}>{}</{t}>\n", xml_esc_val(s)).map_err(|e| format!("写入导出文件失败: {e}"))?,
                         };
                     }
-                    write!(w, "  </row>\n").ok();
+                    write!(w, "  </row>\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
                 }
                 _ => {}
             }
@@ -1604,13 +2377,20 @@ pub async fn db_export_table(
             use sqlx::{Column, Row};
             use futures::TryStreamExt;
             if !structure_only {
-                let (mut conn, _t) = mysql_connect(&config, password.as_deref()).await?;
-                let mut stream = sqlx::query(&tagged_sql).fetch(&mut conn);
+                let (conn, _t) = mysql_export_session.as_mut().ok_or("MySQL 导出会话不存在")?;
+                let projection = if format == "sql" {
+                    super::db_export::mysql_export_projection(&mut *conn, &where_prefix).await?
+                } else { "*".to_string() };
+                let filter = where_clause.as_deref().filter(|w| !w.trim().is_empty()).map(|w| format!(" WHERE {w}")).unwrap_or_default();
+                let mysql_select = tag_sql(&format!("SELECT {projection} FROM {where_prefix}{filter}"));
+                let mut stream = sqlx::query(&mysql_select).fetch(&mut *conn);
                 while let Some(row) = stream.try_next().await.map_err(|e| format!("查询失败: {e}"))? {
                     if col_names.is_empty() {
                         col_names = row.columns().iter().map(|c| c.name().to_string()).collect();
                     }
-                    let vals = mysql_row_to_strings(&row);
+                    if format == "sql" { mysql_sql_row = Some(super::db_export::mysql_sql_values(&row)?); }
+                    let vals = if format == "sql" { Vec::new() }
+                        else { super::db_export::mysql_export_values_checked(&row)? };
                     write_row!(&vals);
                 }
             }
@@ -1686,49 +2466,55 @@ pub async fn db_export_table(
         _ => unreachable!(),
     }
 
+    if cancel.load(Ordering::Relaxed) { return Err("导出已取消".into()); }
+
     // 4. 写文件尾
     match format.as_str() {
         "sql" => {
             // Oracle 不用 BEGIN/COMMIT 包裹（BEGIN 为 PL/SQL 块）；SET FOREIGN_KEY_CHECKS 仅 MySQL
             if row_count > 0 && sqlserver_has_identity {
-                write!(w, "SET IDENTITY_INSERT [{}] OFF;\n", table.replace(']', "]]" )).ok();
+                write!(w, "SET IDENTITY_INSERT [{}] OFF;\n", table.replace(']', "]]" )).map_err(|e| format!("写入导出文件失败: {e}"))?;
             }
-            if row_count > 0 && !matches!(conn_type, ConnType::Oracle) { write!(w, "COMMIT;\n").ok(); }
+            if row_count > 0 && !matches!(conn_type, ConnType::Oracle) { write!(w, "COMMIT;\n").map_err(|e| format!("写入导出文件失败: {e}"))?; }
             if matches!(conn_type, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase) {
-                write!(w, "\nSET FOREIGN_KEY_CHECKS = 1;\n").ok();
+                write!(w, "\nSET FOREIGN_KEY_CHECKS = 1;\n{}", super::db_export::MYSQL_EXPORT_SESSION_FOOTER).map_err(|e| format!("写入导出文件失败: {e}"))?;
             }
         }
         "html" => {
             if row_count == 0 {
                 // 没有数据行，仍需关闭表头
-                for c in &col_names { write!(w, "<th>{}</th>", html_esc(c)).ok(); }
-                write!(w, "</tr>\n</thead>\n<tbody>\n").ok();
+                for c in &col_names { write!(w, "<th>{}</th>", html_esc(c)).map_err(|e| format!("写入导出文件失败: {e}"))?; }
+                write!(w, "</tr>\n</thead>\n<tbody>\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
             }
-            write!(w, "</tbody>\n</table>\n</body>\n</html>\n").ok();
+            write!(w, "</tbody>\n</table>\n</body>\n</html>\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
         }
         "excel" | "xls" | "xlsx" => {
             if row_count == 0 && !col_names.is_empty() {
-                write!(w, "<Row>").ok();
+                write!(w, "<Row>").map_err(|e| format!("写入导出文件失败: {e}"))?;
                 for c in &col_names {
-                    write!(w, "<Cell><Data ss:Type=\"String\">{}</Data></Cell>", xml_esc(c)).ok();
+                    write!(w, "<Cell><Data ss:Type=\"String\">{}</Data></Cell>", xml_esc(c)).map_err(|e| format!("写入导出文件失败: {e}"))?;
                 }
-                write!(w, "</Row>\n").ok();
+                write!(w, "</Row>\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
             }
-            write!(w, "</Table>\n</Worksheet>\n</Workbook>\n").ok();
+            write!(w, "</Table>\n</Worksheet>\n</Workbook>\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
         }
         "xml" => {
             let root = xml_tag(&table);
-            write!(w, "</{root}>\n").ok();
+            write!(w, "</{root}>\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
         }
         "json" => {
-            if row_count > 0 { write!(w, "\n").ok(); }
-            write!(w, "]\n").ok();
+            if row_count > 0 { write!(w, "\n").map_err(|e| format!("写入导出文件失败: {e}"))?; }
+            write!(w, "]\n").map_err(|e| format!("写入导出文件失败: {e}"))?;
         }
         _ => {}
     }
 
     if let Err(e) = w.flush() { return Err(format!("刷新文件失败: {e}")); }
+    drop(w);
+    if cancel.load(Ordering::Relaxed) { return Err("导出已取消".into()); }
+    staged.commit()?;
     let file_bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    cleanup.completed = true;
     emit_progress(row_count, true, file_bytes);
     Ok(row_count)
 }
@@ -1756,7 +2542,16 @@ pub async fn db_export_schema(
 
     use sqlx::{Row, Executor};
     let (mut conn, _t) = mysql_connect(&config, password.as_deref()).await?;
+    let mysql_header = super::db_export::mysql_export_session_header(&mut conn).await?;
+    let schema = if schema.is_empty() {
+        sqlx::query_scalar::<_, Option<String>>("SELECT DATABASE()").fetch_one(&mut conn).await
+            .map_err(|e| format!("读取当前数据库失败: {e}"))?.filter(|s| !s.is_empty()).ok_or("请选择导出数据库")?
+    } else { schema };
     let db_ref = q_mysql(&schema);
+    let database_row = sqlx::query(&format!("SHOW CREATE DATABASE {db_ref}")).fetch_one(&mut conn).await
+        .map_err(|e| format!("读取数据库原始定义失败: {e}"))?;
+    let database_ddl: String = database_row.try_get(1).map_err(|e| format!("读取数据库建库语句失败: {e}"))?;
+    let database_ddl = mysql_export_database_ddl(&database_ddl, &schema)?;
     // 切到目标库，便于 SHOW CREATE FUNCTION/PROCEDURE 使用裸名
     conn.execute(sqlx::raw_sql(&tag_sql(&format!("USE {db_ref}")))).await
         .map_err(|e| format!("切换数据库失败: {e}"))?;
@@ -1784,19 +2579,21 @@ pub async fn db_export_schema(
 
     // 流式写入：避免将整个 dump 拼接为字符串（大库 OOM）
     use std::io::{BufWriter, Write as IoWrite2};
-    let file = std::fs::File::create(&path).map_err(|e| format!("创建文件失败: {e}"))?;
+    let mut staged = super::db_export::StagedExport::new(&path)?;
+    let file = std::fs::File::create(&staged.path).map_err(|e| format!("创建文件失败: {e}"))?;
     let mut w = BufWriter::with_capacity(65536, file);
 
     write!(w, "/*\n DBTerm SQL Dump (整库)\n Schema  : {schema}\n 表 {} · 视图 {} · 函数 {} · 存储过程 {}\n\n Date    : {now}\n*/\n\n",
         tables.len(), views.len(), funcs.len(), procs.len()).map_err(|e| format!("写入失败: {e}"))?;
-    write!(w, "SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS = 0;\nUSE {db_ref};\n\n").map_err(|e| format!("写入失败: {e}"))?;
+    write!(w, "{mysql_header}SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS = 0;\n{database_ddl};\nUSE {db_ref};\n\n").map_err(|e| format!("写入失败: {e}"))?;
 
     for tbl in &tables {
         let tref = q_mysql(tbl);
         let dr = sqlx::query(&tag_sql(&format!("SHOW CREATE TABLE {db_ref}.{tref}")))
             .fetch_one(&mut conn).await
             .map_err(|e| format!("获取 {tbl} 建表语句失败: {e}"))?;
-        let ddl = dr.try_get::<String, _>(1).unwrap_or_default();
+        let ddl = dr.try_get::<String, _>(1).map_err(|e| format!("读取表 {tbl} 完整定义失败: {e}"))?;
+        if ddl.trim().is_empty() { return Err(format!("表 {tbl} 定义为空，已中止导出")); }
         write!(w, "-- ----------------------------\n-- Table structure for {tbl}\n-- ----------------------------\n").map_err(|e| format!("写入失败: {e}"))?;
         write!(w, "DROP TABLE IF EXISTS {tref};\n").map_err(|e| format!("写入失败: {e}"))?;
         let ddl_t = ddl.trim_end();
@@ -1808,7 +2605,8 @@ pub async fn db_export_schema(
         if !structure_only {
             use futures::TryStreamExt;
             write!(w, "-- ----------------------------\n-- Records of {tbl}\n-- ----------------------------\n").map_err(|e| format!("写入失败: {e}"))?;
-            let select_sql = tag_sql(&format!("SELECT * FROM {db_ref}.{tref}"));
+            let projection = super::db_export::mysql_export_projection(&mut conn, &format!("{db_ref}.{tref}")).await?;
+            let select_sql = tag_sql(&format!("SELECT {projection} FROM {db_ref}.{tref}"));
             let mut stream = sqlx::query(&select_sql).fetch(&mut conn);
             let mut col_list: Option<String> = None;
             let mut has_rows = false;
@@ -1820,8 +2618,7 @@ pub async fn db_export_schema(
                     write!(w, "BEGIN;\n").map_err(|e| format!("写入失败: {e}"))?;
                     has_rows = true;
                 }
-                let row_strs = mysql_row_to_strings(&row);
-                let vals = row_strs.iter().map(sql_escape_value).collect::<Vec<_>>().join(", ");
+                let vals = super::db_export::mysql_sql_values(&row)?.join(", ");
                 write!(w, "INSERT INTO {tref} ({}) VALUES ({vals});\n", col_list.as_deref().unwrap()).map_err(|e| format!("写入失败: {e}"))?;
             }
             if has_rows { write!(w, "COMMIT;\n").map_err(|e| format!("写入失败: {e}"))?; }
@@ -1833,7 +2630,8 @@ pub async fn db_export_schema(
         let vref = q_mysql(v);
         let dr = sqlx::query(&tag_sql(&format!("SHOW CREATE VIEW {db_ref}.{vref}")))
             .fetch_one(&mut conn).await.map_err(|e| format!("获取视图 {v} 失败: {e}"))?;
-        let ddl = dr.try_get::<String, _>(1).unwrap_or_default();
+        let ddl = dr.try_get::<String, _>(1).map_err(|e| format!("读取视图 {v} 完整定义失败: {e}"))?;
+        if ddl.trim().is_empty() { return Err(format!("视图 {v} 定义为空，已中止导出")); }
         write!(w, "-- ----------------------------\n-- View structure for {v}\n-- ----------------------------\n").map_err(|e| format!("写入失败: {e}"))?;
         write!(w, "DROP VIEW IF EXISTS {vref};\n").map_err(|e| format!("写入失败: {e}"))?;
         let ddl_t = ddl.trim_end();
@@ -1850,8 +2648,8 @@ pub async fn db_export_schema(
             let nref = q_mysql(name);
             let dr = sqlx::query(&tag_sql(&format!("SHOW CREATE {show_kw} {nref}")))
                 .fetch_one(&mut conn).await.map_err(|e| format!("获取{kind} {name} 失败: {e}"))?;
-            let ddl = dr.try_get::<String, _>(col).unwrap_or_default();
-            if ddl.trim().is_empty() { continue; }
+            let ddl = dr.try_get::<String, _>(col).map_err(|e| format!("读取 {kind} {name} 完整定义失败: {e}"))?;
+            if ddl.trim().is_empty() { return Err(format!("{kind} {name} 定义为空或无查看权限，已中止导出")); }
             write!(w, "-- ----------------------------\n-- {kind} structure for {name}\n-- ----------------------------\n").map_err(|e| format!("写入失败: {e}"))?;
             write!(w, "DROP {drop_kw} IF EXISTS {nref};\nDELIMITER ;;\n").map_err(|e| format!("写入失败: {e}"))?;
             write!(w, "{}", ddl.trim_end()).map_err(|e| format!("写入失败: {e}"))?;
@@ -1859,12 +2657,558 @@ pub async fn db_export_schema(
         }
     }
 
-    write!(w, "SET FOREIGN_KEY_CHECKS = 1;\n").map_err(|e| format!("写入失败: {e}"))?;
+    write!(w, "SET FOREIGN_KEY_CHECKS = 1;\n{}", super::db_export::MYSQL_EXPORT_SESSION_FOOTER).map_err(|e| format!("写入失败: {e}"))?;
     w.flush().map_err(|e| format!("刷新文件失败: {e}"))?;
+    drop(w);
+    staged.commit()?;
     Ok(obj_count)
 }
 
+// File imports must share the guarded, typed, single-transaction insert path.
+async fn import_rows_stop(
+    config: &ConnConfig, password: Option<&str>, schema: &str, table: &str,
+    columns: &[String], rows: &[Vec<Option<String>>],
+) -> Result<ImportResult, String> {
+    let inserted = match config.conn_type {
+        ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase =>
+            mysql_insert_rows(config, password, schema, table, columns, rows).await?,
+        ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss =>
+            pg_insert_rows(config, password, schema, table, columns, rows).await?,
+        ConnType::Sqlite => sqlite_insert_rows_impl(config, schema, table, columns, rows).await?,
+        _ => return Err("此连接类型不支持此事务导入路径".into()),
+    };
+    Ok(ImportResult { inserted, skipped: 0, errors: Vec::new() })
+}
+
+// Independently testable file-import writer; no stored connections or IPC.
+async fn sqlite_import_rows(
+    config: &ConnConfig,
+    schema: &str,
+    table: &str,
+    columns: &[String],
+    rows: &[Vec<Option<String>>],
+    has_header: bool,
+    on_error: &str,
+) -> Result<ImportResult, String> {
+    if on_error == "stop" {
+        return import_rows_stop(config, None, schema, table, columns, rows).await;
+    }
+    let mut inserted = 0;
+    let mut skipped = 0;
+    let mut errors = Vec::new();
+
+    use crate::commands::query::sqlite_url;
+    use sqlx::{sqlite::SqliteConnection, Connection};
+    let url = sqlite_url(config)?;
+    let mut conn = SqliteConnection::connect(&url)
+        .await
+        .map_err(|e| format!("SQLite 连接失败: {e}"))?;
+    let target = if schema.is_empty() {
+        q_dq(table)
+    } else {
+        format!("{}.{}", q_dq(schema), q_dq(table))
+    };
+    let col_list = columns
+        .iter()
+        .map(|c| q_dq(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let n_cols = columns.len();
+    let row_ph = (0..n_cols).map(|_| "?").collect::<Vec<_>>().join(", ");
+    let sql = tag_sql(&format!(
+        "INSERT INTO {target} ({col_list}) VALUES ({row_ph})"
+    ));
+
+    let mut tx = conn
+        .begin()
+        .await
+        .map_err(|e| format!("开启导入事务失败: {e}"))?;
+    let outcome: Result<(), String> = async {
+        for (line_no, row) in rows.iter().enumerate() {
+            sqlx::query("SAVEPOINT dbterm_import_row")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut q = sqlx::query(&sql);
+            for val in row {
+                q = q.bind(val.as_deref());
+            }
+            match q.execute(&mut *tx).await {
+                Ok(r) => {
+                    sqlx::query("RELEASE SAVEPOINT dbterm_import_row")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    inserted += r.rows_affected();
+                }
+                Err(e) => {
+                    // Constraint triggers can abort the transaction; never skip them.
+                    let skippable = match &e {
+                        sqlx::Error::Database(db) => db.code().is_some_and(|c| {
+                            matches!(
+                                c.as_ref(),
+                                "275" | "531" | "787" | "1299" | "1555" | "2067" | "2579" | "3091"
+                            )
+                        }),
+                        _ => false,
+                    };
+                    if !skippable {
+                        return Err(format!("导入发生不可跳过的错误: {e}"));
+                    }
+                    sqlx::query("ROLLBACK TO SAVEPOINT dbterm_import_row")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| format!("恢复导入保存点失败: {e}"))?;
+                    sqlx::query("RELEASE SAVEPOINT dbterm_import_row")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let msg = format!(
+                        "第 {} 行插入失败: {e}",
+                        line_no + 1 + if has_header { 1 } else { 0 }
+                    );
+                    skipped += 1;
+                    errors.push(msg);
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(reason) = outcome {
+        return match tx.rollback().await {
+            Ok(()) => Err(format!("{reason}；本次导入已回滚")),
+            Err(e) => Err(format!(
+                "{reason}；回滚未确认: {e}；请核查目标，禁止自动重试"
+            )),
+        };
+    }
+    tx.commit()
+        .await
+        .map_err(|e| format!("导入提交未获确认，结果未知，请核对目标，禁止自动重试: {e}"))?;
+    Ok(ImportResult {
+        inserted,
+        skipped,
+        errors,
+    })
+}
+
+
+#[cfg(test)]
+mod import_transaction_tests {
+    use super::*;
+    #[tokio::test]
+    async fn stop_import_commits_exact_null_empty_and_multiline_values() {
+        let (config,pool,path)=super::batch_insert_atomicity_tests::sqlite_fixture().await;
+        let rows=vec![vec![Some("1".into()),None],vec![Some("2".into()),Some("".into())],vec![Some("3".into()),Some("首行\n次行".into())]];
+        let result=import_rows_stop(&config,None,"main","batch_rows",&["id".into(),"value".into()],&rows).await.unwrap();
+        let actual:Vec<(String,Option<String>)>=sqlx::query_as("SELECT id,value FROM batch_rows ORDER BY id").fetch_all(&pool).await.unwrap();
+        pool.close().await;std::fs::remove_file(path).unwrap();
+        assert_eq!(result.inserted,3);assert!(result.errors.is_empty());
+        assert_eq!(actual,vec![("1".into(),None),("2".into(),Some("".into())),("3".into(),Some("首行\n次行".into()))]);
+    }
+    #[tokio::test]
+    async fn sqlite_explicit_skip_still_keeps_valid_rows_and_reports_rejected_row() {
+        let (config,pool,path)=super::batch_insert_atomicity_tests::sqlite_fixture().await;
+        let rows=vec![vec![Some("1".into()),None],vec![Some("1".into()),None],vec![Some("2".into()),None]];
+        let result=sqlite_import_rows(&config,"main","batch_rows",&["id".into(),"value".into()],&rows,true,"skip").await.unwrap();
+        let count:i64=sqlx::query_scalar("SELECT COUNT(*) FROM batch_rows").fetch_one(&pool).await.unwrap();
+        pool.close().await;std::fs::remove_file(path).unwrap();
+        assert_eq!((result.inserted,result.skipped,count),(2,1,2));assert_eq!(result.errors.len(),1);
+    }
+    #[tokio::test]
+    async fn sqlite_skip_fatal_trigger_aborts_import_and_preserves_original_rows() {
+        let (config,pool,path)=super::batch_insert_atomicity_tests::sqlite_fixture().await;
+        sqlx::query("INSERT INTO batch_rows VALUES('existing','keep')").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TRIGGER abort_import BEFORE INSERT ON batch_rows WHEN NEW.id='abort' BEGIN SELECT RAISE(ROLLBACK,'transaction aborted'); END").execute(&pool).await.unwrap();
+        let rows=vec![vec![Some("new".into()),None],vec![Some("abort".into()),None],vec![Some("last".into()),None]];
+        let result=sqlite_import_rows(&config,"main","batch_rows",&["id".into(),"value".into()],&rows,true,"skip").await;
+        let actual:Vec<(String,String)>=sqlx::query_as("SELECT id,value FROM batch_rows ORDER BY id").fetch_all(&pool).await.unwrap();
+        pool.close().await;std::fs::remove_file(path).unwrap();
+        assert_eq!(actual,vec![("existing".into(),"keep".into())],"fatal import failure must not retain earlier or later imported rows");
+        assert!(result.is_err(),"transaction abort cannot be skipped as a bad row");
+    }
+    #[tokio::test]
+    async fn json_import_preserves_exact_values_through_sqlite_transaction() {
+        let (config,pool,path)=super::batch_insert_atomicity_tests::sqlite_fixture().await;
+        let columns=["id".to_string(),"value".to_string()];
+        let rows=super::super::import_json::records(r#"[{"id":123456789012345678901234567890,"value":"NULL"},{"id":"2","value":null},{"id":"3","value":{"n":1.234567890123456789,"text":"中文"}}]"#,&columns,"NULL").unwrap();
+        let result=import_rows_stop(&config,None,"main","batch_rows",&columns,&rows).await.unwrap();
+        let actual:Vec<(String,Option<String>)>=sqlx::query_as("SELECT id,value FROM batch_rows ORDER BY id").fetch_all(&pool).await.unwrap();
+        pool.close().await;std::fs::remove_file(path).unwrap();
+        assert_eq!(result.inserted,3);
+        assert_eq!(actual,vec![("123456789012345678901234567890".into(),Some("NULL".into())),("2".into(),None),("3".into(),Some(r#"{"n":1.234567890123456789,"text":"中文"}"#.into()))]);
+    }
+    #[tokio::test]
+    async fn xml_import_keeps_text_empty_and_null_values_in_sqlite() {
+        let (config,pool,path)=super::batch_insert_atomicity_tests::sqlite_fixture().await;
+        let columns=["id".to_string(),"value".to_string()];
+        let rows=super::super::import_xml::records(r#"<batch_rows><row><id>1</id><value>&#20013;<![CDATA[<x>&]]>&amp;lt;</value></row><row><id>2</id><value></value></row><row><id>3</id><value/></row><row><id>4</id><value>NULL</value></row></batch_rows>"#,&columns,"NULL").unwrap();
+        let result=import_rows_stop(&config,None,"main","batch_rows",&columns,&rows).await.unwrap();
+        let actual:Vec<(String,Option<String>)>=sqlx::query_as("SELECT id,value FROM batch_rows ORDER BY id").fetch_all(&pool).await.unwrap();
+        pool.close().await;std::fs::remove_file(path).unwrap();
+        assert_eq!(result.inserted,4);
+        assert_eq!(actual,vec![("1".into(),Some("中<x>&&lt;".into())),("2".into(),Some("".into())),("3".into(),None),("4".into(),Some("NULL".into()))]);
+    }
+    #[tokio::test]
+    async fn excel_mapped_records_preserve_values_through_sqlite_transaction() {
+        let (config,pool,path)=super::batch_insert_atomicity_tests::sqlite_fixture().await;
+        let mut range=calamine::Range::new((0,0),(2,1));
+        range.set_value((0,0),calamine::Data::String("value".into()));range.set_value((0,1),calamine::Data::String("id".into()));
+        range.set_value((1,0),calamine::Data::String("001中文\ntext".into()));range.set_value((1,1),calamine::Data::Int(1));
+        range.set_value((2,0),calamine::Data::Empty);range.set_value((2,1),calamine::Data::Int(2));
+        let columns=["id","value"].map(String::from);
+        let rows=super::super::import_excel::records(&range,&columns,true,"NULL").unwrap();
+        let outcome=import_rows_stop(&config,None,"main","batch_rows",&columns,&rows).await.unwrap();
+        let actual:Vec<(String,Option<String>)>=sqlx::query_as("SELECT id,value FROM batch_rows ORDER BY id").fetch_all(&pool).await.unwrap();
+        pool.close().await;std::fs::remove_file(path).unwrap();assert_eq!(outcome.inserted,2);
+        assert_eq!(actual,vec![("1".into(),Some("001中文\ntext".into())),("2".into(),None)]);
+    }
+    #[tokio::test]
+    async fn sqlite_stop_import_late_error_preserves_only_original_rows() {
+        let (config,pool,path) = super::batch_insert_atomicity_tests::sqlite_fixture().await;
+        sqlx::query("INSERT INTO batch_rows VALUES('existing','keep')").execute(&pool).await.unwrap();
+        let rows=vec![vec![Some("new".into()),Some("first".into())],vec![Some("existing".into()),Some("duplicate".into())]];
+        let result=sqlite_import_rows(&config,"main","batch_rows",&["id".into(),"value".into()],&rows,true,"stop").await;
+        let actual:Vec<(String,String)>=sqlx::query_as("SELECT id,value FROM batch_rows ORDER BY id").fetch_all(&pool).await.unwrap();
+        pool.close().await;
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(actual,vec![("existing".into(),"keep".into())],"failed stop-mode import must roll back earlier inserted records");
+        assert!(result.is_err(),"stop failure must not be reported as successful partial import");
+    }
+}
+
+#[cfg(test)]
+#[path="import_skip_tests.rs"]
+mod import_skip_tests;
+
+async fn mysql_import_rows(
+    config: &ConnConfig,
+    password: Option<&str>,
+    schema: &str,
+    table: &str,
+    columns: &[String],
+    rows: &[Vec<Option<String>>],
+    has_header: bool,
+    on_error: &str,
+) -> Result<ImportResult, String> {
+    if on_error == "stop" {
+        return import_rows_stop(config, password, schema, table, columns, rows).await;
+    }
+    if columns.is_empty() || columns.len() > 65_535 || rows.iter().any(|r| r.len() != columns.len())
+    {
+        return Err("导入列数无效或记录宽度不一致，未执行写入".into());
+    }
+    use sqlx::Connection;
+    let (mut conn, _t) = mysql_connect(config, password).await?;
+    let target = if schema.is_empty() {
+        q_mysql(table)
+    } else {
+        format!("{}.{}", q_mysql(schema), q_mysql(table))
+    };
+    let col_list = columns
+        .iter()
+        .map(|c| q_mysql(c))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut tx = conn
+        .begin()
+        .await
+        .map_err(|e| format!("开启导入事务失败: {e}"))?;
+    let outcome: Result<ImportResult, String> = async {
+        super::query::mysql_require_atomic_table(&mut *tx, schema, table).await?;
+        let mut result = ImportResult {
+            inserted: 0,
+            skipped: 0,
+            errors: Vec::new(),
+        };
+        let batch_size = (65_535 / columns.len()).min(200);
+        for (batch, chunk) in rows.chunks(batch_size).enumerate() {
+            let mut pending = vec![(0usize, chunk)];
+            while let Some((relative, part)) = pending.pop() {
+                sqlx::Executor::execute(&mut *tx, "SAVEPOINT dbterm_import_row")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let row_placeholders = vec!["?"; columns.len()].join(",");
+                let values = vec![format!("({row_placeholders})"); part.len()].join(",");
+                let sql = tag_sql(&format!(
+                    "INSERT INTO {target} ({col_list}) VALUES {values}"
+                ));
+                let mut query = sqlx::query(&sql);
+                for row in part {
+                    for value in row {
+                        query = query.bind(value.as_deref());
+                    }
+                }
+                let rejected = match query.execute(&mut *tx).await {
+                    Ok(done) => {
+                        let warning = sqlx::Executor::fetch_optional(&mut *tx, "SHOW WARNINGS")
+                            .await
+                            .map_err(|e| format!("读取导入警告失败: {e}"))?
+                            .is_some();
+                        if !warning {
+                            sqlx::Executor::execute(
+                                &mut *tx,
+                                "RELEASE SAVEPOINT dbterm_import_row",
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?;
+                            result.inserted += done.rows_affected();
+                            continue;
+                        }
+                        "数据库返回转换警告，该记录未保留".to_string()
+                    }
+                    Err(e) => {
+                        let can_skip = match &e {
+                            sqlx::Error::Database(db) => db
+                                .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+                                .is_some_and(|e| {
+                                    matches!(
+                                        e.number(),
+                                        1048 | 1062
+                                            | 1264
+                                            | 1265
+                                            | 1292
+                                            | 1366
+                                            | 1406
+                                            | 1451
+                                            | 1452
+                                            | 3819
+                                            | 4025
+                                    )
+                                }),
+                            _ => false,
+                        };
+                        if !can_skip {
+                            return Err(format!("导入发生不可跳过的错误: {e}"));
+                        }
+                        e.to_string()
+                    }
+                };
+                sqlx::Executor::execute(&mut *tx, "ROLLBACK TO SAVEPOINT dbterm_import_row")
+                    .await
+                    .map_err(|e| format!("恢复导入保存点失败: {e}"))?;
+                sqlx::Executor::execute(&mut *tx, "RELEASE SAVEPOINT dbterm_import_row")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if part.len() > 1 {
+                    for i in (0..part.len()).rev() {
+                        pending.push((relative + i, &part[i..i + 1]));
+                    }
+                } else {
+                    result.skipped += 1;
+                    result.errors.push(format!(
+                        "第{}条记录被跳过: {rejected}",
+                        batch * batch_size + relative + 1 + usize::from(has_header)
+                    ));
+                }
+            }
+        }
+        Ok(result)
+    }
+    .await;
+    match outcome {
+        Ok(result) => {
+            tx.commit().await.map_err(|e| {
+                format!("导入提交未获确认，结果未知，请核对目标，禁止自动重试: {e}")
+            })?;
+            Ok(result)
+        }
+        Err(reason) => match tx.rollback().await {
+            Ok(()) => Err(format!("{reason}；本次导入已回滚")),
+            Err(e) => Err(format!(
+                "{reason}；回滚未确认: {e}；请核查目标，禁止自动重试"
+            )),
+        },
+    }
+}
+
+async fn pg_import_rows(
+    config: &ConnConfig,
+    password: Option<&str>,
+    schema: &str,
+    table: &str,
+    columns: &[String],
+    rows: &[Vec<Option<String>>],
+    has_header: bool,
+    on_error: &str,
+) -> Result<ImportResult, String> {
+    if on_error == "stop" {
+        return import_rows_stop(config, password, schema, table, columns, rows).await;
+    }
+    if columns.is_empty() || columns.len() > 65_535 || rows.iter().any(|r| r.len() != columns.len())
+    {
+        return Err("导入列数无效或记录宽度不一致，未执行写入".into());
+    }
+    use sqlx::Connection;
+    let (mut conn, _t) = pg_connect(config, password).await?;
+    let schema = if schema.is_empty() { "public" } else { schema };
+    let target = format!("{}.{}", q_dq(schema), q_dq(table));
+    let col_list = columns
+        .iter()
+        .map(|c| q_dq(c))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut tx = conn
+        .begin()
+        .await
+        .map_err(|e| format!("开启导入事务失败: {e}"))?;
+    let outcome: Result<ImportResult, String> = async {
+        let metadata = pg_write_types::target_types(&mut *tx, schema, table).await?;
+        let types = columns
+            .iter()
+            .map(|c| {
+                metadata
+                    .get(c)
+                    .cloned()
+                    .ok_or_else(|| format!("目标字段不存在: {c}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut result = ImportResult {
+            inserted: 0,
+            skipped: 0,
+            errors: Vec::new(),
+        };
+        let batch_size = (65_535 / columns.len()).min(200);
+        for (batch, chunk) in rows.chunks(batch_size).enumerate() {
+            let mut pending = vec![(0usize, chunk)];
+            while let Some((relative, part)) = pending.pop() {
+                sqlx::query("SAVEPOINT dbterm_import_row")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let mut parameter = 0usize;
+                let values = part
+                    .iter()
+                    .map(|_| {
+                        let placeholders = (0..columns.len())
+                            .map(|column| {
+                                parameter += 1;
+                                format!(
+                                    "CAST({}{}::text AS {})",
+                                    char::from(36),
+                                    parameter,
+                                    types[column]
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!("({placeholders})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = tag_sql(&format!(
+                    "INSERT INTO {target} ({col_list}) VALUES {values}"
+                ));
+                let mut query = sqlx::query(&sql);
+                for row in part {
+                    for value in row {
+                        query = query.bind(value.as_deref());
+                    }
+                }
+                let rejected = match query.execute(&mut *tx).await {
+                    Ok(done) => {
+                        let warning = false;
+                        if !warning {
+                            sqlx::query("RELEASE SAVEPOINT dbterm_import_row")
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            result.inserted += done.rows_affected();
+                            continue;
+                        }
+                        "数据库返回转换警告，该记录未保留".to_string()
+                    }
+                    Err(e) => {
+                        let can_skip = match &e {
+                            sqlx::Error::Database(db) => db
+                                .code()
+                                .is_some_and(|c| c.starts_with("22") || c.starts_with("23")),
+                            _ => false,
+                        };
+                        if !can_skip {
+                            return Err(format!("导入发生不可跳过的错误: {e}"));
+                        }
+                        e.to_string()
+                    }
+                };
+                sqlx::query("ROLLBACK TO SAVEPOINT dbterm_import_row")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| format!("恢复导入保存点失败: {e}"))?;
+                sqlx::query("RELEASE SAVEPOINT dbterm_import_row")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if part.len() > 1 {
+                    for i in (0..part.len()).rev() {
+                        pending.push((relative + i, &part[i..i + 1]));
+                    }
+                } else {
+                    result.skipped += 1;
+                    result.errors.push(format!(
+                        "第{}条记录被跳过: {rejected}",
+                        batch * batch_size + relative + 1 + usize::from(has_header)
+                    ));
+                }
+            }
+        }
+        Ok(result)
+    }
+    .await;
+    match outcome {
+        Ok(result) => {
+            tx.commit().await.map_err(|e| {
+                format!("导入提交未获确认，结果未知，请核对目标，禁止自动重试: {e}")
+            })?;
+            Ok(result)
+        }
+        Err(reason) => match tx.rollback().await {
+            Ok(()) => Err(format!("{reason}；本次导入已回滚")),
+            Err(e) => Err(format!(
+                "{reason}；回滚未确认: {e}；请核查目标，禁止自动重试"
+            )),
+        },
+    }
+}
+
 // ── 8. db_import_csv ──────────────────────────────────────────────────────────
+
+const MAX_IMPORT_FILE_BYTES: u64 = 128 * 1024 * 1024;
+
+fn read_import_file(path: &str) -> Result<Vec<u8>, String> {
+    read_import_file_limited(path, MAX_IMPORT_FILE_BYTES)
+}
+
+fn read_import_file_limited(path: &str, limit: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("读取导入文件失败: {e}"))?;
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("读取导入文件失败: {e}"))?;
+    if bytes.len() as u64 > limit {
+        return Err(format!(
+            "导入文件超过{}MiB上限，已拒绝读取，数据库尚未写入",
+            limit / 1024 / 1024
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod import_file_limit_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_reader_accepts_limit_and_rejects_the_first_byte_over_it() {
+        let path = std::env::temp_dir().join(format!("dbterm-import-limit-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"12345").unwrap();
+        assert_eq!(read_import_file_limited(path.to_str().unwrap(), 5).unwrap(), b"12345");
+        assert!(read_import_file_limited(path.to_str().unwrap(), 4).unwrap_err().contains("上限"));
+        std::fs::remove_file(path).unwrap();
+    }
+}
 
 #[tauri::command]
 pub async fn db_import_csv(
@@ -1882,116 +3226,39 @@ pub async fn db_import_csv(
     duck_pool: State<'_, DuckPool>,
     registry: State<'_, super::driver::DriverRegistry>,
 ) -> Result<ImportResult, String> {
+    if !matches!(on_error.as_str(), "stop" | "skip") {
+        return Err("无效的导入错误处理策略，未执行写入".into());
+    }
+    if columns.is_empty() || columns.iter().collect::<std::collections::HashSet<_>>().len() != columns.len() {
+        return Err("目标列不能为空或重复，未执行写入".into());
+    }
     validate_ident(&table)?;
     if !schema.is_empty() { validate_ident(&schema)?; }
     for col in &columns { validate_ident(col)?; }
     validate_path(&path)?;
+    let input = read_import_file(&path)?;
 
     let fmt = format.as_deref().unwrap_or("csv");
     let is_excel = matches!(fmt, "excel" | "xlsx" | "xls");
-    // Excel 为二进制，不能按文本读取
-    let content = if is_excel { String::new() } else {
-        std::fs::read_to_string(&path).map_err(|e| format!("读取文件失败: {e}"))?
-    };
-
-    let delim: char = if fmt == "tsv" || fmt == "txt" { '\t' } else { ',' };
-
-    // 分隔符行解析（支持引号转义；delim 可为 , 或 \t）
-    let parse_delim_line = |line: &str| -> Vec<Option<String>> {
-        let mut fields = Vec::new();
-        let mut field = String::new();
-        let mut in_quotes = false;
-        let mut chars = line.chars().peekable();
-        while let Some(c) = chars.next() {
-            match c {
-                '"' if in_quotes => {
-                    if chars.peek() == Some(&'"') { field.push('"'); chars.next(); }
-                    else { in_quotes = false; }
-                }
-                '"' => { in_quotes = true; }
-                c if c == delim && !in_quotes => {
-                    fields.push(if field == null_value { None } else { Some(field.clone()) });
-                    field.clear();
-                }
-                other => { field.push(other); }
-            }
-        }
-        fields.push(if field == null_value { None } else { Some(field) });
-        fields
-    };
 
     // 统一解析为行集合 rows
-    let rows: Vec<Vec<Option<String>>> = if fmt == "json" {
-        let v: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| format!("解析 JSON 失败: {e}"))?;
-        let arr = v.as_array().ok_or("JSON 根节点必须是对象数组")?;
-        arr.iter().map(|item| {
-            columns.iter().map(|c| match item.get(c) {
-                None | Some(serde_json::Value::Null) => None,
-                Some(serde_json::Value::String(s)) => if *s == null_value { None } else { Some(s.clone()) },
-                Some(other) => Some(other.to_string()),
-            }).collect()
-        }).collect()
-    } else if is_excel {
-        use calamine::{Reader, open_workbook_auto, Data};
-        let mut wb = open_workbook_auto(&path).map_err(|e| format!("打开 Excel 失败: {e}"))?;
+    let rows: Vec<Vec<Option<String>>> = if is_excel {
+        use calamine::Reader;
+        let mut wb = calamine::open_workbook_auto_from_rs(std::io::Cursor::new(input))
+            .map_err(|e| format!("打开 Excel 失败: {e}"))?;
         let range = wb.worksheet_range_at(0)
             .ok_or("Excel 无工作表")?
             .map_err(|e| format!("读取工作表失败: {e}"))?;
-        let cell_to_opt = |c: &Data| -> Option<String> {
-            match c {
-                Data::Empty => None,
-                Data::String(s) => if *s == null_value { None } else { Some(s.clone()) },
-                other => { let s = other.to_string(); if s == null_value { None } else { Some(s) } }
-            }
-        };
-        let all: Vec<&[Data]> = range.rows().collect();
-        if has_header && !all.is_empty() {
-            // 按表头名匹配目标列
-            let header: Vec<String> = all[0].iter().map(|c| c.to_string()).collect();
-            let idx: Vec<Option<usize>> = columns.iter()
-                .map(|col| header.iter().position(|h| h == col)).collect();
-            all[1..].iter().map(|r| {
-                idx.iter().map(|oi| oi.and_then(|i| r.get(i)).and_then(|c| cell_to_opt(c))).collect()
-            }).collect()
-        } else {
-            // 无表头：按位置映射
-            all.iter().map(|r| {
-                (0..columns.len()).map(|i| r.get(i).and_then(|c| cell_to_opt(c))).collect()
-            }).collect()
-        }
-    } else if fmt == "xml" {
-        // 轻量解析：逐个 <row>…</row>，块内按列名取 <col>…</col>（兼容本工具导出的 XML）
-        fn unescape(s: &str) -> String {
-            s.replace("&lt;", "<").replace("&gt;", ">")
-             .replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
-        }
-        let mut rows_out: Vec<Vec<Option<String>>> = Vec::new();
-        let mut rest = content.as_str();
-        while let Some(start) = rest.find("<row>") {
-            let after = &rest[start + 5..];
-            let Some(end) = after.find("</row>") else { break };
-            let block = &after[..end];
-            rest = &after[end + 6..];
-            let cells: Vec<Option<String>> = columns.iter().map(|col| {
-                let open  = format!("<{col}>");
-                let close = format!("</{col}>");
-                if let Some(s) = block.find(&open) {
-                    let b = &block[s + open.len()..];
-                    if let Some(e) = b.find(&close) {
-                        let val = unescape(&b[..e]);
-                        return if val == null_value { None } else { Some(val) };
-                    }
-                }
-                None
-            }).collect();
-            rows_out.push(cells);
-        }
-        rows_out
+        super::import_excel::records(&range, &columns, has_header, &null_value)?
     } else {
-        let mut lines: Vec<&str> = content.lines().collect();
-        if has_header && !lines.is_empty() { lines.remove(0); }
-        lines.iter().map(|l| parse_delim_line(l)).collect()
+        let content = String::from_utf8(input).map_err(|e| format!("读取导入文件失败，必须是UTF-8文本: {e}"))?;
+        if fmt == "json" {
+            super::import_json::records(&content, &columns, &null_value)?
+        } else if fmt == "xml" {
+        super::import_xml::records(&content, &columns, &null_value)?
+        } else {
+        super::import_records::records(content.as_bytes(), fmt, has_header, columns.len(), &null_value)?
+        }
     };
 
     if rows.is_empty() {
@@ -2001,128 +3268,40 @@ pub async fn db_import_csv(
     let (config, password) = load_conn(&id, &storage).await?;
     ensure_writable(&config)?;
 
+    if on_error == "stop" && matches!(config.conn_type,
+        ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase |
+        ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss | ConnType::Sqlite) {
+        return import_rows_stop(&config, password.as_deref(), &schema, &table, &columns, &rows).await;
+    }
+
     let mut inserted: u64 = 0;
-    let mut skipped:  u64 = 0;
+    let skipped: u64 = 0;
     let mut errors:   Vec<String> = Vec::new();
 
-    const BATCH: usize = 100;
 
     match config.conn_type {
         ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => {
-            let (mut conn, _t) = mysql_connect(&config, password.as_deref()).await?;
-            let target = if schema.is_empty() { q_mysql(&table) }
-                         else { format!("{}.{}", q_mysql(&schema), q_mysql(&table)) };
-            let col_list = columns.iter().map(|c| q_mysql(c)).collect::<Vec<_>>().join(", ");
-            let n_cols = columns.len();
-            let row_ph = (0..n_cols).map(|_| "?").collect::<Vec<_>>().join(", ");
-
-            // 批量插入
-            for chunk in rows.chunks(BATCH) {
-                let all_ph = chunk.iter().map(|_| format!("({row_ph})")).collect::<Vec<_>>().join(", ");
-                let sql = tag_sql(&format!("INSERT INTO {target} ({col_list}) VALUES {all_ph}"));
-                let mut q = sqlx::query(&sql);
-                for row in chunk {
-                    for val in row {
-                        q = q.bind(val.as_deref());
-                    }
-                }
-                match q.execute(&mut conn).await {
-                    Ok(r) => inserted += r.rows_affected(),
-                    Err(e) => {
-                        let msg = format!("批量插入失败: {e}");
-                        if on_error == "stop" {
-                            errors.push(msg);
-                            return Ok(ImportResult { inserted, skipped, errors });
-                        }
-                        skipped += chunk.len() as u64;
-                        errors.push(msg);
-                    }
-                }
-            }
+            return mysql_import_rows(&config,password.as_deref(),&schema,&table,&columns,&rows,has_header,&on_error).await;
         }
         ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
-            let (mut conn, _t) = pg_connect(&config, password.as_deref()).await?;
-            let schema_name = if schema.is_empty() { "public" } else { &schema };
-            let target = format!("{}.{}", q_dq(schema_name), q_dq(&table));
-            let col_list = columns.iter().map(|c| q_dq(c)).collect::<Vec<_>>().join(", ");
-            let n_cols = columns.len();
-
-            const PG_BATCH: usize = 200;
-            let header_offset = if has_header { 1 } else { 0 };
-            for (chunk_start, chunk) in rows.chunks(PG_BATCH).enumerate() {
-                let mut idx = 1usize;
-                let all_ph = chunk.iter().map(|_| {
-                    let row_ph = (0..n_cols).map(|_| { let s = format!("${idx}"); idx += 1; s }).collect::<Vec<_>>().join(", ");
-                    format!("({row_ph})")
-                }).collect::<Vec<_>>().join(", ");
-                let sql = tag_sql(&format!("INSERT INTO {target} ({col_list}) VALUES {all_ph}"));
-                let mut q = sqlx::query(&sql);
-                for row in chunk {
-                    for val in row {
-                        q = q.bind(val.as_deref());
-                    }
-                }
-                match q.execute(&mut conn).await {
-                    Ok(r) => inserted += r.rows_affected(),
-                    Err(e) => {
-                        // 批量失败时回退为逐行以精确定位并支持 skip 模式
-                        let base_line = chunk_start * PG_BATCH + header_offset + 1;
-                        let placeholders = (1..=n_cols).map(|i| format!("${i}")).collect::<Vec<_>>().join(", ");
-                        let row_sql = tag_sql(&format!("INSERT INTO {target} ({col_list}) VALUES ({placeholders})"));
-                        if on_error == "stop" {
-                            let msg = format!("第 {base_line} 行附近批量插入失败: {e}");
-                            errors.push(msg);
-                            return Ok(ImportResult { inserted, skipped, errors });
-                        }
-                        for (i, row) in chunk.iter().enumerate() {
-                            let mut q2 = sqlx::query(&row_sql);
-                            for val in row { q2 = q2.bind(val.as_deref()); }
-                            match q2.execute(&mut conn).await {
-                                Ok(_) => inserted += 1,
-                                Err(e2) => {
-                                    skipped += 1;
-                                    errors.push(format!("第 {} 行插入失败: {e2}", base_line + i));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            return pg_import_rows(&config,password.as_deref(),&schema,&table,&columns,&rows,has_header,&on_error).await;
         }
         ConnType::Sqlite => {
-            use sqlx::{sqlite::SqliteConnection, Connection};
-            use crate::commands::query::sqlite_url;
-            let url = sqlite_url(&config)?;
-            let mut conn = SqliteConnection::connect(&url).await
-                .map_err(|e| format!("SQLite 连接失败: {e}"))?;
-            let target = if schema.is_empty() { q_dq(&table) } else { format!("{}.{}", q_dq(&schema), q_dq(&table)) };
-            let col_list = columns.iter().map(|c| q_dq(c)).collect::<Vec<_>>().join(", ");
-            let n_cols = columns.len();
-            let row_ph = (0..n_cols).map(|_| "?").collect::<Vec<_>>().join(", ");
-            let sql = tag_sql(&format!("INSERT INTO {target} ({col_list}) VALUES ({row_ph})"));
-
-            for (line_no, row) in rows.iter().enumerate() {
-                let mut q = sqlx::query(&sql);
-                for val in row {
-                    q = q.bind(val.as_deref());
-                }
-                match q.execute(&mut conn).await {
-                    Ok(_) => inserted += 1,
-                    Err(e) => {
-                        let msg = format!("第 {} 行插入失败: {e}", line_no + 1 + if has_header { 1 } else { 0 });
-                        if on_error == "stop" {
-                            errors.push(msg);
-                            return Ok(ImportResult { inserted, skipped, errors });
-                        }
-                        skipped += 1;
-                        errors.push(msg);
-                    }
-                }
-            }
+            return sqlite_import_rows(&config, &schema, &table, &columns, &rows, has_header, &on_error).await;
         }
         ConnType::Duckdb => {
             ensure_writable(&config)?;
-            // DuckDB COPY 命令原生支持 CSV/JSON/Parquet 导入，性能最优
+            // Excel/XML have already been decoded by DBterm's strict mappings.
+            // Do not send their source bytes to DuckDB's CSV COPY parser.
+            if matches!(fmt, "excel" | "xlsx" | "xls" | "xml" | "json") || on_error == "skip" {
+                let header_rows = if matches!(fmt, "json" | "xml") { 0 } else { usize::from(has_header) };
+                return duck_import_rows_impl(
+                    &id, &config, &schema, &table, &columns, &rows,
+                    header_rows, &on_error, &duck_pool, &registry,
+                ).await;
+            }
+            // DuckDB 原生 COPY 保留 stop 模式下分隔文本的批量导入性能；
+            // skip 模式必须走逐记录路径，才能准确统计跳过行并保留合法记录。
             let target = if schema.is_empty() { q_dq(&table) } else { format!("{}.{}", q_dq(&schema), q_dq(&table)) };
             let delim_str = if fmt == "tsv" || fmt == "txt" { "\t" } else { "," };
             let header_opt = if has_header { "TRUE" } else { "FALSE" };
@@ -2132,12 +3311,9 @@ pub async fn db_import_csv(
                 format!(" ({})", columns.iter().map(|c| q_dq(c)).collect::<Vec<_>>().join(", "))
             } else { String::new() };
             let safe_path = path.replace('\'', "''");
-            let copy_sql = match fmt {
-                "json" => format!("INSERT INTO {target}{col_list} SELECT * FROM read_json_auto('{safe_path}')"),
-                _ => format!(
-                    "COPY {target}{col_list} FROM '{safe_path}' (HEADER {header_opt}, DELIMITER '{delim_str}', NULLSTR {null_opt})"
-                ),
-            };
+            let copy_sql = format!(
+                "COPY {target}{col_list} FROM '{safe_path}' (HEADER {header_opt}, DELIMITER '{delim_str}', NULLSTR {null_opt})"
+            );
             match dispatch_duck_query(&id, &config, &copy_sql, &duck_pool, &registry).await {
                 Ok(r) => { inserted = r.rows_affected; }
                 Err(e) => {
@@ -2167,67 +3343,21 @@ pub async fn db_exec_sql_file(
     duck_pool: State<'_, DuckPool>,
     registry: State<'_, super::driver::DriverRegistry>,
 ) -> Result<SqlExecResult, String> {
+    let _ = &duck_pool; // Import uses a dedicated session; keep the command signature stable.
     validate_path(&path)?;
     if let Some(ref s) = schema { if !s.is_empty() { validate_ident(s)?; } }
 
-    // 清洗单条语句：去除 /* */ 块注释与 -- 行注释，返回 trim 后的纯 SQL
-    fn clean_stmt(chunk: &str) -> String {
-        let mut s = chunk.to_string();
-        loop {
-            match (s.find("/*"), s.find("*/")) {
-                (Some(a), Some(b)) if b > a => { s.replace_range(a..b + 2, ""); }
-                _ => break,
-            }
-        }
-        s.lines()
-            .filter(|l| !l.trim_start().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_string()
-    }
+    let (config, password) = load_conn(&id, &storage).await?;
+    ensure_writable(&config)?;
+    let file = std::fs::File::open(&path).map_err(|e| format!("打开 SQL 文件失败: {e}"))?;
+    let mysql = matches!(config.conn_type, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase);
+    let mut statements = sql_file_reader::SqlFileReader::new(std::io::BufReader::with_capacity(65536, file), mysql);
+    statements.set_sqlite(config.conn_type == ConnType::Sqlite);
 
-    // BufReader 流式解析：避免将整个大 SQL 文件读入内存
-    // 支持 DELIMITER 指令（存储过程/函数 dump 使用 ;; 分隔符）
-    let statements: Vec<String> = {
-        use std::io::BufRead;
-        let file = std::fs::File::open(&path)
-            .map_err(|e| format!("打开 SQL 文件失败: {e}"))?;
-        let reader = std::io::BufReader::with_capacity(65536, file);
-        let mut out: Vec<String> = Vec::new();
-        let mut delim = ";".to_string();
-        let mut buf = String::new();
-        for line_result in reader.lines() {
-            let line = line_result.map_err(|e| format!("读取 SQL 文件失败: {e}"))?;
-            let trimmed = line.trim();
-            // DELIMITER 指令：切换分隔符，本行不计入语句
-            if trimmed.to_ascii_uppercase().starts_with("DELIMITER ") {
-                let s = clean_stmt(&buf); if !s.is_empty() { out.push(s); }
-                buf.clear();
-                let d = trimmed[10..].trim();
-                delim = if d.is_empty() { ";".to_string() } else { d.to_string() };
-                continue;
-            }
-            if !buf.is_empty() { buf.push('\n'); }
-            buf.push_str(&line);
-            let bt = buf.trim_end().to_string();
-            if bt.ends_with(&delim) {
-                let stmt = bt[..bt.len() - delim.len()].to_string();
-                let s = clean_stmt(&stmt); if !s.is_empty() { out.push(s); }
-                buf.clear();
-            }
-        }
-        let s = clean_stmt(&buf); if !s.is_empty() { out.push(s); }
-        out
-    };
-
-    let total = statements.len() as u64;
+    let total = 0; // Streaming input: count unknown until EOF.
     let mut executed: u64 = 0;
     let mut failed:   u64 = 0;
     let mut errors:   Vec<String> = Vec::new();
-
-    let (config, password) = load_conn(&id, &storage).await?;
-    ensure_writable(&config)?;
 
     // 发送进度事件（节流：每 100 条或最后一条才 emit，防止 10 万行文件产生 10 万次 IPC 事件）
     let emit_progress = |current: u64, sql: &str, error: Option<&str>| {
@@ -2258,34 +3388,52 @@ pub async fn db_exec_sql_file(
                         .map_err(|e| format!("切换数据库 {s} 失败: {e}"))?;
                 }
             }
-            for (i, stmt) in statements.iter().enumerate() {
-                match conn.execute(sqlx::raw_sql(&tag_sql(stmt))).await {
+            let mut i = 0u64;
+            loop {
+                let mode: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut conn).await
+                    .map_err(|e| format!("读取导入会话 SQL 模式失败；此前执行 {executed} 条，结果请核查: {e}"))?;
+                statements.set_lexical_mode(mode.split(',').any(|m| m == "NO_BACKSLASH_ESCAPES"), mode.split(',').any(|m| m == "ANSI_QUOTES"));
+                let stmt = match statements.next_statement() {
+                    Ok(Some(sql)) => sql, Ok(None) => break,
+                    Err(error) => { failed += 1; errors.push(format!("语句 {} 解析失败，已停止；此前成功执行 {executed} 条，可能已提交: {error}", i+1)); break; }
+                };
+                match conn.execute(sqlx::raw_sql(&tag_sql(&stmt))).await {
                     Ok(_) => {
-                        executed += 1;
-                        emit_progress(i as u64 + 1, stmt, None);
+                        executed += 1; i += 1;
+                        emit_progress(i, &stmt, None);
                     }
                     Err(e) => {
                         failed += 1;
                         let msg = format!("语句 {} 失败: {e}", i + 1);
-                        errors.push(msg.clone());
-                        emit_progress(i as u64 + 1, stmt, Some(&msg));
+                        errors.push(format!("{msg}；已停止后续语句，此前成功执行 {executed} 条，可能已提交，请勿盲目重试"));
+                        emit_progress(i + 1, &stmt, Some(&msg));
+                        break;
                     }
                 }
             }
         }
         ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
             let (mut conn, _t) = pg_connect(&config, password.as_deref()).await?;
-            for (i, stmt) in statements.iter().enumerate() {
-                match conn.execute(sqlx::raw_sql(&tag_sql(stmt))).await {
+            let mut i = 0u64;
+            loop {
+                let standard: String = sqlx::query_scalar("SHOW standard_conforming_strings").fetch_one(&mut conn).await
+                    .map_err(|e| format!("读取导入会话字符串模式失败；此前执行 {executed} 条，结果请核查: {e}"))?;
+                statements.set_postgres_strings(standard == "on");
+                let stmt = match statements.next_statement() {
+                    Ok(Some(sql)) => sql, Ok(None) => break,
+                    Err(error) => { failed += 1; errors.push(format!("语句 {} 解析失败，已停止；此前成功执行 {executed} 条，可能已提交: {error}", i+1)); break; }
+                };
+                match conn.execute(sqlx::raw_sql(&tag_sql(&stmt))).await {
                     Ok(_) => {
-                        executed += 1;
-                        emit_progress(i as u64 + 1, stmt, None);
+                        executed += 1; i += 1;
+                        emit_progress(i, &stmt, None);
                     }
                     Err(e) => {
                         failed += 1;
                         let msg = format!("语句 {} 失败: {e}", i + 1);
-                        errors.push(msg.clone());
-                        emit_progress(i as u64 + 1, stmt, Some(&msg));
+                        errors.push(format!("{msg}；已停止后续语句，此前成功执行 {executed} 条，可能已提交，请勿盲目重试"));
+                        emit_progress(i + 1, &stmt, Some(&msg));
+                        break;
                     }
                 }
             }
@@ -2296,34 +3444,48 @@ pub async fn db_exec_sql_file(
             let url = sqlite_url(&config)?;
             let mut conn = SqliteConnection::connect(&url).await
                 .map_err(|e| format!("SQLite 连接失败: {e}"))?;
-            for (i, stmt) in statements.iter().enumerate() {
-                match conn.execute(sqlx::raw_sql(&tag_sql(stmt))).await {
+            let mut i = 0u64;
+            loop {
+                let stmt = match statements.next_statement() {
+                    Ok(Some(sql)) => sql, Ok(None) => break,
+                    Err(error) => { failed += 1; errors.push(format!("语句 {} 解析失败，已停止；此前成功执行 {executed} 条，可能已提交: {error}", i+1)); break; }
+                };
+                match conn.execute(sqlx::raw_sql(&tag_sql(&stmt))).await {
                     Ok(_) => {
-                        executed += 1;
-                        emit_progress(i as u64 + 1, stmt, None);
+                        executed += 1; i += 1;
+                        emit_progress(i, &stmt, None);
                     }
                     Err(e) => {
                         failed += 1;
                         let msg = format!("语句 {} 失败: {e}", i + 1);
-                        errors.push(msg.clone());
-                        emit_progress(i as u64 + 1, stmt, Some(&msg));
+                        errors.push(format!("{msg}；已停止后续语句，此前成功执行 {executed} 条，可能已提交，请勿盲目重试"));
+                        emit_progress(i + 1, &stmt, Some(&msg));
+                        break;
                     }
                 }
             }
         }
         ConnType::Duckdb => {
             ensure_writable(&config)?;
-            for (i, stmt) in statements.iter().enumerate() {
-                match dispatch_duck_query(&id, &config, stmt, &duck_pool, &registry).await {
+            // A SQL file can contain BEGIN/COMMIT; never share that session with editor queries.
+            let import_pool: DuckPool = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+            let mut i = 0u64;
+            loop {
+                let stmt = match statements.next_statement() {
+                    Ok(Some(sql)) => sql, Ok(None) => break,
+                    Err(error) => { failed += 1; errors.push(format!("语句 {} 解析失败，已停止；此前成功执行 {executed} 条，可能已提交: {error}", i+1)); break; }
+                };
+                match dispatch_duck_query(&id, &config, &stmt, &import_pool, &registry).await {
                     Ok(_) => {
-                        executed += 1;
-                        emit_progress(i as u64 + 1, stmt, None);
+                        executed += 1; i += 1;
+                        emit_progress(i, &stmt, None);
                     }
                     Err(e) => {
                         failed += 1;
                         let msg = format!("语句 {} 失败: {e}", i + 1);
-                        errors.push(msg.clone());
-                        emit_progress(i as u64 + 1, stmt, Some(&msg));
+                        errors.push(format!("{msg}；已停止后续语句，此前成功执行 {executed} 条，可能已提交，请勿盲目重试"));
+                        emit_progress(i + 1, &stmt, Some(&msg));
+                        break;
                     }
                 }
             }
@@ -2370,6 +3532,193 @@ async fn get_cols_any(
     }
 }
 
+#[cfg(test)]
+mod schema_compare_safety_tests {
+    use super::*;
+    #[test]
+    fn incomplete_engine_metadata_never_claims_complete_schema_equality() {
+        assert!(require_complete_schema_compare(1).is_ok());
+        for family in [0, 2, 3, 4, 5] { assert!(require_complete_schema_compare(family).is_err()); }
+    }
+    #[test]
+    fn schema_sql_modes_reject_literal_interpretation_mismatch() {
+        assert!(validate_schema_sql_modes("STRICT_TRANS_TABLES", "STRICT_ALL_TABLES").is_ok());
+        assert!(validate_schema_sql_modes("NO_BACKSLASH_ESCAPES", "").is_err());
+        assert!(validate_schema_sql_modes("", "ANSI_QUOTES").is_err());
+    }
+    #[tokio::test]
+    #[ignore = "requires disposable local MySQL DBTERM_TEST_MYSQL_PORT"]
+    async fn mysql_backspace_default_requires_same_escape_mode_for_raw_alter() {
+        use sqlx::Row;
+        let port: u16 = std::env::var("DBTERM_TEST_MYSQL_PORT").unwrap().parse().unwrap();
+        let config: ConnConfig = serde_json::from_value(serde_json::json!({
+            "id":"mode-local-test","name":"mode-local-test","type":"mysql","host":"127.0.0.1",
+            "port":port,"username":"root","useSsl":false,"createdAt":0,"updatedAt":0
+        })).unwrap();
+        let db = format!("dbterm_mode_{}", uuid::Uuid::new_v4().simple());
+        let (mut conn, _) = mysql_connect(&config, None).await.unwrap();
+        sqlx::query("SET SESSION sql_mode='STRICT_TRANS_TABLES'").execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("CREATE DATABASE `{db}`")).execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("CREATE TABLE `{db}`.source(s VARCHAR(20) DEFAULT 'a\\b')")).execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("CREATE TABLE `{db}`.target(s VARCHAR(20) DEFAULT 'other')")).execute(&mut conn).await.unwrap();
+        let raw = mysql_read_ddl(&mut conn, &mysql_qualified(&db, "source")).await.unwrap();
+        let source_mode: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut conn).await.unwrap();
+        sqlx::query("SET SESSION sql_mode='STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES'").execute(&mut conn).await.unwrap();
+        let target_mode: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut conn).await.unwrap();
+        assert!(validate_schema_sql_modes(&source_mode, &target_mode).is_err());
+        sqlx::query("SET SESSION sql_mode='STRICT_TRANS_TABLES'").execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("ALTER TABLE `{db}`.target MODIFY COLUMN {}", mysql_column_definition(&raw, "s").unwrap())).execute(&mut conn).await.unwrap();
+        let rows = sqlx::query("SELECT HEX(COLUMN_DEFAULT) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? ORDER BY TABLE_NAME").bind(&db).fetch_all(&mut conn).await.unwrap();
+        let values: Vec<String> = rows.iter().map(|r| r.try_get(0).unwrap()).collect();
+        sqlx::query(&format!("DROP DATABASE `{db}`")).execute(&mut conn).await.unwrap();
+        assert_eq!(values, ["6108","6108"]);
+    }
+    #[test]
+    fn database_signature_keeps_charset_collation_encryption_and_normalizes_only_name() {
+        let a = "CREATE DATABASE `a` /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci */ /*!80016 DEFAULT ENCRYPTION='N' */";
+        let b = a.replacen("`a`", "`b`", 1);
+        assert_eq!(mysql_database_signature(a, "a").unwrap(), mysql_database_signature(&b, "b").unwrap());
+        for changed in [b.replace("utf8mb4_0900_ai_ci", "utf8mb4_bin"), b.replace("ENCRYPTION='N'", "ENCRYPTION='Y'")] {
+            assert_ne!(mysql_database_signature(a, "a").unwrap(), mysql_database_signature(&changed, "b").unwrap());
+        }
+    }
+    #[test]
+    fn raw_definition_column_list_must_match_metadata_order_and_names() {
+        let raw = "CREATE TABLE `t` (\n  `id` int NOT NULL,\n  `value` varchar(10) INVISIBLE,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB";
+        assert!(validate_mysql_definition_columns(raw, &["id".into(), "value".into()]).is_ok());
+        assert!(validate_mysql_definition_columns(raw, &["id".into()]).is_err());
+        assert!(validate_mysql_definition_columns(raw, &["value".into(), "id".into()]).is_err());
+    }
+    #[tokio::test]
+    #[ignore = "requires disposable local MySQL DBTERM_TEST_MYSQL_PORT"]
+    async fn mysql_full_definition_capture_includes_hidden_generated_and_rejects_triggers() {
+        let port: u16 = std::env::var("DBTERM_TEST_MYSQL_PORT").unwrap().parse().unwrap();
+        let config: ConnConfig = serde_json::from_value(serde_json::json!({
+            "id":"schema-local-test","name":"schema-local-test","type":"mysql","host":"127.0.0.1",
+            "port":port,"username":"root","useSsl":false,"createdAt":0,"updatedAt":0
+        })).unwrap();
+        let db = format!("dbterm_schema_{}", uuid::Uuid::new_v4().simple());
+        let (mut conn, _) = mysql_connect(&config, None).await.unwrap();
+        sqlx::query(&format!("CREATE DATABASE `{db}`")).execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("CREATE TABLE `{db}`.sample(id INT PRIMARY KEY,hidden VARCHAR(8) CHARACTER SET latin1 COLLATE latin1_bin INVISIBLE COMMENT 'keep',calc INT GENERATED ALWAYS AS (id+1) STORED) ENGINE=InnoDB COMMENT='table-comment'")).execute(&mut conn).await.unwrap();
+        let (cols, raw, reader, guard) = mysql_schema_compare_definition(&config, None, &db, "sample").await.unwrap();
+        assert_eq!(cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["id","hidden","calc"]);
+        assert!(raw.contains("INVISIBLE")); assert!(raw.contains("GENERATED ALWAYS")); assert!(raw.contains("latin1_bin")); assert!(raw.contains("table-comment"));
+        drop(reader); drop(guard);
+        sqlx::Executor::execute(&mut conn, format!("CREATE TRIGGER `{db}`.sample_trigger BEFORE INSERT ON `{db}`.sample FOR EACH ROW SET @schema_compare_trigger=1").as_str()).await.unwrap();
+        let rejected = mysql_schema_compare_definition(&config, None, &db, "sample").await.is_err();
+        sqlx::query(&format!("DROP DATABASE `{db}`")).execute(&mut conn).await.unwrap();
+        assert!(rejected, "unsupported trigger behavior cannot be reported equal");
+    }
+}
+
+fn require_complete_schema_compare(family: u8) -> Result<(), String> {
+    if family != 1 {
+        return Err("此引擎尚未实现完整结构比对（索引、约束、生成列、注释及表选项），已拒绝显示为完全一致或生成不完整同步 SQL".into());
+    }
+    Ok(())
+}
+
+fn validate_schema_sql_modes(source: &str, target: &str) -> Result<(), String> {
+    for mode in ["NO_BACKSLASH_ESCAPES", "ANSI_QUOTES"] {
+        let enabled = |value: &str| value.split(',').any(|entry| entry.trim().eq_ignore_ascii_case(mode));
+        if enabled(source) != enabled(target) {
+            return Err(format!("源目标会话 {mode} 设置不一致，原始 DDL 的字面量或标识符解释不相同，已拒绝生成同步 SQL；请先统一会话 SQL 模式"));
+        }
+    }
+    Ok(())
+}
+
+fn mysql_database_signature(raw: &str, schema: &str) -> Result<String, String> {
+    let prefix = format!("CREATE DATABASE {}", q_mysql(schema));
+    let rest = raw.strip_prefix(&prefix).ok_or("数据库原始定义格式异常，不能安全比较")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) { return Err("数据库原始定义格式异常".into()); }
+    Ok(rest.to_string())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseDefinitionDiff {
+    identical: bool,
+    source_ddl: String,
+    target_ddl: String,
+}
+
+#[tauri::command]
+pub async fn db_diff_database_definition(
+    src_id: String, src_schema: String, dst_id: String, dst_schema: String, storage: State<'_, StorageState>,
+) -> Result<DatabaseDefinitionDiff, String> {
+    validate_ident(&src_schema)?; validate_ident(&dst_schema)?;
+    let (src_config, src_password) = load_conn(&src_id, &storage).await?;
+    let (dst_config, dst_password) = load_conn(&dst_id, &storage).await?;
+    require_complete_schema_compare(struct_family(&src_config.conn_type))?;
+    require_complete_schema_compare(struct_family(&dst_config.conn_type))?;
+    use sqlx::Row;
+    let (mut source, _source_guard) = mysql_connect(&src_config, src_password.as_deref()).await?;
+    let (mut target, _target_guard) = mysql_connect(&dst_config, dst_password.as_deref()).await?;
+    let source_ddl: String = sqlx::query(&format!("SHOW CREATE DATABASE {}", q_mysql(&src_schema))).fetch_one(&mut source).await
+        .map_err(|e| format!("读取源数据库完整定义失败: {e}"))?.try_get(1).map_err(|e| e.to_string())?;
+    let target_ddl: String = sqlx::query(&format!("SHOW CREATE DATABASE {}", q_mysql(&dst_schema))).fetch_one(&mut target).await
+        .map_err(|e| format!("读取目标数据库完整定义失败: {e}"))?.try_get(1).map_err(|e| e.to_string())?;
+    let identical = mysql_database_signature(&source_ddl, &src_schema)? == mysql_database_signature(&target_ddl, &dst_schema)?;
+    Ok(DatabaseDefinitionDiff { identical, source_ddl, target_ddl })
+}
+
+#[path = "schema_compare_snapshot.rs"]
+mod schema_compare_snapshot;
+#[tauri::command]
+pub async fn db_diff_schema_snapshot(
+ src_id:String,src_schema:String,dst_id:String,dst_schema:String,storage:State<'_,StorageState>,
+)->Result<schema_compare_snapshot::SchemaSnapshotDiff,String>{
+ validate_ident(&src_schema)?;validate_ident(&dst_schema)?;
+ let (source,sp)=load_conn(&src_id,&storage).await?;let (target,dp)=load_conn(&dst_id,&storage).await?;
+ schema_compare_snapshot::compare_configs(&source,sp.as_deref(),&src_schema,&target,dp.as_deref(),&dst_schema).await
+}
+
+fn validate_mysql_definition_columns(raw: &str, names: &[String]) -> Result<(), String> {
+    let lines: Vec<_> = raw.lines().filter(|line| line.starts_with("  `")).collect();
+    if lines.len() != names.len() || lines.iter().zip(names).any(|(line, name)| !line.starts_with(&format!("  {} ", q_mysql(name)))) {
+        return Err("字段元数据与原始 DDL 不完整或顺序不一致，已拒绝结构比对".into());
+    }
+    Ok(())
+}
+
+async fn mysql_schema_compare_definition(config: &ConnConfig, password: Option<&str>, schema: &str, table: &str) -> Result<(Vec<ColumnInfo>, String, sqlx::mysql::MySqlConnection, Option<std::sync::Arc<crate::db_tunnel::DbTunnel>>), String> {
+    let (mut conn, tunnel) = mysql_connect(config, password).await?;
+    sqlx::query("SET SESSION lock_wait_timeout=30").execute(&mut conn).await.map_err(|e| e.to_string())?;
+    sqlx::Executor::execute(&mut conn, sqlx::raw_sql("START TRANSACTION READ ONLY")).await.map_err(|e| format!("建立结构读取事务失败: {e}"))?;
+    let (cols, raw) = mysql_schema_compare_read(&mut conn, schema, table).await?;
+    Ok((cols, raw, conn, tunnel))
+}
+
+async fn mysql_schema_compare_read(conn: &mut sqlx::mysql::MySqlConnection, schema: &str, table: &str) -> Result<(Vec<ColumnInfo>, String), String> {
+    use sqlx::Row;
+    let target = mysql_qualified(schema, table);
+    sqlx::query(&format!("SELECT * FROM {target} LIMIT 0")).execute(&mut *conn).await.map_err(|e| format!("锁定结构元数据失败: {e}"))?;
+    let kind: String = sqlx::query_scalar("SELECT CAST(TABLE_TYPE AS CHAR) FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?")
+        .bind(schema).bind(table).fetch_one(&mut *conn).await.map_err(|e| e.to_string())?;
+    if kind != "BASE TABLE" { return Err("完整表结构对比不支持视图".into()); }
+    let visible: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM information_schema.USER_PRIVILEGES WHERE GRANTEE=CONCAT(CHAR(39),REPLACE(CURRENT_USER(),'@',CONCAT(CHAR(39),'@',CHAR(39))),CHAR(39)) AND PRIVILEGE_TYPE='TRIGGER') OR EXISTS(SELECT 1 FROM information_schema.SCHEMA_PRIVILEGES WHERE GRANTEE=CONCAT(CHAR(39),REPLACE(CURRENT_USER(),'@',CONCAT(CHAR(39),'@',CHAR(39))),CHAR(39)) AND TABLE_SCHEMA=? AND PRIVILEGE_TYPE='TRIGGER') OR EXISTS(SELECT 1 FROM information_schema.TABLE_PRIVILEGES WHERE GRANTEE=CONCAT(CHAR(39),REPLACE(CURRENT_USER(),'@',CONCAT(CHAR(39),'@',CHAR(39))),CHAR(39)) AND TABLE_SCHEMA=? AND TABLE_NAME=? AND PRIVILEGE_TYPE='TRIGGER')")
+        .bind(schema).bind(schema).bind(table).fetch_one(&mut *conn).await.map_err(|e| format!("检查触发器可见性失败: {e}"))?;
+    if visible == 0 { return Err("无法完整核验触发器，需要目标表、数据库或全局直接 TRIGGER 权限，已拒绝声称结构一致".into()); }
+    let triggers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA=? AND EVENT_OBJECT_TABLE=?")
+        .bind(schema).bind(table).fetch_one(&mut *conn).await.map_err(|e| e.to_string())?;
+    if triggers != 0 { return Err("表存在触发器，当前完整结构对比尚未覆盖触发器定义，已拒绝声称完全一致或生成部分同步 SQL".into()); }
+    let raw = mysql_read_ddl(&mut *conn, &target).await?;
+    let rows = sqlx::query("SELECT CAST(COLUMN_NAME AS CHAR CHARACTER SET utf8mb4),CAST(COLUMN_TYPE AS CHAR CHARACTER SET utf8mb4),CAST(IS_NULLABLE AS CHAR),CAST(COLUMN_KEY AS CHAR),CAST(COLUMN_DEFAULT AS CHAR) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION")
+        .bind(schema).bind(table).fetch_all(&mut *conn).await.map_err(|e| format!("读取完整字段信息失败: {e}"))?;
+    let mut cols = Vec::new();
+    for row in rows {
+        cols.push(ColumnInfo {
+            name: row.try_get(0).map_err(|e| e.to_string())?, data_type: row.try_get(1).map_err(|e| e.to_string())?,
+            nullable: row.try_get::<String,_>(2).map_err(|e| e.to_string())? == "YES",
+            key: row.try_get(3).map_err(|e| e.to_string())?, default_value: row.try_get(4).map_err(|e| e.to_string())?,
+        });
+    }
+    validate_mysql_definition_columns(&raw, &cols.iter().map(|c| c.name.clone()).collect::<Vec<_>>())?;
+    Ok((cols, raw))
+}
+
 #[tauri::command]
 pub async fn db_diff_structure(
     src_id:     String,
@@ -2379,8 +3728,8 @@ pub async fn db_diff_structure(
     dst_schema: String,
     dst_table:  String,
     storage: State<'_, StorageState>,
-    ss_pool: State<'_, SsPool>,
-    registry: State<'_, DriverRegistry>,
+    _ss_pool: State<'_, SsPool>,
+    _registry: State<'_, DriverRegistry>,
 ) -> Result<StructureDiff, String> {
     validate_ident(&src_table)?;
     validate_ident(&dst_table)?;
@@ -2396,12 +3745,53 @@ pub async fn db_diff_structure(
     if sf != df {
         return Err("源连接与目标连接类型不兼容（结构对比需同族数据库）".into());
     }
-    let cols_src = get_cols_any(&src_id, &src_cfg, src_pwd.as_deref(), &src_schema, &src_table, &ss_pool, &registry).await?;
-    let cols_dst = get_cols_any(&dst_id, &dst_cfg, dst_pwd.as_deref(), &dst_schema, &dst_table, &ss_pool, &registry).await?;
+    require_complete_schema_compare(sf)?;
+    let src_schema = if sf == 1 && src_schema.is_empty() { src_cfg.database.clone().filter(|s| !s.is_empty()).ok_or("请选择源数据库")? } else { src_schema };
+    let dst_schema = if df == 1 && dst_schema.is_empty() { dst_cfg.database.clone().filter(|s| !s.is_empty()).ok_or("请选择目标数据库")? } else { dst_schema };
+    let (cols_src, source_ddl, mut source_conn, _source_guard) = mysql_schema_compare_definition(&src_cfg, src_pwd.as_deref(), &src_schema, &src_table).await?;
+    let (cols_dst, target_ddl, mut target_conn, _target_guard) = mysql_schema_compare_definition(&dst_cfg, dst_pwd.as_deref(), &dst_schema, &dst_table).await?;
+    let source_sql_mode: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut source_conn).await.map_err(|e| format!("读取源结构会话模式失败: {e}"))?;
+    let target_sql_mode: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut target_conn).await.map_err(|e| format!("读取目标结构会话模式失败: {e}"))?;
+    validate_schema_sql_modes(&source_sql_mode, &target_sql_mode)?;
+
+    mysql_structure_diff_from_definition(cols_src, source_ddl, &src_table, cols_dst, target_ddl, &dst_schema, &dst_table, &target_sql_mode)
+}
+
+fn mysql_structure_diff_from_definition(
+    cols_src: Vec<ColumnInfo>, source_ddl: String, src_table: &str,
+    cols_dst: Vec<ColumnInfo>, target_ddl: String, dst_schema: &str, dst_table: &str,
+    target_sql_mode: &str,
+) -> Result<StructureDiff, String> {
+    let sf=1; let mut mysql_definitions=None;
+    if sf == 1 {
+        if mysql_table_signature(&source_ddl, &src_table, &cols_src)? != mysql_table_signature(&target_ddl, &dst_table, &cols_dst)? {
+            return Err("表索引、约束或表选项存在差异；当前结构对比器不能安全生成完整 ALTER，已拒绝显示为一致或执行不完整 SQL".into());
+        }
+        mysql_definitions = Some((source_ddl, target_ddl));
+        let common_source: Vec<String> = cols_src.iter().filter(|s| cols_dst.iter().any(|d| d.name.eq_ignore_ascii_case(&s.name)))
+            .map(|c| c.name.to_ascii_lowercase()).collect();
+        let common_target: Vec<String> = cols_dst.iter().filter(|d| cols_src.iter().any(|s| s.name.eq_ignore_ascii_case(&d.name)))
+            .map(|c| c.name.to_ascii_lowercase()).collect();
+        if common_source != common_target {
+            return Err("源目标列顺序不同，当前对比器不能安全保持原列顺序，已拒绝生成不完整 ALTER".into());
+        }
+        let mut saw_new_column = false;
+        for column in &cols_src {
+            if cols_dst.iter().any(|existing| existing.name.eq_ignore_ascii_case(&column.name)) {
+                if saw_new_column {
+                    return Err("新增列位于已有列之前，当前对比器不能安全保持源列顺序，已拒绝生成不完整 ALTER".into());
+                }
+            } else {
+                saw_new_column = true;
+            }
+        }
+    }
 
     use std::collections::HashMap;
-    let map_src: HashMap<&str, &ColumnInfo> = cols_src.iter().map(|c| (c.name.as_str(), c)).collect();
-    let map_dst: HashMap<&str, &ColumnInfo> = cols_dst.iter().map(|c| (c.name.as_str(), c)).collect();
+    let mysql_names = sf == 1;
+    let key = |name: &str| if mysql_names { name.to_ascii_lowercase() } else { name.to_string() };
+    let map_src: HashMap<String, &ColumnInfo> = cols_src.iter().map(|c| (key(&c.name), c)).collect();
+    let map_dst: HashMap<String, &ColumnInfo> = cols_dst.iter().map(|c| (key(&c.name), c)).collect();
 
     let mut added:    Vec<ColumnInfo>  = Vec::new();
     let mut removed:  Vec<ColumnInfo>  = Vec::new();
@@ -2409,8 +3799,11 @@ pub async fn db_diff_structure(
 
     // src 有 → dst 需要 ADD 或 MODIFY
     for col_src in &cols_src {
-        if let Some(&col_dst) = map_dst.get(col_src.name.as_str()) {
-            if col_src.data_type    != col_dst.data_type
+        if let Some(&col_dst) = map_dst.get(&key(&col_src.name)) {
+            let exact_definition_changed = if let Some((source, target)) = &mysql_definitions {
+                mysql_column_definition(source, &col_src.name)? != mysql_column_definition(target, &col_dst.name)?
+            } else { false };
+            if exact_definition_changed || col_src.data_type != col_dst.data_type
                 || col_src.nullable != col_dst.nullable
                 || col_src.default_value != col_dst.default_value
             {
@@ -2427,7 +3820,7 @@ pub async fn db_diff_structure(
 
     // dst 有但 src 无 → DROP（高危）
     for col_dst in &cols_dst {
-        if !map_src.contains_key(col_dst.name.as_str()) {
+        if !map_src.contains_key(&key(&col_dst.name)) {
             removed.push(col_dst.clone());
         }
     }
@@ -2435,91 +3828,21 @@ pub async fn db_diff_structure(
     let danger_drops: Vec<String> = removed.iter().map(|c| c.name.clone()).collect();
 
     // 生成 ALTER SQL（针对 dst 表，按 dst 方言）
-    let alter_sql = match df {
-        1 => {
-            let ds = if dst_schema.is_empty() { src_schema.as_str() } else { dst_schema.as_str() };
+    let alter_sql = {
+            let (source_ddl, _) = mysql_definitions.as_ref().ok_or("缺少已验证的源表完整定义")?;
+            let ds = &dst_schema;
             let target = if ds.is_empty() { q_mysql(&dst_table) }
                          else { format!("{}.{}", q_mysql(ds), q_mysql(&dst_table)) };
             let mut parts: Vec<String> = Vec::new();
             for col in &added {
-                let null_part = if col.nullable { "" } else { " NOT NULL" };
-                let def_part  = col.default_value.as_deref()
-                    .map(|d| format!(" DEFAULT '{}'", d.replace('\'', "''"))).unwrap_or_default();
-                parts.push(format!("ADD COLUMN {} {}{}{}", q_mysql(&col.name), col.data_type, null_part, def_part));
+                parts.push(format!("ADD COLUMN {}", mysql_column_definition(&source_ddl, &col.name)?));
             }
             for ch in &modified {
-                let null_part = if ch.after.nullable { "" } else { " NOT NULL" };
-                let def_part  = ch.after.default_value.as_deref()
-                    .map(|d| format!(" DEFAULT '{}'", d.replace('\'', "''"))).unwrap_or_default();
-                parts.push(format!("MODIFY COLUMN {} {}{}{}", q_mysql(&ch.name), ch.after.data_type, null_part, def_part));
+                parts.push(format!("MODIFY COLUMN {}", mysql_column_definition(&source_ddl, &ch.name)?));
             }
             for col in &removed { parts.push(format!("DROP COLUMN {}", q_mysql(&col.name))); }
-            if parts.is_empty() { String::new() } else { format!("ALTER TABLE {target}\n  {};", parts.join(",\n  ")) }
-        }
-        2 => {
-            let sd = if dst_schema.is_empty() { "public".to_string() } else { dst_schema.clone() };
-            let target = format!("{}.{}", q_dq(&sd), q_dq(&dst_table));
-            let mut stmts: Vec<String> = Vec::new();
-            for col in &added {
-                let null_part = if col.nullable { "" } else { " NOT NULL" };
-                let def_part  = col.default_value.as_deref().map(|d| format!(" DEFAULT {d}")).unwrap_or_default();
-                stmts.push(format!("ALTER TABLE {target} ADD COLUMN {} {}{}{};", q_dq(&col.name), col.data_type, null_part, def_part));
-            }
-            for ch in &modified {
-                stmts.push(format!("ALTER TABLE {target} ALTER COLUMN {} TYPE {};", q_dq(&ch.name), ch.after.data_type));
-                if !ch.after.nullable && ch.before.nullable {
-                    stmts.push(format!("ALTER TABLE {target} ALTER COLUMN {} SET NOT NULL;", q_dq(&ch.name)));
-                } else if ch.after.nullable && !ch.before.nullable {
-                    stmts.push(format!("ALTER TABLE {target} ALTER COLUMN {} DROP NOT NULL;", q_dq(&ch.name)));
-                }
-            }
-            for col in &removed { stmts.push(format!("ALTER TABLE {target} DROP COLUMN {};", q_dq(&col.name))); }
-            stmts.join("\n")
-        }
-        3 => {
-            // Oracle：owner.table，双引号标识符；ADD/MODIFY 用括号包列
-            let qid = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-            let target = if dst_schema.is_empty() { qid(&dst_table) } else { format!("{}.{}", qid(&dst_schema), qid(&dst_table)) };
-            let mut stmts: Vec<String> = Vec::new();
-            for col in &added {
-                let nn = if col.nullable { "" } else { " NOT NULL" };
-                let def = col.default_value.as_deref().map(|d| format!(" DEFAULT {d}")).unwrap_or_default();
-                stmts.push(format!("ALTER TABLE {target} ADD ({} {}{}{});", qid(&col.name), col.data_type, def, nn));
-            }
-            for ch in &modified {
-                let def = ch.after.default_value.as_deref().map(|d| format!(" DEFAULT {d}")).unwrap_or_default();
-                stmts.push(format!("ALTER TABLE {target} MODIFY ({} {}{});", qid(&ch.name), ch.after.data_type, def));
-            }
-            for col in &removed { stmts.push(format!("ALTER TABLE {target} DROP COLUMN {};", qid(&col.name))); }
-            stmts.join("\n")
-        }
-        4 => {
-            // SQL Server：schema 实为数据库名 → [库].dbo.[表]，方括号标识符
-            let qid = |s: &str| format!("[{}]", s.replace(']', "]]"));
-            let target = if dst_schema.is_empty() { format!("dbo.{}", qid(&dst_table)) } else { format!("{}.dbo.{}", qid(&dst_schema), qid(&dst_table)) };
-            let mut stmts: Vec<String> = Vec::new();
-            for col in &added {
-                let nn = if col.nullable { " NULL" } else { " NOT NULL" };
-                let def = col.default_value.as_deref().map(|d| format!(" DEFAULT {d}")).unwrap_or_default();
-                stmts.push(format!("ALTER TABLE {target} ADD {} {}{}{};", qid(&col.name), col.data_type, nn, def));
-            }
-            for ch in &modified {
-                let nn = if ch.after.nullable { " NULL" } else { " NOT NULL" };
-                stmts.push(format!("ALTER TABLE {target} ALTER COLUMN {} {}{};", qid(&ch.name), ch.after.data_type, nn));
-            }
-            for col in &removed { stmts.push(format!("ALTER TABLE {target} DROP COLUMN {};", qid(&col.name))); }
-            stmts.join("\n")
-        }
-        _ => {
-            // ClickHouse：schema 实为数据库名 → 库.表，反引号标识符（无 NULL/DEFAULT 约束差异概念）
-            let qid = |s: &str| format!("`{}`", s.replace('`', "\\`"));
-            let target = if dst_schema.is_empty() { qid(&dst_table) } else { format!("{}.{}", qid(&dst_schema), qid(&dst_table)) };
-            let mut stmts: Vec<String> = Vec::new();
-            for col in &added { stmts.push(format!("ALTER TABLE {target} ADD COLUMN {} {};", qid(&col.name), col.data_type)); }
-            for ch in &modified { stmts.push(format!("ALTER TABLE {target} MODIFY COLUMN {} {};", qid(&ch.name), ch.after.data_type)); }
-            for col in &removed { stmts.push(format!("ALTER TABLE {target} DROP COLUMN {};", qid(&col.name))); }
-            stmts.join("\n")
-        }
+            if parts.is_empty() { String::new() } else { format!("-- 目标会话前置条件：@@SESSION.sql_mode = '{target_sql_mode}'；请先核验，禁止在转义规则不同的会话直接执行\nALTER TABLE {target}\n  {};", parts.join(",\n  ")) }
+
     };
 
     Ok(StructureDiff { added, removed, modified, alter_sql, danger_drops })
@@ -2584,6 +3907,35 @@ fn mig_is_numeric(t: &str) -> bool {
         .iter().any(|k| u.contains(k))
 }
 
+fn same_engine_migration_is_single_atomic_statement(
+    same_conn: bool,
+    strategy: &str,
+    do_structure: bool,
+    do_data: bool,
+    clear_before: bool,
+) -> bool {
+    same_conn && strategy == "append" && !do_structure && do_data && !clear_before
+}
+
+#[cfg(test)]
+mod same_engine_atomicity_tests {
+    use super::same_engine_migration_is_single_atomic_statement;
+
+    #[test]
+    fn only_same_connection_append_data_is_allowed_without_transaction_wrapper() {
+        assert!(same_engine_migration_is_single_atomic_statement(true, "append", false, true, false));
+        for case in [
+            (false, "append", false, true, false),
+            (true, "replace", false, true, false),
+            (true, "truncate", false, true, true),
+            (true, "append", true, true, false),
+            (true, "append", false, false, false),
+        ] {
+            assert!(!same_engine_migration_is_single_atomic_statement(case.0, case.1, case.2, case.3, case.4));
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn migrate_same_engine(
     ct: ConnType,
@@ -2593,12 +3945,18 @@ async fn migrate_same_engine(
     sel_cols: Option<&[String]>, map_dst_cols: Option<&[String]>, where_sql: &str, row_limit: u64,
     _conflict_mode: &str, error_mode: &str,
     ss_pool: &SsPool, registry: &DriverRegistry,
+    app_handle: &tauri::AppHandle,
 ) -> Result<MigrateResult, String> {
     let start = Instant::now();
     let same_conn = src_id == dst_id;
     let src_ref = mig_table_ref(&ct, src_schema, src_table);
     let dst_ref = mig_table_ref(&ct, dst_schema, dst_table);
     let mut errors: Vec<String> = Vec::new();
+    let emit_progress = |stage: &str, total_rows: u64, migrated_rows: u64| {
+        #[derive(serde::Serialize, Clone)]
+        struct Progress { stage: String, total_rows: u64, migrated_rows: u64 }
+        let _ = app_handle.emit("migrate_progress", Progress { stage: stage.to_string(), total_rows, migrated_rows });
+    };
 
     let exists = mig_table_exists(&ct, dst_config, dst_pwd, dst_id, dst_schema, dst_table, ss_pool, registry).await.unwrap_or(false);
     if strategy == "skip" && exists {
@@ -2704,6 +4062,7 @@ async fn migrate_same_engine(
     }
 
     if do_data {
+        emit_progress("migrating", 0, 0);
         let sel = if sel_cols.is_some() { src_col_list.clone() } else { "*".to_string() };
         if same_conn {
             // 服务端 INSERT ... SELECT，零数据往返、类型零损失
@@ -2725,6 +4084,7 @@ async fn migrate_same_engine(
                     migrated = post.saturating_sub(pre);
                 }
             }
+            emit_progress("migrating", migrated, migrated);
         } else {
             // 跨连接：读源行 + 分批 INSERT（按列类型决定数值不加引号 / 文本加引号转义）
             let read_sql = format!("SELECT {sel_prefix}{sel} FROM {src_ref}{where_sql}{sel_suffix}");
@@ -2741,7 +4101,7 @@ async fn migrate_same_engine(
                     format!("({vs})")
                 }).collect::<Vec<_>>().join(", ");
                 match mig_run(dst_config, dst_pwd, dst_id, &format!("INSERT INTO {dst_ref} ({insert_col_list}) VALUES {values}"), ss_pool, registry).await {
-                    Ok(_) => migrated += batch.len() as u64,
+                    Ok(_) => { migrated += batch.len() as u64; emit_progress("migrating", src_total, migrated); }
                     Err(e) => {
                         failed += batch.len() as u64;
                         errors.push(format!("批量插入失败: {e}"));
@@ -2751,6 +4111,8 @@ async fn migrate_same_engine(
             }
         }
     }
+
+    emit_progress("done", if src_total > 0 { src_total } else { migrated + failed }, migrated);
 
     // replace 策略数据传输完成后：全部成功则删备份，有失败则忽略（部分数据已写入，不回滚到旧状态）
     if let Some(ref bak_ref) = same_engine_bak {
@@ -2812,6 +4174,10 @@ pub async fn db_migrate_table(
         _ => (None, None),
     };
 
+    if sel_cols.is_some() && content != "data" {
+        return Err("列映射与原样复制源表结构不兼容；请先创建目标表，再选择「仅数据」迁移".into());
+    }
+
     let do_structure = content != "data";       // 创建/重建目标表结构
     let do_data      = content != "structure";   // 写入数据
     // 仅数据时，覆盖/截断都表现为「先清空再写入」
@@ -2828,11 +4194,125 @@ pub async fn db_migrate_table(
     let (dst_config, dst_pwd) = load_conn(&dst_id, &storage).await?;
     ensure_writable(&dst_config)?;   // 迁移写入目标连接，目标只读则拒绝
 
+    let mysql_source = matches!(src_config.conn_type, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase);
+    let mysql_target = matches!(dst_config.conn_type, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase);
+    if !(mysql_source && mysql_target) {
+        return Err("此引擎组合尚不能保证完整定义、数据类型及失败恢复，已在修改目标前中止；请使用原生备份恢复工具，不会按字段摘要或文本转换降级迁移".into());
+    }
+    if mysql_source && mysql_target {
+        use sqlx::Row;
+        let source_schema = if src_schema.is_empty() { src_config.database.as_deref().unwrap_or("") } else { &src_schema };
+        let target_schema = if dst_schema.is_empty() { dst_config.database.as_deref().unwrap_or("") } else { &dst_schema };
+        // 两个连接别名可能仍指向同一个实例；相同限定名保守拒绝，避免覆盖源表。
+        if source_schema.eq_ignore_ascii_case(target_schema) && src_table.eq_ignore_ascii_case(&dst_table) {
+            return Err("源表与目标表的库名、表名相同，无法排除同一实例别名，已拒绝迁移以保护源表".into());
+        }
+        if source_schema.is_empty() || target_schema.is_empty() {
+            return Err("安全迁移必须明确选择源数据库和目标数据库".into());
+        }
+        let (mut target_conn, _target_guard) = mysql_connect(&dst_config, dst_pwd.as_deref()).await?;
+        let target_engine: Option<String> = sqlx::query_scalar("SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?")
+            .bind(target_schema).bind(&dst_table).fetch_optional(&mut target_conn).await
+            .map_err(|e| format!("检查目标表失败: {e}"))?.flatten();
+        if ((do_structure && strategy == "replace") || clear_before_insert) && target_engine.is_some() {
+            let referenced: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE WHERE REFERENCED_TABLE_SCHEMA=? AND REFERENCED_TABLE_NAME=?")
+                .bind(target_schema).bind(&dst_table).fetch_one(&mut target_conn).await
+                .map_err(|e| format!("检查目标外键依赖失败: {e}"))?;
+            let triggers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA=? AND EVENT_OBJECT_TABLE=?")
+                .bind(target_schema).bind(&dst_table).fetch_one(&mut target_conn).await
+                .map_err(|e| format!("检查目标触发器失败: {e}"))?;
+            if referenced > 0 || triggers > 0 {
+                return Err("目标表存在外键引用或触发器，覆盖重建无法保证关系和行为安全，已保留原表并中止".into());
+            }
+        }
+        if do_data && !do_structure && target_engine.as_deref() != Some("InnoDB") {
+            return Err("目标表不存在或不支持 InnoDB 事务，已中止数据迁移".into());
+        }
+        if do_data {
+            let mode: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut target_conn).await
+                .map_err(|e| format!("检查目标严格模式失败: {e}"))?;
+            if !mode.split(',').any(|m| matches!(m, "STRICT_TRANS_TABLES" | "STRICT_ALL_TABLES")) {
+                return Err("目标数据库未开启严格模式，无法保证值不会被静默截断，已中止迁移".into());
+            }
+            let triggers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA=? AND EVENT_OBJECT_TABLE=?")
+                .bind(target_schema).bind(&dst_table).fetch_one(&mut target_conn).await
+                .map_err(|e| format!("检查目标触发器失败: {e}"))?;
+            if triggers > 0 { return Err("目标表存在触发器，写入可能改变数据或其他表，已中止迁移".into()); }
+        }
+        if !matches!(strategy.as_str(), "replace" | "skip" | "append" | "truncate")
+            || (do_structure && !matches!(strategy.as_str(), "replace" | "skip")) {
+            return Err("该迁移策略无法保证源表结构和恢复安全，请使用「覆盖重建」或「已存在则跳过」".into());
+        }
+        if sel_cols.is_some() {
+            return Err("列映射迁移尚不能保证完整结构与数据保真，已拒绝执行".into());
+        }
+        if disable_fk || error_mode != "stop" || conflict != "error" || (do_data && !use_tx) {
+            return Err("安全迁移要求启用事务回滚、保持外键检查、遇错中止且不忽略冲突".into());
+        }
+        let (mut source_conn, _guard) = mysql_connect(&src_config, src_pwd.as_deref()).await?;
+        if do_data && !do_structure {
+            let source_ref = format!("{}.{}", q_mysql(source_schema), q_mysql(&src_table));
+            let target_ref = format!("{}.{}", q_mysql(target_schema), q_mysql(&dst_table));
+            let source = sqlx::query(&format!("SHOW CREATE TABLE {source_ref}")).fetch_one(&mut source_conn).await
+                .map_err(|e| format!("读取源结构失败: {e}"))?;
+            let target = sqlx::query(&format!("SHOW CREATE TABLE {target_ref}")).fetch_one(&mut target_conn).await
+                .map_err(|e| format!("读取目标结构失败: {e}"))?;
+            let source: String = source.try_get(1).map_err(|e| format!("解析源结构失败: {e}"))?;
+            let target: String = target.try_get(1).map_err(|e| format!("解析目标结构失败: {e}"))?;
+            if mysql_apply_ddl(&source, &src_table, &target_ref)? != mysql_apply_ddl(&target, &dst_table, &target_ref)? {
+                return Err("仅数据迁移的源目标结构不一致，已在清空或写入目标前中止".into());
+            }
+        }
+        if do_structure {
+            let triggers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA=? AND EVENT_OBJECT_TABLE=?")
+                .bind(source_schema).bind(&src_table).fetch_one(&mut source_conn).await
+                .map_err(|e| format!("检查源表触发器失败: {e}"))?;
+            if triggers > 0 { return Err("源表包含触发器，当前迁移无法完整复制其行为，已在修改目标前中止".into()); }
+            if src_table != dst_table {
+                let self_refs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND REFERENCED_TABLE_SCHEMA=TABLE_SCHEMA AND REFERENCED_TABLE_NAME=TABLE_NAME")
+                    .bind(source_schema).bind(&src_table).fetch_one(&mut source_conn).await
+                    .map_err(|e| format!("检查源表自引用失败: {e}"))?;
+                if self_refs > 0 { return Err("源表包含自引用外键，改名复制会改变引用关系，已中止迁移".into()); }
+            }
+        }
+        let columns = sqlx::query("SELECT COLUMN_NAME, DATA_TYPE, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=?")
+            .bind(source_schema).bind(&src_table).fetch_all(&mut source_conn).await
+            .map_err(|e| format!("读取源字段安全信息失败: {e}"))?;
+        if columns.is_empty() { return Err("源表不存在或无法读取完整元数据，已中止迁移".into()); }
+        if do_data {
+            for column in columns {
+                let typ: String = column.try_get(1).map_err(|e| format!("解析源类型失败: {e}"))?;
+                let extra: String = column.try_get(2).map_err(|e| format!("解析源字段属性失败: {e}"))?;
+                if super::mysql_migration_safety::unsupported_transfer_type(&typ, &extra) {
+                    let name: String = column.try_get(0).unwrap_or_default();
+                    return Err(format!("字段 {name}（{typ} / {extra}）尚不支持无损数据传输，已在修改目标前中止；可单独复制表结构"));
+                }
+            }
+            let schema_ref = format!("{}.{}", q_mysql(source_schema), q_mysql(&src_table));
+            let engine: String = sqlx::query_scalar("SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?")
+                .bind(source_schema).bind(&src_table).fetch_one(&mut source_conn).await
+                .map_err(|e| format!("读取源存储引擎失败: {e}"))?;
+            if !engine.eq_ignore_ascii_case("InnoDB") {
+                return Err(format!("{schema_ref} 使用 {engine}，无法保证事务恢复，已中止数据迁移"));
+            }
+        }
+    }
+
     // 同引擎（Oracle / SQL Server / ClickHouse）迁移走专用路径：
     // 同连接用服务端 CTAS + INSERT...SELECT（零数据往返、类型零损失）；跨连接读+写。
     if src_config.conn_type == dst_config.conn_type
         && matches!(src_config.conn_type, ConnType::Oracle | ConnType::SqlServer | ConnType::ClickHouse)
     {
+        let same_conn = src_id == dst_id;
+        if !same_engine_migration_is_single_atomic_statement(
+            same_conn,
+            &strategy,
+            do_structure,
+            do_data,
+            clear_before_insert,
+        ) {
+            return Err("该数据库引擎的迁移步骤无法由当前连接包成一个已验证的原子语句；为避免留下半成品，当前仅允许同一连接、仅数据、追加模式，其他操作请使用数据库原生备份/恢复工具".into());
+        }
         // Oracle / SQL Server / ClickHouse 同引擎路径暂未实现冲突合并（各方言 MERGE 语法差异大）。
         // 明确拒绝而非静默忽略，避免用户误以为「忽略冲突 / UPSERT」策略已生效。
         if conflict != "error" {
@@ -2845,6 +4325,7 @@ pub async fn db_migrate_table(
             &strategy, do_structure, do_data, clear_before_insert,
             sel_cols.as_deref(), map_dst_cols.as_deref(), &where_sql, row_limit,
             &conflict, &error_mode, &ss_pool, &registry,
+            &app_handle,
         ).await;
     }
 
@@ -2859,7 +4340,7 @@ pub async fn db_migrate_table(
     // ── 0. 大表流式直传：MySQL / PostgreSQL / SQLite，游标边读边写，内存恒定 ──────────
     // 仅覆盖常规策略（replace/truncate/append/skip）+ 无列映射；其余组合走下方一次性读取。
     // 镜像/影子表策略已在后续分支处理，此处 strategy 匹配自然排除它们。
-    let can_stream = sel_cols.is_none() && do_data
+    let can_stream = sel_cols.is_none() && (do_data || (mysql_source && mysql_target))
         && matches!(strategy.as_str(), "replace" | "truncate" | "append" | "skip")
         && is_sql_engine(&src_config.conn_type) && is_sql_engine(&dst_config.conn_type);
     if can_stream {
@@ -2873,48 +4354,70 @@ pub async fn db_migrate_table(
         match src_config.conn_type {
             ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => {
                 let (mut src_conn, _g) = mysql_connect(&src_config, src_pwd.as_deref()).await?;
+                if mysql_target {
+                    sqlx::query("SET SESSION lock_wait_timeout=30").execute(&mut src_conn).await.map_err(|e| format!("设置源元数据锁等待上限失败: {e}"))?;
+                    sqlx::query("SET time_zone = '+00:00'").execute(&mut src_conn).await
+                        .map_err(|e| format!("设置源时间会话失败: {e}"))?;
+                    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").execute(&mut src_conn).await
+                        .map_err(|e| format!("设置源数据快照失败: {e}"))?;
+                    sqlx::Executor::execute(&mut src_conn, sqlx::raw_sql("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")).await
+                        .map_err(|e| format!("建立源数据快照失败: {e}"))?;
+                }
                 let schema_q = if src_schema.is_empty() { src_config.database.clone().unwrap_or_default() } else { src_schema.clone() };
                 let src = if src_schema.is_empty() { q_mysql(&src_table) } else { format!("{}.{}", q_mysql(&src_schema), q_mysql(&src_table)) };
-                let meta = sqlx::query("SELECT COLUMN_NAME, COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION")
+                // Hold MDL through source consumption; preflight on another connection is insufficient.
+                sqlx::query(&format!("SELECT * FROM {src} LIMIT 0")).fetch_all(&mut src_conn).await
+                    .map_err(|e| format!("锁定源表元数据失败: {e}"))?;
+                mysql_validate_live_table(&mut src_conn, &schema_q, &src_table, do_data, false).await?;
+                if do_structure {
+                    let self_refs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND REFERENCED_TABLE_SCHEMA=TABLE_SCHEMA AND REFERENCED_TABLE_NAME=TABLE_NAME")
+                        .bind(&schema_q).bind(&src_table).fetch_one(&mut src_conn).await.map_err(|e| format!("核验实际源自引用失败: {e}"))?;
+                    if self_refs > 0 { return Err("源表存在自引用外键，原样定义无法经暂存重命名保持引用，已在修改目标前中止".into()); }
+                }
+                if do_data {
+                    let columns = sqlx::query("SELECT DATA_TYPE,EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=?")
+                        .bind(&schema_q).bind(&src_table).fetch_all(&mut src_conn).await.map_err(|e| e.to_string())?;
+                    for c in columns {
+                        let typ: String = c.try_get(0).map_err(|e| e.to_string())?;
+                        let extra: String = c.try_get(1).map_err(|e| e.to_string())?;
+                        if super::mysql_migration_safety::unsupported_transfer_type(&typ, &extra) {
+                            return Err(format!("实际源字段类型无法无损传输（{typ}/{extra}），已在修改目标前中止"));
+                        }
+                    }
+                }
+                let meta = sqlx::query("SELECT CAST(COLUMN_NAME AS CHAR CHARACTER SET utf8mb4), CAST(COLUMN_TYPE AS CHAR CHARACTER SET utf8mb4) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION")
                     .bind(&schema_q).bind(&src_table).fetch_all(&mut src_conn).await.map_err(|e| format!("读取源表结构失败: {e}"))?;
-                let col_names: Vec<String> = meta.iter().filter_map(|r| r.try_get::<String, _>(0).ok()).collect();
-                let col_types: Vec<String> = meta.iter().filter_map(|r| r.try_get::<String, _>(1).ok()).collect();
+                let col_names: Vec<String> = meta.iter().map(|r| r.try_get::<String, _>(0)).collect::<Result<_,_>>().map_err(|e| format!("解析源字段名失败: {e}"))?;
+                let col_types: Vec<String> = meta.iter().map(|r| r.try_get::<String, _>(1)).collect::<Result<_,_>>().map_err(|e| format!("解析源字段类型失败: {e}"))?;
                 if col_names.is_empty() { return Err("无法确定源表列，迁移中止".into()); }
                 let total_est: u64 = sqlx::query("SELECT TABLE_ROWS FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?")
                     .bind(&schema_q).bind(&src_table).fetch_optional(&mut src_conn).await.ok().flatten()
                     .and_then(|r| r.try_get::<i64, _>(0).ok()).unwrap_or(0).max(0) as u64;
                 let dst_is_mysql = matches!(dst_config.conn_type, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase);
-                let can_like = dst_is_mysql && (src_id == dst_id || src_config.host == dst_config.host);
-                // MySQL→MySQL 时始终从源端取 SHOW CREATE TABLE：
-                // - 跨服务器：主路径（目标无法引用源端表名）
-                // - 同主机跨库：LIKE 成功时忽略 native_ddl；LIKE 因权限/版本失败时用作精确 fallback
-                //   （LIKE 失败只有 col_types 时列长度/charset/索引丢失，3098 等问题会重现）
-                let native_ddl: Option<String> = if dst_is_mysql && do_structure {
-                    sqlx::query(&format!("SHOW CREATE TABLE {src}")).fetch_one(&mut src_conn).await.ok()
-                        .and_then(|r| r.try_get::<String, _>(1).ok())
+                let can_like = false;
+                // MySQL 同家族源表必须用原始 DDL；LIKE 不复制外键，按列重建会丢索引和默认值。
+                let source_sql_mode: Option<String> = if dst_is_mysql { Some(sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut src_conn).await.map_err(|e| format!("读取迁移源会话模式失败: {e}"))?) } else { None };
+                let native_ddl: Option<String> = if dst_is_mysql {
+                    let row = sqlx::query(&format!("SHOW CREATE TABLE {src}"))
+                        .fetch_one(&mut src_conn).await
+                        .map_err(|e| format!("读取源表原始 DDL 失败，已中止迁移: {e}"))?;
+                    Some(row.try_get::<String, _>(1)
+                        .map_err(|e| format!("解析源表原始 DDL 失败，已中止迁移: {e}"))?)
                 } else { None };
-                let setup = match open_stream_dst(&dst_config, dst_pwd.as_deref(), &dst_schema, &dst_table, &strategy, do_structure, clear_before_insert, disable_fk, use_tx, &col_names, &col_types, can_like, &src, &src_config.conn_type, native_ddl.as_deref()).await? {
+                let setup = match open_stream_dst(&dst_config, dst_pwd.as_deref(), &dst_schema, &dst_table, &strategy, do_structure, clear_before_insert, disable_fk, use_tx, &col_names, &col_types, can_like, &src, &src_config.conn_type, &src_table, native_ddl.as_deref(), source_sql_mode.as_deref()).await? {
                     None => { emit_progress("done", total_est, 0); return Ok(skip_result(total_est)); }
                     Some(s) => s,
                 };
-                // replace 策略备份清理信息（drive_stream 会消耗 setup，提前取出）
-                let bak_q = setup.bak_q.clone();
-                let orig_q = setup.orig_q.clone();
-                let sel = tag_sql(&format!("SELECT {} FROM {src}{where_sql}{limit_sql}", col_names.iter().map(|c| q_mysql(c)).collect::<Vec<_>>().join(", ")));
-                let stream = sqlx::query(&sel).fetch(&mut src_conn).map_ok(|r| mysql_row_to_strings(&r)).boxed();
+                // 让服务器把受支持的标量转换为 UTF-8 文本，避免日期/整数的二进制协议兜底误解码。
+                let selected = if mysql_target { mysql_migration_projection(&col_names, &col_types)? }
+                    else { col_names.iter().map(|name|q_mysql(name)).collect::<Vec<_>>().join(", ") };
+                let sel = tag_sql(&format!("SELECT {selected} FROM {src}{where_sql}{limit_sql}"));
+                let stream = if do_data {
+                    sqlx::query(&sel).fetch(&mut src_conn).and_then(|r| async move { mysql_transfer_row(&r) }).boxed()
+                } else {
+                    futures::stream::empty::<Result<Vec<Option<String>>, sqlx::Error>>().boxed()
+                };
                 let result = drive_stream(stream, setup, &col_names, &conflict, skip_errors, use_tx, disable_fk, batch_usize, total_est, &emit_progress, start).await;
-                // 迁移完成后处理备份表
-                if let (Some(bq), Some(oq)) = (bak_q, orig_q) {
-                    if let Ok((mut c, _g)) = mysql_connect(&dst_config, dst_pwd.as_deref()).await {
-                        if result.is_ok() {
-                            let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {bq}")).execute(&mut c).await;
-                        } else {
-                            // 数据传输失败：删新表、恢复备份
-                            let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {oq}")).execute(&mut c).await;
-                            let _ = sqlx::query(&format!("RENAME TABLE {bq} TO {oq}")).execute(&mut c).await;
-                        }
-                    }
-                }
                 return result;
             }
             ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
@@ -2930,23 +4433,49 @@ pub async fn db_migrate_table(
                     .bind(&src).fetch_optional(&mut src_conn).await.ok().flatten()
                     .and_then(|r| r.try_get::<i64, _>(0).ok()).unwrap_or(0).max(0) as u64;
                 let can_like = matches!(dst_config.conn_type, ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss) && src_id == dst_id;
-                let setup = match open_stream_dst(&dst_config, dst_pwd.as_deref(), &dst_schema, &dst_table, &strategy, do_structure, clear_before_insert, disable_fk, use_tx, &col_names, &col_types, can_like, &src, &src_config.conn_type, None).await? {
+                let setup = match open_stream_dst(&dst_config, dst_pwd.as_deref(), &dst_schema, &dst_table, &strategy, do_structure, clear_before_insert, disable_fk, use_tx, &col_names, &col_types, can_like, &src, &src_config.conn_type, &src_table, None, None).await? {
                     None => { emit_progress("done", total_est, 0); return Ok(skip_result(total_est)); }
                     Some(s) => s,
                 };
                 let bak_q = setup.bak_q.clone();
                 let orig_q = setup.orig_q.clone();
+                let created_oid = setup.pg_created_oid;
                 let sel = tag_sql(&format!("SELECT {} FROM {src}{where_sql}{limit_sql}", col_names.iter().map(|c| q_dq(c)).collect::<Vec<_>>().join(", ")));
                 let stream = sqlx::query(&sel).fetch(&mut src_conn).map_ok(|r| pg_row_to_strings(&r)).boxed();
                 let result = drive_stream(stream, setup, &col_names, &conflict, skip_errors, use_tx, disable_fk, batch_usize, total_est, &emit_progress, start).await;
-                if let (Some(bq), Some(oq)) = (bak_q, orig_q) {
-                    if let Ok((mut c, _g)) = pg_connect(&dst_config, dst_pwd.as_deref()).await {
-                        if result.is_ok() {
-                            let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {bq}")).execute(&mut c).await;
-                        } else {
-                            let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {oq}")).execute(&mut c).await;
-                            let _ = sqlx::query(&format!("ALTER TABLE {bq} RENAME TO {}", q_dq(&dst_table))).execute(&mut c).await;
+                if let (Some(oq), Some(created_oid)) = (orig_q, created_oid) {
+                    let (mut c, _g) = match pg_connect(&dst_config, dst_pwd.as_deref()).await {
+                        Ok(connection) => connection,
+                        Err(reconnect) => return match result {
+                            Ok(mut completed) => {
+                                if let Some(bq) = &bak_q { completed.errors.push(format!("迁移已完成，但无法确认清理旧表备份 {bq}: {reconnect}")); }
+                                Ok(completed)
+                            }
+                            Err(error) => Err(match &bak_q {
+                                Some(bq) => format!("{error}；无法连接目标以恢复旧表，备份仍保留于 {bq}: {reconnect}"),
+                                None => format!("{error}；无法连接目标清理本次创建的表 {oq}: {reconnect}"),
+                            }),
+                        },
+                    };
+                    match result {
+                        Ok(mut completed) => {
+                            if let Some(bq) = &bak_q {
+                                if let Err(e) = sqlx::query(&format!("DROP TABLE {bq}")).execute(&mut c).await {
+                                    completed.errors.push(format!("迁移已完成，但旧表备份清理失败，仍保留于 {bq}: {e}"));
+                                }
+                            }
+                            return Ok(completed);
                         }
+                        Err(error) if pg_commit_outcome_unknown(&error) => {
+                            return Err(match &bak_q {
+                                Some(bq) => format!("{error}；结果未确认，未自动删除或恢复任何表；请核对正式目标 {oq} 与旧表备份 {bq}，勿重试迁移"),
+                                None => format!("{error}；结果未确认，未自动删除目标 {oq}；请核对目标状态，勿重试迁移"),
+                            });
+                        }
+                        Err(error) => return Err(match pg_restore_backup(&mut c, bak_q.as_deref(), &oq, &dst_table, Some(created_oid)).await {
+                            Ok(()) => error,
+                            Err(recovery) => format!("{error}；{recovery}"),
+                        }),
                     }
                 }
                 return result;
@@ -2966,7 +4495,7 @@ pub async fn db_migrate_table(
                 if col_names.is_empty() { return Err("无法确定源表列，迁移中止".into()); }
                 let total_est = 0u64; // SQLite 无瞬时行数估算
                 let can_like = matches!(dst_config.conn_type, ConnType::Sqlite) && src_id == dst_id;
-                let setup = match open_stream_dst(&dst_config, dst_pwd.as_deref(), &dst_schema, &dst_table, &strategy, do_structure, clear_before_insert, disable_fk, use_tx, &col_names, &col_types, can_like, &src, &src_config.conn_type, None).await? {
+                let setup = match open_stream_dst(&dst_config, dst_pwd.as_deref(), &dst_schema, &dst_table, &strategy, do_structure, clear_before_insert, disable_fk, use_tx, &col_names, &col_types, can_like, &src, &src_config.conn_type, &src_table, None, None).await? {
                     None => { emit_progress("done", total_est, 0); return Ok(skip_result(total_est)); }
                     Some(s) => s,
                 };
@@ -3002,6 +4531,7 @@ pub async fn db_migrate_table(
     emit_progress("reading", 0, 0);
 
     let mut col_types: Vec<String> = vec![];
+    let mut source_mysql_ddl: Option<String> = None;
     let mut meta_names: Vec<String> = vec![]; // 元数据列名（结果集为空时回退用）
     let (rows_cols, all_rows): (Vec<String>, Vec<Vec<Option<String>>>) = match src_config.conn_type {
         ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => {
@@ -3009,6 +4539,15 @@ pub async fn db_migrate_table(
             let (mut conn, _t) = mysql_connect(&src_config, src_pwd.as_deref()).await?;
             let src = if src_schema.is_empty() { q_mysql(&src_table) }
                       else { format!("{}.{}", q_mysql(&src_schema), q_mysql(&src_table)) };
+            // 只有同家族 MySQL 目标需要原始 DDL；跨引擎映射保留既有逻辑。
+            if (do_structure || strategy == "shadow" || strategy == "mirror")
+                && matches!(dst_config.conn_type, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase) {
+                let ddl_row = sqlx::query(&format!("SHOW CREATE TABLE {src}"))
+                    .fetch_one(&mut conn).await
+                    .map_err(|e| format!("读取源表原始 DDL 失败，已中止迁移: {e}"))?;
+                source_mysql_ddl = Some(ddl_row.try_get::<String, _>(1)
+                    .map_err(|e| format!("解析源表原始 DDL 失败，已中止迁移: {e}"))?);
+            }
             let schema_q = if src_schema.is_empty() {
                 src_config.database.clone().unwrap_or_default()
             } else { src_schema.clone() };
@@ -3124,6 +4663,9 @@ pub async fn db_migrate_table(
 
     let total_rows = all_rows.len() as u64;
     emit_progress("migrating", total_rows, 0);
+
+    // 非流式覆盖会先重命名旧表；保留备份直到数据写入完全成功。
+    let mut mysql_backup: Option<(String, String)> = None;
 
     // ── 2. 目标存在性检查 ──────────────────────────────────────────────────────
     let target_exists: bool = match dst_config.conn_type {
@@ -3455,16 +4997,18 @@ pub async fn db_migrate_table(
         let (mut conn, _t) = mysql_connect(&dst_config, dst_pwd.as_deref()).await?;
         let dst = if dst_schema.is_empty() { q_mysql(&dst_table) }
                   else { format!("{}.{}", q_mysql(&dst_schema), q_mysql(&dst_table)) };
-        let src_q = if src_schema.is_empty() { q_mysql(&src_table) }
-                    else { format!("{}.{}", q_mysql(&src_schema), q_mysql(&src_table)) };
         let col_list = col_names.iter().map(|c| q_mysql(c)).collect::<Vec<_>>().join(", ");
         let n_cols = col_names.len();
         let row_ph = (0..n_cols).map(|_| "?").collect::<Vec<_>>().join(", ");
         // MySQL 预处理参数上限 65535：每批行数按列数封顶，避免宽表报错
         let max_rows = if n_cols == 0 { batch as usize } else { ((65535 / n_cols).max(1)).min(batch as usize) };
-        // 同服务器且未做列映射时用 CREATE TABLE LIKE 保留完整结构，否则按列建表
-        let same_server = sel_cols.is_none() && (src_id == dst_id || src_config.host == dst_config.host);
+        // 同引擎使用源端 SHOW CREATE TABLE；仅跨引擎映射列类型。
 
+        if source_mysql_ddl.is_none()
+            && matches!(src_config.conn_type, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase)
+            && (strategy == "shadow" || !target_exists) {
+            return Err("源表原始 DDL 不可用，已中止建表，避免生成不一致的目标结构".into());
+        }
         if disable_fk { let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=0").execute(&mut conn).await; }
         let mut migrated_rows: u64 = 0;
         let mut errors: Vec<String> = vec![];
@@ -3475,8 +5019,8 @@ pub async fn db_migrate_table(
             validate_ident(&shadow)?;
             let shadow_q = if dst_schema.is_empty() { q_mysql(&shadow) }
                            else { format!("{}.{}", q_mysql(&dst_schema), q_mysql(&shadow)) };
-            let _ = sqlx::query(&tag_sql(&format!("DROP TABLE IF EXISTS {shadow_q}"))).execute(&mut conn).await;
-            create_mysql_like_or_columns(&mut conn, &shadow_q, same_server, &src_q, &col_names, &col_types).await?;
+            create_mysql_like_or_columns(&mut conn, &shadow_q, &col_names, &col_types,
+                source_mysql_ddl.as_deref(), &src_table).await?;
             for chunk in all_rows.chunks(max_rows) {
                 let all_ph = chunk.iter().map(|_| format!("({row_ph})")).collect::<Vec<_>>().join(", ");
                 let sql = tag_sql(&format!("INSERT INTO {shadow_q} ({col_list}) VALUES {all_ph}"));
@@ -3496,7 +5040,6 @@ pub async fn db_migrate_table(
                 validate_ident(&old)?;
                 let old_q = if dst_schema.is_empty() { q_mysql(&old) }
                             else { format!("{}.{}", q_mysql(&dst_schema), q_mysql(&old)) };
-                let _ = sqlx::query(&tag_sql(&format!("DROP TABLE IF EXISTS {old_q}"))).execute(&mut conn).await;
                 sqlx::query(&tag_sql(&format!("RENAME TABLE {dst} TO {old_q}, {shadow_q} TO {dst}")))
                     .execute(&mut conn).await.map(|_| Some(old_q))
             } else {
@@ -3516,7 +5059,8 @@ pub async fn db_migrate_table(
         } else {
             // 镜像同步：目标不存在则建表；按主键 UPSERT 写入；删除源中已不存在的行
             if !target_exists {
-                create_mysql_like_or_columns(&mut conn, &dst, same_server, &src_q, &col_names, &col_types).await?;
+                create_mysql_like_or_columns(&mut conn, &dst, &col_names, &col_types,
+                    source_mysql_ddl.as_deref(), &src_table).await?;
             }
             let schema_q = if dst_schema.is_empty() { dst_config.database.clone().unwrap_or_default() } else { dst_schema.clone() };
             let pk: Vec<String> = sqlx::query(
@@ -3607,18 +5151,22 @@ pub async fn db_migrate_table(
                 let (mut conn, _t) = mysql_connect(&dst_config, dst_pwd.as_deref()).await?;
                 let dst = if dst_schema.is_empty() { q_mysql(&dst_table) }
                           else { format!("{}.{}", q_mysql(&dst_schema), q_mysql(&dst_table)) };
+                let source_ddl = source_mysql_ddl.as_deref()
+                    .map(|raw| mysql_apply_ddl(raw, &src_table, &dst))
+                    .transpose()?;
+                if matches!(src_config.conn_type, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase)
+                    && source_ddl.is_none() {
+                    return Err("源表原始 DDL 不可用，已中止建表，避免生成不一致的目标结构".into());
+                }
                 if backup_first {
                     let bak = format!("__mig_bak_{}_{}", dst_table, ts);
                     let bq = if dst_schema.is_empty() { q_mysql(&bak) }
                              else { format!("{}.{}", q_mysql(&dst_schema), q_mysql(&bak)) };
-                    let _ = sqlx::query(&tag_sql(&format!("DROP TABLE IF EXISTS {bq}"))).execute(&mut conn).await;
                     sqlx::query(&tag_sql(&format!("RENAME TABLE {dst} TO {bq}")))
                         .execute(&mut conn).await.map_err(|e| format!("备份旧表失败: {e}"))?;
-                    let create_r = if sel_cols.is_none() && (src_id == dst_id || src_config.host == dst_config.host) {
-                        let src = if src_schema.is_empty() { q_mysql(&src_table) }
-                                  else { format!("{}.{}", q_mysql(&src_schema), q_mysql(&src_table)) };
-                        sqlx::query(&tag_sql(&format!("CREATE TABLE {dst} LIKE {src}")))
-                            .execute(&mut conn).await.map(|_| ()).map_err(|e| format!("创建目标表失败: {e}"))
+                    let create_r = if let Some(ref ddl) = source_ddl {
+                        sqlx::query(&tag_sql(ddl)).execute(&mut conn).await
+                            .map(|_| ()).map_err(|e| format!("按源表原始 DDL 创建目标表失败: {e}"))
                     } else if !col_types.is_empty() {
                         create_mysql_table_mapped(&mut conn, &dst, &col_names, &col_types).await
                     } else {
@@ -3628,16 +5176,13 @@ pub async fn db_migrate_table(
                         let _ = sqlx::query(&tag_sql(&format!("RENAME TABLE {bq} TO {dst}"))).execute(&mut conn).await;
                         return Err(e);
                     }
-                    // 成功后清理备份（流式迁移成功后的备份清理在 drive_stream 之后；此处非流式暂在结构准备后立即清理不合适——数据写入还没开始）
-                    // bq 留到数据写入成功后由调用方清理；此处仅在建表失败时还原，建表成功后继续走数据写入。
-                    // 数据写入失败无法自动还原（非流式路径不支持备份追踪），bq 残留为安全边界。
-                    let _ = sqlx::query(&tag_sql(&format!("DROP TABLE IF EXISTS {bq}"))).execute(&mut conn).await;
+                    if do_data { mysql_backup = Some((bq, dst)); }
+                    else { sqlx::query(&tag_sql(&format!("DROP TABLE IF EXISTS {bq}"))).execute(&mut conn).await
+                        .map_err(|e| format!("清理旧表备份失败: {e}"))?; }
                 } else {
-                    if sel_cols.is_none() && (src_id == dst_id || src_config.host == dst_config.host) {
-                        let src = if src_schema.is_empty() { q_mysql(&src_table) }
-                                  else { format!("{}.{}", q_mysql(&src_schema), q_mysql(&src_table)) };
-                        sqlx::query(&tag_sql(&format!("CREATE TABLE {dst} LIKE {src}")))
-                            .execute(&mut conn).await.map_err(|e| format!("创建目标表失败: {e}"))?;
+                    if let Some(ref ddl) = source_ddl {
+                        sqlx::query(&tag_sql(ddl)).execute(&mut conn).await
+                            .map_err(|e| format!("按源表原始 DDL 创建目标表失败: {e}"))?;
                     } else if !col_types.is_empty() {
                         create_mysql_table_mapped(&mut conn, &dst, &col_names, &col_types).await?;
                     } else {
@@ -3753,6 +5298,7 @@ pub async fn db_migrate_table(
     let n_cols = col_names.len();
     let skip_errors = error_mode == "skip";
 
+    let write_result: Result<(), String> = async {
     match dst_config.conn_type {
         ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => {
             let (mut conn, _t) = mysql_connect(&dst_config, dst_pwd.as_deref()).await?;
@@ -3768,7 +5314,7 @@ pub async fn db_migrate_table(
             } else { String::new() };
 
             if disable_fk { let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=0").execute(&mut conn).await; }
-            if use_tx { sqlx::query("START TRANSACTION").execute(&mut conn).await.map_err(|e| format!("开启事务失败: {e}"))?; }
+            if use_tx { sqlx::Executor::execute(&mut conn, sqlx::raw_sql("START TRANSACTION")).await.map_err(|e| format!("开启事务失败: {e}"))?; }
             if clear_before_insert {
                 if let Err(e) = sqlx::query(&tag_sql(&format!("TRUNCATE TABLE {dst}"))).execute(&mut conn).await {
                     if use_tx { let _ = sqlx::query("ROLLBACK").execute(&mut conn).await; }
@@ -3804,7 +5350,7 @@ pub async fn db_migrate_table(
                 }
             }
 
-            if use_tx { sqlx::query("COMMIT").execute(&mut conn).await.map_err(|e| format!("提交事务失败: {e}"))?; }
+            if use_tx { sqlx::Executor::execute(&mut conn, sqlx::raw_sql("COMMIT")).await.map_err(|e| format!("提交事务失败: {e}"))?; }
             if disable_fk { let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1").execute(&mut conn).await; }
         }
         ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
@@ -3977,6 +5523,21 @@ pub async fn db_migrate_table(
         _ => return Err("目标连接类型不支持迁移".into()),
     }
 
+    Ok(())
+    }.await;
+    if let Some((backup, target)) = mysql_backup {
+        let (mut conn, _t) = mysql_connect(&dst_config, dst_pwd.as_deref()).await?;
+        if write_result.is_ok() && failed_rows == 0 {
+            sqlx::query(&tag_sql(&format!("DROP TABLE IF EXISTS {backup}"))).execute(&mut conn).await
+                .map_err(|e| format!("迁移完成但清理旧表备份失败，备份仍保留: {e}"))?;
+        } else {
+            sqlx::query(&tag_sql(&format!("DROP TABLE IF EXISTS {target}"))).execute(&mut conn).await
+                .map_err(|e| format!("迁移失败；目标表清理失败，旧表备份仍在 {backup}: {e}"))?;
+            sqlx::query(&tag_sql(&format!("RENAME TABLE {backup} TO {target}"))).execute(&mut conn).await
+                .map_err(|e| format!("迁移失败；恢复旧表失败，旧表备份仍在 {backup}: {e}"))?;
+        }
+    }
+    write_result?;
     emit_progress("done", total_rows, migrated_rows);
     Ok(MigrateResult {
         total_rows,
@@ -4140,11 +5701,62 @@ async fn create_pg_table_mapped(
     Ok(())
 }
 
+async fn pg_relation_oid(conn: &mut sqlx::postgres::PgConnection, relation: &str) -> Result<Option<i64>, String> {
+    sqlx::query_scalar("SELECT to_regclass($1)::oid::bigint")
+        .bind(relation).fetch_one(conn).await.map_err(|e| format!("读取 PostgreSQL 表身份失败: {e}"))
+}
+
+async fn pg_restore_backup(
+    conn: &mut sqlx::postgres::PgConnection, backup: Option<&str>, target: &str,
+    target_name: &str, expected_target_oid: Option<i64>,
+) -> Result<(), String> {
+    sqlx::query("BEGIN").execute(&mut *conn).await
+        .map_err(|e| format!("无法开启正式表恢复事务，备份保留于 {}: {e}", backup.unwrap_or("(无旧表备份)")))?;
+    let result: Result<(), String> = async {
+    if let Some(actual_oid) = pg_relation_oid(conn, target).await? {
+        if expected_target_oid != Some(actual_oid) {
+            return Err(format!("未能恢复正式表：目标 {target} 已不是本次迁移创建的表，未删除该对象；旧表备份保留于 {}",
+                backup.unwrap_or("(无旧表备份)")));
+        }
+        sqlx::query(&format!("DROP TABLE {target}")).execute(&mut *conn).await
+            .map_err(|e| format!("未能清理本次迁移目标 {target}，旧表备份仍保留于 {}: {e}", backup.unwrap_or("(无旧表备份)")))?;
+    }
+    if let Some(backup) = backup {
+        sqlx::query(&format!("ALTER TABLE {backup} RENAME TO {}", q_dq(target_name))).execute(&mut *conn).await
+            .map_err(|e| format!("正式表恢复失败；旧数据仍保留于备份 {backup}: {e}"))?;
+    }
+    Ok(())
+    }.await;
+    if let Err(error) = result {
+        return match sqlx::query("ROLLBACK").execute(&mut *conn).await {
+            Ok(_) => Err(error),
+            Err(rollback) => Err(format!("{error}；恢复事务回滚未确认，备份位置 {}，请核对目标: {rollback}", backup.unwrap_or("(无旧表备份)"))),
+        };
+    }
+    sqlx::query("COMMIT").execute(&mut *conn).await
+        .map(|_| ())
+        .map_err(|e| format!("恢复事务提交未获确认；请核对正式目标 {target} 和备份 {}，勿重试: {e}", backup.unwrap_or("(无旧表备份)")))
+}
+
+async fn pg_abort_replace_setup(
+    conn: &mut sqlx::postgres::PgConnection, backup: Option<&str>, target: &str,
+    target_name: &str, expected_target_oid: Option<i64>, error: String,
+) -> String {
+    match pg_restore_backup(conn, backup, target, target_name, expected_target_oid).await {
+        Ok(()) => error,
+        Err(recovery) => format!("{error}；{recovery}"),
+    }
+}
+
 // ── 流式迁移基础设施（MySQL / PostgreSQL / SQLite）────────────────────────────────
 fn is_sql_engine(t: &ConnType) -> bool {
     matches!(t, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase
         | ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss | ConnType::Sqlite)
 }
+
+#[cfg(test)]
+#[path = "migration_scalar_tests.rs"]
+mod migration_scalar_tests;
 
 /// 流式写入的目标连接（按方言分派）
 /// field 1 的 Arc<DbTunnel> 不被直接读取，但必须持有以保持 SSH 隧道存活（Drop 守卫）
@@ -4162,56 +5774,388 @@ struct DstSetup {
     /// replace 策略下备份旧表的引用名；drive_stream 成功后 DROP，失败后 RENAME 回原表
     bak_q: Option<String>,
     orig_q: Option<String>,  // bak_q 对应的原始表名（用于失败后恢复）
+    /// Only a private stage is written before publication. Never restore/drop final names on errors.
+    publication: Option<MySqlPublication>,
+    pg_created_oid: Option<i64>,
+    verify_all_rows: bool,
+    mysql_numeric_columns: Vec<String>, // ENUM ordinals / SET masks must never travel as labels.
 }
 
-/// 建立流式写入目标：连接 + 存在性/策略校验 + DDL + 事务/清空。
-/// 返回 None 表示「跳过策略且目标已存在」，调用方按整表跳过处理。
+struct MySqlPublication {
+    final_q: String,
+    final_name: String,
+    stage_name: String,
+    backup_q: Option<String>,
+    expected_ddl: String,
+    original_ddl: Option<String>,
+    schema: String,
+    content: Option<(Vec<String>, TransferDigest)>,
+    expected_rows: Option<u64>,
+    raw_content: Option<(Vec<String>, TransferDigest)>,
+}
+
+/// 仅替换 SHOW CREATE TABLE 返回的首个表名。列、索引、外键和表选项一字不改。
+/// DDL 不符合预期时失败，而不是猜测或拼装一个可能不等价的目标表。
+fn mysql_apply_ddl(raw: &str, src_table: &str, dst_q: &str) -> Result<String, String> {
+    let prefix = format!("CREATE TABLE {} (", q_mysql(src_table));
+    let rest = raw.strip_prefix(&prefix)
+        .ok_or_else(|| "源端 SHOW CREATE TABLE 返回的表名或格式与预期不一致，已中止迁移".to_string())?;
+    if !rest.contains("\n)") {
+        return Err("源端 SHOW CREATE TABLE 返回不完整，已中止迁移".into());
+    }
+    Ok(format!("CREATE TABLE {dst_q} ({rest}"))
+}
+
+/// SHOW CREATE emits one physical line per column; never reconstruct attributes
+/// from ColumnInfo, which omits collation, comments and ON UPDATE/generated SQL.
+fn mysql_column_definition<'a>(raw: &'a str, column: &str) -> Result<&'a str, String> {
+    let prefix = format!("  {} ", q_mysql(column));
+    let line = raw.lines().find(|line| line.starts_with(&prefix))
+        .ok_or_else(|| format!("源 DDL 中找不到字段 {column} 的完整定义，已拒绝生成 ALTER"))?;
+    Ok(line.trim_start().strip_suffix(',').unwrap_or(line.trim_start()))
+}
+
+fn mysql_export_database_ddl(raw: &str, schema: &str) -> Result<String, String> {
+    let prefix = format!("CREATE DATABASE {}", q_mysql(schema));
+    let rest = raw.strip_prefix(&prefix).ok_or("数据库原始定义格式异常，已拒绝改写")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) { return Err("数据库原始定义格式异常".into()); }
+    Ok(format!("CREATE DATABASE IF NOT EXISTS {}{rest}", q_mysql(schema)))
+}
+
+fn mysql_table_signature(raw: &str, table: &str, columns: &[ColumnInfo]) -> Result<String, String> {
+    let normalized = mysql_apply_ddl(raw, table, "`__DBTERM_TABLE__`")?;
+    let column_lines: std::collections::HashSet<String> = columns.iter().map(|c| format!("  {} ", q_mysql(&c.name))).collect();
+    Ok(normalized.lines().filter(|line| !column_lines.iter().any(|prefix| line.starts_with(prefix)))
+        .collect::<Vec<_>>().join("\n"))
+}
+
+async fn create_mysql_verified(
+    conn: &mut sqlx::mysql::MySqlConnection, ddl: &str, dst_q: &str, dst_table: &str,
+) -> Result<(), String> {
+    use sqlx::Row;
+    sqlx::query(&tag_sql(ddl)).execute(&mut *conn).await
+        .map_err(|e| format!("按源表原文建表失败（不会自动改写定义）: {e}"))?;
+    let verification = async {
+        let row = sqlx::query(&format!("SHOW CREATE TABLE {dst_q}")).fetch_one(&mut *conn).await
+            .map_err(|e| format!("读取目标结构校验失败: {e}"))?;
+        let actual: String = row.try_get(1).map_err(|e| format!("解析目标结构校验失败: {e}"))?;
+        let normalized = mysql_apply_ddl(&actual, dst_table, dst_q)?;
+        if normalized != ddl {
+            return Err("目标数据库生成的结构与源表不一致，已拒绝继续迁移".to_string());
+        }
+        Ok(())
+    }.await;
+    if let Err(error) = verification {
+        sqlx::query(&format!("DROP TABLE {dst_q}")).execute(&mut *conn).await
+            .map_err(|e| format!("{error}；清理新建目标表失败: {e}"))?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod mysql_ddl_fidelity_tests {
+    use super::mysql_apply_ddl;
+
+    #[test]
+    fn transfer_digest_handles_null_boundaries_duplicates_and_same_count_changes() {
+        let digest = |rows: Vec<Vec<Option<&str>>>| {
+            let mut d = super::TransferDigest::default();
+            for r in rows { d.add(&r.into_iter().map(|v| v.map(String::from)).collect::<Vec<_>>()); }
+            d
+        };
+        assert_ne!(digest(vec![vec![None]]), digest(vec![vec![Some("")]]));
+        assert_ne!(digest(vec![vec![Some("a"),Some("bc")]]), digest(vec![vec![Some("ab"),Some("c")]]));
+        assert_ne!(digest(vec![vec![Some("1")]]), digest(vec![vec![Some("2")]]));
+        assert_ne!(digest(vec![vec![Some("1")]]), digest(vec![vec![Some("1")],vec![Some("1")]]));
+        assert_eq!(digest(vec![vec![Some("1")],vec![Some("2")]]), digest(vec![vec![Some("2")],vec![Some("1")]]));
+    }
+
+    #[test]
+    fn where_filter_rejects_statement_and_query_suffix_injection() {
+        for unsafe_filter in ["id = 1; DELETE FROM important", "id = 1 UNION SELECT 2", "id = 1 ORDER BY id", "id = 1 LIMIT 1", "id = 1 -- hide generated suffix"] {
+            assert!(super::validate_where(unsafe_filter).is_err(), "accepted: {unsafe_filter}");
+        }
+        assert!(super::validate_where("id > 0 AND (name = 'a;b' OR name IS NULL)").is_ok());
+        assert!(super::validate_where("`id` > CAST(X'313233' AS CHAR)").is_ok());
+    }
+
+    #[test]
+    fn migration_only_replaces_table_identifier_in_user_ddl() {
+        let source = include_str!("fixtures/mc_pos_settlement_company.sql").trim_end();
+        let expected = source.replacen("CREATE TABLE `mc_pos_settlement_company`", "CREATE TABLE `target_db`.`mc_pos_settlement_company`", 1);
+        assert_eq!(mysql_apply_ddl(source, "mc_pos_settlement_company", "`target_db`.`mc_pos_settlement_company`").unwrap(), expected);
+    }
+
+    #[test]
+    fn database_export_preserves_charset_collation_and_version_comments() {
+        let raw = "CREATE DATABASE `a` /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci */ /*!80016 DEFAULT ENCRYPTION='N' */";
+        assert_eq!(super::mysql_export_database_ddl(raw, "a").unwrap(), raw.replacen("CREATE DATABASE", "CREATE DATABASE IF NOT EXISTS", 1));
+        assert!(super::mysql_export_database_ddl(raw, "other").is_err());
+    }
+
+    #[test]
+    fn migration_preserves_foreign_keys_and_column_collations() {
+        let source = "CREATE TABLE `child` (\n  `id` bigint NOT NULL,\n  `name` varchar(24) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL,\n  CONSTRAINT `fk_parent` FOREIGN KEY (`id`) REFERENCES `parent` (`id`) ON DELETE CASCADE\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci";
+        let expected = source.replacen("CREATE TABLE `child`", "CREATE TABLE `dest`.`child`", 1);
+        assert_eq!(mysql_apply_ddl(source, "child", "`dest`.`child`").unwrap(), expected);
+    }
+
+    #[test]
+    fn structure_diff_uses_complete_column_sql_including_expression_defaults() {
+        let source = include_str!("fixtures/mc_pos_settlement_company.sql").trim_end();
+        assert_eq!(super::mysql_column_definition(source, "update_time").unwrap(),
+            "`update_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'");
+        let source = "CREATE TABLE `t` (\n  `s` varchar(24) CHARACTER SET latin1 COLLATE latin1_bin DEFAULT 'a,b' COMMENT 'ends,',\n  `calc` int GENERATED ALWAYS AS ((1 + 2)) STORED\n) ENGINE=InnoDB";
+        assert_eq!(super::mysql_column_definition(source, "s").unwrap(), "`s` varchar(24) CHARACTER SET latin1 COLLATE latin1_bin DEFAULT 'a,b' COMMENT 'ends,'");
+        assert_eq!(super::mysql_column_definition(source, "calc").unwrap(), "`calc` int GENERATED ALWAYS AS ((1 + 2)) STORED");
+        assert!(super::mysql_column_definition(source, "missing").is_err());
+    }
+
+    #[test]
+    fn structure_diff_detects_attributes_missing_from_column_summary() {
+        let base = "CREATE TABLE `t` (\n  `s` varchar(24) DEFAULT 'x'\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        let col = crate::models::ColumnInfo { name: "s".into(), data_type: "varchar(24)".into(), nullable: true, key: String::new(), default_value: Some("x".into()) };
+        for definition in [
+            "`s` varchar(24) CHARACTER SET latin1 COLLATE latin1_bin DEFAULT 'x'",
+            "`s` varchar(24) DEFAULT 'x' COMMENT 'different'",
+            "`s` varchar(24) DEFAULT 'x' INVISIBLE",
+        ] {
+            let other = base.replace("`s` varchar(24) DEFAULT 'x'", definition);
+            assert_eq!(super::mysql_table_signature(base, "t", std::slice::from_ref(&col)).unwrap(),
+                super::mysql_table_signature(&other, "t", std::slice::from_ref(&col)).unwrap());
+            assert_ne!(super::mysql_column_definition(base, "s").unwrap(), super::mysql_column_definition(&other, "s").unwrap());
+        }
+        let other = base.replace("DEFAULT CHARSET=utf8mb4", "DEFAULT CHARSET=latin1");
+        assert_ne!(super::mysql_table_signature(base, "t", std::slice::from_ref(&col)).unwrap(),
+            super::mysql_table_signature(&other, "t", &[col]).unwrap());
+    }
+
+    #[test]
+    fn migration_rejects_malformed_source_ddl_instead_of_building_partial_table() {
+        assert!(mysql_apply_ddl("CREATE VIEW `v` AS SELECT 1", "v", "`dest`.`v`").is_err());
+        assert!(mysql_apply_ddl("CREATE TABLE `broken`", "broken", "`dest`.`broken`").is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicitly selected disposable local MySQL: DBTERM_TEST_MYSQL_PORT"]
+    async fn real_mysql_setup_preserves_ddl_and_restores_existing_table_on_create_failure() {
+        use super::*;
+        use sqlx::Row;
+        let port: u16 = std::env::var("DBTERM_TEST_MYSQL_PORT").expect("disposable port required").parse().unwrap();
+        let db = format!("dbterm_test_{}", uuid::Uuid::new_v4().simple());
+        let config: ConnConfig = serde_json::from_value(serde_json::json!({
+            "id":"disposable-mysql-test", "name":"disposable", "type":"mysql",
+            "host":"127.0.0.1", "port":port, "username":"root", "useSsl":false,
+            "createdAt":0, "updatedAt":0
+        })).unwrap();
+        let (mut conn, _) = mysql_connect(&config, None).await.unwrap();
+        sqlx::query(&format!("CREATE DATABASE `{db}` DEFAULT CHARSET=latin1")).execute(&mut conn).await.unwrap();
+        let source_mode: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut conn).await.unwrap();
+        let full_source = include_str!("fixtures/mc_pos_settlement_company.sql").trim_end();
+        let mut full_setup = open_stream_dst(&config, None, &db, "mc_pos_settlement_company", "replace", true, false, false, false,
+            &[], &[], false, "", &ConnType::Mysql, "mc_pos_settlement_company", Some(full_source), Some(&source_mode)).await.unwrap().unwrap();
+        stream_finish(&mut full_setup, false, false).await.unwrap();
+        drop(full_setup);
+        let row = sqlx::query(&format!("SHOW CREATE TABLE `{db}`.`mc_pos_settlement_company`"))
+            .fetch_one(&mut conn).await.unwrap();
+        let full_actual: String = row.try_get(1).unwrap();
+        assert_eq!(full_actual, full_source);
+        // Column summaries are equal while complete definitions differ. Apply exactly
+        // the raw MODIFY clause used by the structure diff and compare full DDL.
+        sqlx::query(&format!("CREATE TABLE `{db}`.`diff_source` (id int PRIMARY KEY, s varchar(24) CHARACTER SET latin1 COLLATE latin1_bin DEFAULT 'x' COMMENT 'source' INVISIBLE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"))
+            .execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("CREATE TABLE `{db}`.`diff_target` (id int PRIMARY KEY, s varchar(24) DEFAULT 'x') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"))
+            .execute(&mut conn).await.unwrap();
+        let source_row = sqlx::query(&format!("SHOW CREATE TABLE `{db}`.`diff_source`")).fetch_one(&mut conn).await.unwrap();
+        let source_sql: String = source_row.try_get(1).unwrap();
+        let target_row = sqlx::query(&format!("SHOW CREATE TABLE `{db}`.`diff_target`")).fetch_one(&mut conn).await.unwrap();
+        let target_sql: String = target_row.try_get(1).unwrap();
+        assert_ne!(mysql_column_definition(&source_sql, "s").unwrap(), mysql_column_definition(&target_sql, "s").unwrap());
+        sqlx::query(&format!("ALTER TABLE `{db}`.`diff_target` MODIFY COLUMN {}", mysql_column_definition(&source_sql, "s").unwrap()))
+            .execute(&mut conn).await.unwrap();
+        let after = sqlx::query(&format!("SHOW CREATE TABLE `{db}`.`diff_target`")).fetch_one(&mut conn).await.unwrap();
+        let after: String = after.try_get(1).unwrap();
+        assert_eq!(mysql_apply_ddl(&after, "diff_target", "`same`").unwrap(), mysql_apply_ddl(&source_sql, "diff_source", "`same`").unwrap());
+        let raw = "CREATE TABLE `source` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `plan_code` varchar(64) NOT NULL DEFAULT '',\n  `update_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `uk_plan` ((nullif(`plan_code`,_utf8mb4'')))\n) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci ROW_FORMAT=DYNAMIC COMMENT='保真'";
+        let cols = vec!["id".to_string(), "plan_code".to_string(), "update_time".to_string()];
+        let mut setup = open_stream_dst(&config, None, &db, "copy", "replace", true, false, false, false,
+            &cols, &[], false, "", &ConnType::Mysql, "source", Some(raw), Some(&source_mode)).await.unwrap().unwrap();
+        stream_finish(&mut setup, false, false).await.unwrap();
+        drop(setup);
+        let row = sqlx::query(&format!("SHOW CREATE TABLE `{db}`.`copy`")).fetch_one(&mut conn).await.unwrap();
+        let actual: String = row.try_get(1).unwrap();
+        assert_eq!(actual, raw.replacen("`source`", "`copy`", 1));
+        create_mysql_verified(&mut conn, &mysql_apply_ddl(raw, "source", &format!("`{db}`.`source`")).unwrap(),
+            &format!("`{db}`.`source`"), "source").await.unwrap();
+        sqlx::query("SET SESSION sql_mode=CONCAT(@@SESSION.sql_mode, ',NO_AUTO_VALUE_ON_ZERO')").execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("INSERT INTO `{db}`.`source` VALUES (0,'零值','2026-01-02 03:04:05'),(2,'002','2026-01-03 04:05:06')"))
+            .execute(&mut conn).await.unwrap();
+        let mut setup = open_stream_dst(&config, None, &db, "copy", "append", false, false, false, true,
+            &cols, &[], false, "", &ConnType::Mysql, "source", Some(raw), Some(&source_mode)).await.unwrap().unwrap();
+        if let StreamDst::My(ref mut actual, _) = setup.dst {
+            let enabled: i64 = sqlx::query_scalar("SELECT @@SESSION.foreign_key_checks").fetch_one(actual).await.unwrap();
+            assert_eq!(enabled, 1);
+        }
+        use futures::{StreamExt, TryStreamExt};
+        let select = format!("SELECT CAST(id AS CHAR CHARACTER SET utf8mb4),CAST(plan_code AS CHAR CHARACTER SET utf8mb4),CAST(update_time AS CHAR CHARACTER SET utf8mb4) FROM `{db}`.`source` ORDER BY id");
+        let stream = sqlx::query(&select).fetch(&mut conn).map_ok(|r| mysql_row_to_strings(&r)).boxed();
+        let result = drive_stream(stream, setup, &cols, "error", false, true, false, 10, 2,
+            &|_, _, _| {}, Instant::now()).await.unwrap();
+        assert_eq!(result.migrated_rows, 2);
+        let rows = sqlx::query(&format!("SELECT id,plan_code,CAST(update_time AS CHAR) FROM `{db}`.`copy` ORDER BY id")).fetch_all(&mut conn).await.unwrap();
+        assert_eq!(rows[0].try_get::<u64,_>(0).unwrap(), 0);
+        assert_eq!(rows[0].try_get::<String,_>(1).unwrap(), "零值");
+        assert_eq!(rows[1].try_get::<String,_>(1).unwrap(), "002");
+        assert_eq!(rows[1].try_get::<String,_>(2).unwrap(), "2026-01-03 04:05:06");
+        sqlx::query(&format!("CREATE TABLE `{db}`.`old` (id int PRIMARY KEY)")).execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("INSERT INTO `{db}`.`old` VALUES (42)")).execute(&mut conn).await.unwrap();
+        let old_q = mysql_qualified(&db, "old");
+        let old_raw = mysql_read_ddl(&mut conn, &old_q).await.unwrap();
+        let metadata = sqlx::query("SELECT CAST(COLUMN_NAME AS CHAR CHARACTER SET utf8mb4),CAST(COLUMN_TYPE AS CHAR CHARACTER SET utf8mb4) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME='old' ORDER BY ORDINAL_POSITION")
+            .bind(&db).fetch_all(&mut conn).await.unwrap();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].try_get::<String,_>(0).unwrap(), "id");
+        assert_eq!(metadata[0].try_get::<String,_>(1).unwrap(), "int");
+        let opposite_mode = if source_mode.split(',').any(|mode| mode == "NO_BACKSLASH_ESCAPES") {
+            source_mode.split(',').filter(|mode| *mode != "NO_BACKSLASH_ESCAPES").collect::<Vec<_>>().join(",")
+        } else { format!("{source_mode},NO_BACKSLASH_ESCAPES") };
+        let source_mode_before: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut conn).await.unwrap();
+        sqlx::query("SET SESSION sql_mode=?").bind(&opposite_mode).execute(&mut conn).await.unwrap();
+        let actual_opposite_mode: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut conn).await.unwrap();
+        let mode_specific_raw = mysql_read_ddl(&mut conn, &old_q).await.unwrap();
+        sqlx::query("SET SESSION sql_mode=?").bind(&source_mode_before).execute(&mut conn).await.unwrap();
+        let stage_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME LIKE '__dbterm_stage_%'").bind(&db).fetch_one(&mut conn).await.unwrap();
+        let mismatch = open_stream_dst(&config, None, &db, "old", "replace", true, false, false, true,
+            &["id".into()], &[], false, "", &ConnType::Mysql, "old", Some(&mode_specific_raw), Some(&actual_opposite_mode)).await;
+        assert!(mismatch.is_err(), "incompatible source SQL mode must refuse before staging");
+        let stage_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME LIKE '__dbterm_stage_%'").bind(&db).fetch_one(&mut conn).await.unwrap();
+        assert_eq!(stage_count_before, stage_count_after);
+        assert!(open_stream_dst(&config, None, &db, "old", "replace", true, false, false, true,
+            &["id".into()], &[], false, "", &ConnType::Mysql, "old", Some(&old_raw), None).await.is_err());
+        assert_eq!(mysql_read_ddl(&mut conn, &old_q).await.unwrap(), old_raw);
+        assert_eq!(sqlx::query_scalar::<_, String>("SELECT @@SESSION.sql_mode").fetch_one(&mut conn).await.unwrap(), source_mode_before);
+        let id_cols = vec!["id".to_string()];
+        let stage = open_stream_dst(&config, None, &db, "old", "replace", true, false, false, true,
+            &id_cols, &[], false, "", &ConnType::Mysql, "old", Some(&old_raw), Some(&source_mode)).await.unwrap().unwrap();
+        let old_count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {old_q} WHERE id=42")).fetch_one(&mut conn).await.unwrap();
+        assert_eq!(old_count, 1, "old destination remains visible during staging");
+        let failed = futures::stream::iter(vec![Ok(vec![Some("1".into())]), Err(sqlx::Error::Protocol("injected read failure".into()))]).boxed();
+        assert!(drive_stream(failed, stage, &id_cols, "error", false, true, false, 1, 2,
+            &|_,_,_| {}, Instant::now()).await.is_err());
+        let old_count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {old_q} WHERE id=42")).fetch_one(&mut conn).await.unwrap();
+        assert_eq!(old_count, 1);
+        let data_only = open_stream_dst(&config, None, &db, "old", "truncate", false, true, false, true,
+            &id_cols, &[], false, "", &ConnType::Mysql, "old", Some(&old_raw), Some(&source_mode)).await.unwrap().unwrap();
+        let failure = futures::stream::iter(vec![Ok(vec![Some("9".into())]), Err(sqlx::Error::Protocol("injected after DELETE".into()))]).boxed();
+        assert!(drive_stream(failure, data_only, &id_cols, "error", false, true, false, 1, 2,
+            &|_,_,_| {}, Instant::now()).await.is_err());
+        let preserved: i32 = sqlx::query_scalar(&format!("SELECT id FROM {old_q}")).fetch_one(&mut conn).await.unwrap();
+        assert_eq!(preserved, 42, "DELETE and INSERT must rollback together");
+        let mut tampered = open_stream_dst(&config, None, &db, "old", "replace", true, false, false, true,
+            &id_cols, &[], false, "", &ConnType::Mysql, "old", Some(&old_raw), Some(&source_mode)).await.unwrap().unwrap();
+        stream_write_chunk(&mut tampered, &id_cols, "error", false, &[vec![Some("7".into())]]).await.unwrap();
+        let mut expected = TransferDigest::default();
+        expected.add(&[Some("7".into())]);
+        tampered.publication.as_mut().unwrap().content = Some((id_cols.clone(), expected));
+        if let StreamDst::My(ref mut actual, _) = tampered.dst {
+            sqlx::Executor::execute(&mut *actual, sqlx::raw_sql("COMMIT")).await.unwrap();
+        }
+        sqlx::query(&format!("UPDATE {} SET id=8", tampered.dst_q)).execute(&mut conn).await.unwrap();
+        let err = stream_finish(&mut tampered, false, false).await.unwrap_err();
+        assert!(err.contains("内容指纹不一致"), "{err}");
+        let old_count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {old_q} WHERE id=42")).fetch_one(&mut conn).await.unwrap();
+        assert_eq!(old_count, 1, "same-count stage tampering must not publish");
+        let stage = open_stream_dst(&config, None, &db, "old", "replace", true, false, false, true,
+            &id_cols, &[], false, "", &ConnType::Mysql, "old", Some(&old_raw), Some(&source_mode)).await.unwrap().unwrap();
+        let backup = stage.publication.as_ref().unwrap().backup_q.clone().unwrap();
+        let success = futures::stream::iter(vec![Ok(vec![Some("7".into())])]).boxed();
+        let result = drive_stream(success, stage, &id_cols, "error", false, true, false, 1, 1,
+            &|_,_,_| {}, Instant::now()).await.unwrap();
+        assert!(result.errors[0].contains(&backup));
+        let actual: i32 = sqlx::query_scalar(&format!("SELECT id FROM {old_q}")).fetch_one(&mut conn).await.unwrap();
+        assert_eq!(actual, 7);
+        let old: i32 = sqlx::query_scalar(&format!("SELECT id FROM {backup}")).fetch_one(&mut conn).await.unwrap();
+        assert_eq!(old, 42);
+        sqlx::query(&format!("DROP TABLE {old_q}")).execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("RENAME TABLE {backup} TO {old_q}")).execute(&mut conn).await.unwrap();
+        let bad = raw.replace("utf8mb4_0900_ai_ci", "utf8mb4_nonexistent_ci");
+        assert!(open_stream_dst(&config, None, &db, "old", "replace", true, false, false, false,
+            &cols, &[], false, "", &ConnType::Mysql, "source", Some(&bad), Some(&source_mode)).await.is_err());
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM `{db}`.`old` WHERE id=42")).fetch_one(&mut conn).await.unwrap();
+        assert_eq!(count, 1);
+        sqlx::query(&format!("CREATE TABLE `{db}`.`dependent` (id int PRIMARY KEY, FOREIGN KEY (id) REFERENCES `{db}`.`old`(id) ON DELETE CASCADE)"))
+            .execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("INSERT INTO `{db}`.`dependent` VALUES (42)")).execute(&mut conn).await.unwrap();
+        let error = open_stream_dst(&config, None, &db, "old", "truncate", false, true, false, true,
+            &cols, &[], false, "", &ConnType::Mysql, "source", None, Some(&source_mode)).await.err().expect("must reject cascading clear");
+        assert!(error.contains("外键引用"), "{error}");
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM `{db}`.`dependent` WHERE id=42")).fetch_one(&mut conn).await.unwrap();
+        assert_eq!(count, 1);
+        sqlx::query(&format!("DROP DATABASE `{db}`")).execute(&mut conn).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+#[path = "publication_disconnect_tests.rs"]
+mod publication_disconnect_tests;
+
+#[cfg(test)]
+mod publication_acceptance_tests {
+    use super::*;
+    #[tokio::test]
+    #[ignore = "requires explicitly disposable local MySQL DBTERM_TEST_MYSQL_PORT"]
+    async fn real_mysql_delete_commit_disconnect_checks_complete_batch_and_unknown_receipt() {
+        super::super::query::commit_disconnect_tests::assert_mysql_batch_commit_faults(false, |config, db| async move {
+            mysql_delete_rows(&config, None, &db, "t", &["id".into()], &[vec![Some("1".into())],vec![Some("2".into())]]).await
+        }).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicitly selected disposable local MySQL: DBTERM_TEST_MYSQL_PORT"]
+    async fn real_mysql_publish_rejects_stage_charset_and_concurrent_target_ddl_changes() {
+        let port: u16 = std::env::var("DBTERM_TEST_MYSQL_PORT").expect("disposable port required").parse().unwrap();
+        let config: ConnConfig = serde_json::from_value(serde_json::json!({
+            "id":"publication-acceptance","name":"disposable","type":"mysql",
+            "host":"127.0.0.1","port":port,"username":"root","useSsl":false,"createdAt":0,"updatedAt":0
+        })).unwrap();
+        let (mut conn, _) = mysql_connect(&config, None).await.unwrap();
+        let db = format!("dbterm_publish_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE `{db}` DEFAULT CHARSET=latin1")).execute(&mut conn).await.unwrap();
+        let source = mysql_qualified(&db, "source");
+        let target = mysql_qualified(&db, "target");
+        sqlx::query(&format!("CREATE TABLE {source} (id int PRIMARY KEY, v varchar(24) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")).execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("CREATE TABLE {target} LIKE {source}")).execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("INSERT INTO {target} VALUES (42,'preserve')")).execute(&mut conn).await.unwrap();
+        let raw = mysql_read_ddl(&mut conn, &source).await.unwrap();
+        let original = mysql_read_ddl(&mut conn, &target).await.unwrap();
+        let mode: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut conn).await.unwrap();
+        for alter_stage in [true, false] {
+            let mut setup = open_stream_dst(&config, None, &db, "target", "replace", true, false, false, false,
+                &[], &[], false, "", &ConnType::Mysql, "source", Some(&raw), Some(&mode)).await.unwrap().unwrap();
+            let backup = setup.publication.as_ref().unwrap().backup_q.clone().unwrap();
+            let changed_target = if alter_stage {
+                sqlx::query(&format!("ALTER TABLE {} MODIFY COLUMN v varchar(24) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL", setup.dst_q)).execute(&mut conn).await.unwrap();
+                original.clone()
+            } else {
+                sqlx::query(&format!("ALTER TABLE {target} ADD COLUMN concurrent_note int NOT NULL DEFAULT 7")).execute(&mut conn).await.unwrap();
+                mysql_read_ddl(&mut conn, &target).await.unwrap()
+            };
+            let error = stream_finish(&mut setup, false, false).await.unwrap_err();
+            assert!(error.contains(if alter_stage { "结构校验失败" } else { "目标结构发生变化" }), "{error}");
+            assert_eq!(mysql_read_ddl(&mut conn, &target).await.unwrap(), changed_target, "failed publication must not rewrite the destination");
+            let value: String = sqlx::query_scalar(&format!("SELECT v FROM {target} WHERE id=42")).fetch_one(&mut conn).await.unwrap();
+            assert_eq!(value, "preserve");
+            assert!(mysql_read_ddl(&mut conn, &backup).await.is_err(), "publication failure must not rename original into backup");
+            assert_eq!(mysql_read_ddl(&mut conn, &source).await.unwrap(), raw, "source definition must remain unchanged");
+            drop(setup);
+        }
+        sqlx::query(&format!("DROP DATABASE `{db}`")).execute(&mut conn).await.unwrap();
+    }
+}
+
+/// 建立流式写入目标；None 表示跳过已存在的目标表。
 #[allow(clippy::too_many_arguments)]
-/// MySQL 8.0 的 `_0900_` 系列 collation（基于 Unicode 9.0.0）在 MySQL 5.7 / MariaDB 上不存在；
-/// 降级到最接近的通用兼容版本，防止跨版本迁移时 DDL 建表失败（1273 Unknown collation）。
-fn compat_mysql_collation(s: &str) -> String {
-    const MAP: &[(&str, &str)] = &[
-        ("utf8mb4_0900_ai_ci",  "utf8mb4_unicode_ci"),
-        ("utf8mb4_0900_ai_cs",  "utf8mb4_unicode_ci"),
-        ("utf8mb4_0900_as_ci",  "utf8mb4_unicode_ci"),
-        ("utf8mb4_0900_as_cs",  "utf8mb4_bin"),
-        ("utf8mb4_0900_bin",    "utf8mb4_bin"),
-        ("utf8_0900_ai_ci",     "utf8_unicode_ci"),
-        ("utf8_0900_ai_cs",     "utf8_unicode_ci"),
-        ("utf8_0900_as_ci",     "utf8_unicode_ci"),
-        ("utf8_0900_as_cs",     "utf8_bin"),
-        ("utf8_0900_bin",       "utf8_bin"),
-        // MySQL 8.4 引入的新 uca1400 系列（MariaDB 暂不支持）
-        ("utf8mb4_uca1400_ai_ci", "utf8mb4_unicode_ci"),
-        ("utf8mb4_uca1400_as_cs", "utf8mb4_bin"),
-    ];
-    let mut out = s.to_string();
-    for (from, to) in MAP { out = out.replace(from, to); }
-    out
-}
-
-/// 把源端 SHOW CREATE TABLE 的输出改名到目标表，并剥掉外键约束。
-/// - 保留：列类型、主键、索引、AUTO_INCREMENT、ENGINE/字符集等
-/// - 剥外键：与「覆盖重建丢失外键」既有约定一致，且避免目标库依赖顺序导致建表失败
-/// - 降级 collation：MySQL 8.0 的 _0900_ 系列在 MySQL 5.7 / MariaDB 上不支持，自动替换
-fn mysql_apply_ddl(raw: &str, dst_q: &str) -> String {
-    let mut def_lines: Vec<String> = Vec::new();
-    let mut footer: Option<String> = None;
-    for line in raw.lines().skip(1) {  // 跳过首行 `CREATE TABLE \`name\` (`
-        let t = line.trim_start();
-        if t.starts_with(')') { footer = Some(compat_mysql_collation(line)); break; }
-        if t.starts_with("CONSTRAINT") && t.contains("FOREIGN KEY") { continue; }
-        if t.starts_with("FOREIGN KEY") { continue; }
-        def_lines.push(compat_mysql_collation(line.trim_end()));
-    }
-    // 剥外键后最后一行定义可能悬空逗号，去掉
-    if let Some(last) = def_lines.last_mut() {
-        if last.ends_with(',') { last.pop(); }
-    }
-    let footer = footer.unwrap_or_else(|| ")".to_string());
-    format!("CREATE TABLE {dst_q} (\n{}\n{}", def_lines.join("\n"), footer)
-}
-
 async fn open_stream_dst(
     dst_config: &ConnConfig, dst_pwd: Option<&str>,
     dst_schema: &str, dst_table: &str,
@@ -4219,13 +6163,36 @@ async fn open_stream_dst(
     disable_fk: bool, use_tx: bool,
     col_names: &[String], col_types: &[String],
     can_like: bool, src_like_q: &str, src_type: &ConnType,
-    native_ddl: Option<&str>,
+    src_table: &str, native_ddl: Option<&str>, source_sql_mode: Option<&str>,
 ) -> Result<Option<DstSetup>, String> {
     let truncate_needs_exist = |exists: bool| (strategy == "truncate" || (strategy == "append" && !do_structure)) && !exists;
     let need_ddl = |exists: bool| do_structure && (strategy == "replace" || (strategy == "skip" && !exists));
     match dst_config.conn_type {
         ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => {
             let (mut conn, g) = mysql_connect(dst_config, dst_pwd).await?;
+            let source_mode = source_sql_mode.ok_or("源表 DDL 缺少对应会话 SQL 模式，已在修改目标前中止")?;
+            let target_mode: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut conn).await.map_err(|e| format!("读取迁移目标会话模式失败: {e}"))?;
+            validate_schema_sql_modes(source_mode, &target_mode)?;
+            // Bound lock waits rather than leaving the UI waiting indefinitely.
+            sqlx::query("SET SESSION lock_wait_timeout=30, SESSION innodb_lock_wait_timeout=30").execute(&mut conn).await
+                .map_err(|e| format!("设置目标锁等待上限失败: {e}"))?;
+            // 在实际执行连接上校验，不能依赖另一条预检查连接或实例默认值。
+            sqlx::query("SET SESSION FOREIGN_KEY_CHECKS=1").execute(&mut conn).await
+                .map_err(|e| format!("开启目标外键检查失败: {e}"))?;
+            let fk_checks: i64 = sqlx::query_scalar("SELECT @@SESSION.foreign_key_checks")
+                .fetch_one(&mut conn).await.map_err(|e| format!("核验目标外键检查失败: {e}"))?;
+            if fk_checks != 1 { return Err("目标外键检查未开启，已中止迁移".into()); }
+            if use_tx {
+                let mode: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode")
+                    .fetch_one(&mut conn).await.map_err(|e| format!("检查写连接严格模式失败: {e}"))?;
+                if !mode.split(',').any(|m| matches!(m, "STRICT_TRANS_TABLES" | "STRICT_ALL_TABLES")) {
+                    return Err("实际写连接未开启严格模式，已在修改目标前中止".into());
+                }
+            }
+            sqlx::query("SET time_zone = '+00:00'").execute(&mut conn).await
+                .map_err(|e| format!("设置目标时间会话失败: {e}"))?;
+            sqlx::query("SET SESSION sql_mode = CONCAT(@@SESSION.sql_mode, ',NO_AUTO_VALUE_ON_ZERO')").execute(&mut conn).await
+                .map_err(|e| format!("设置零值自增保护失败: {e}"))?;
             let dst_q = if dst_schema.is_empty() { q_mysql(dst_table) } else { format!("{}.{}", q_mysql(dst_schema), q_mysql(dst_table)) };
             // 用 INFORMATION_SCHEMA 判断目标表是否存在（避免 SELECT 权限不足时误判）
             let sch = if dst_schema.is_empty() { "DATABASE()".to_string() } else { format!("'{}'", dst_schema.replace('\'', "\\'")) };
@@ -4233,55 +6200,69 @@ async fn open_stream_dst(
                 "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA={sch} AND TABLE_NAME='{}'",
                 dst_table.replace('\'', "\\'")
             );
-            let exists: bool = sqlx::query_scalar::<_, i64>(&exists_sql).fetch_one(&mut conn).await.unwrap_or(0) > 0;
+            let exists: bool = sqlx::query_scalar::<_, i64>(&exists_sql).fetch_one(&mut conn).await
+                .map_err(|e| format!("确认目标表是否存在失败: {e}"))? > 0;
             if strategy == "skip" && exists { return Ok(None); }
             if truncate_needs_exist(exists) { return Err(format!("目标表不存在，{}策略要求目标表已存在", if strategy == "truncate" { "截断" } else { "追加" })); }
-            // replace 策略：先把旧表 RENAME 为备份，建新表失败时自动恢复，避免旧数据丢失
-            let mut bak_q: Option<String> = None;
+            if exists && (clear_before_insert || (do_structure && strategy == "replace")) {
+                let dependency_schema = if dst_schema.is_empty() {
+                    sqlx::query_scalar::<_, String>("SELECT DATABASE()").fetch_one(&mut conn).await
+                        .map_err(|e| format!("读取目标数据库失败: {e}"))?
+                } else { dst_schema.to_string() };
+                let referenced: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE WHERE REFERENCED_TABLE_SCHEMA=? AND REFERENCED_TABLE_NAME=?")
+                    .bind(&dependency_schema).bind(dst_table).fetch_one(&mut conn).await
+                    .map_err(|e| format!("检查实际目标外键依赖失败: {e}"))?;
+                if referenced > 0 {
+                    return Err("目标表被外键引用，清空或重建可能影响其他表，已保留原表并中止".into());
+                }
+            }
+            let mut write_q = dst_q.clone();
+            let mut publication = None;
             if need_ddl(exists) {
-                if strategy == "replace" && exists {
-                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-                    let bak_name = format!("__mig_bak_{}_{}", dst_table, ts);
-                    let bq = if dst_schema.is_empty() { q_mysql(&bak_name) } else { format!("{}.{}", q_mysql(dst_schema), q_mysql(&bak_name)) };
-                    let _ = sqlx::query(&tag_sql(&format!("DROP TABLE IF EXISTS {bq}"))).execute(&mut conn).await;
-                    sqlx::query(&tag_sql(&format!("RENAME TABLE {dst_q} TO {bq}"))).execute(&mut conn).await
-                        .map_err(|e| format!("备份旧表失败（可能权限不足 RENAME）: {e}"))?;
-                    bak_q = Some(bq);
-                } else if strategy == "replace" {
-                    // 目标表不存在，无需备份，也无需 DROP
-                }
-                // CREATE TABLE ... LIKE 需要 SELECT 权限；失败时降级到 DDL/列定义方式
-                let mut create_ok = false;
-                if can_like {
-                    create_ok = sqlx::query(&tag_sql(&format!("CREATE TABLE {dst_q} LIKE {src_like_q}"))).execute(&mut conn).await.is_ok();
-                }
-                if !create_ok {
-                    let r = if let Some(raw) = native_ddl {
-                        sqlx::query(&tag_sql(&mysql_apply_ddl(raw, &dst_q))).execute(&mut conn).await
-                            .map(|_| ()).map_err(|e| format!("创建目标表失败: {e}"))
-                    } else if !col_types.is_empty() {
-                        create_mysql_table_mapped(&mut conn, &dst_q, col_names, col_types).await
-                    } else {
-                        create_mysql_table_from_columns(&mut conn, &dst_q, col_names).await
-                    };
-                    if let Err(e) = r {
-                        // 建表失败 → 把备份 RENAME 回原表，确保旧数据不丢
-                        if let Some(ref bq) = bak_q {
-                            let _ = sqlx::query(&tag_sql(&format!("RENAME TABLE {bq} TO {dst_q}"))).execute(&mut conn).await;
-                        }
-                        return Err(e);
-                    }
+                let raw = native_ddl.ok_or("源表原始 DDL 不可用，已在修改目标前中止")?;
+                let original_ddl = if exists {
+                    Some(mysql_read_ddl(&mut conn, &dst_q).await?)
+                } else { None };
+                let stage_name = format!("__dbterm_stage_{}", uuid::Uuid::new_v4().simple());
+                write_q = mysql_qualified(dst_schema, &stage_name);
+                let expected_ddl = mysql_apply_ddl(raw, src_table, &write_q)?;
+                create_mysql_verified(&mut conn, &expected_ddl, &write_q, &stage_name).await?;
+                publication = Some(MySqlPublication {
+                    final_q: dst_q.clone(), final_name: dst_table.to_string(), stage_name,
+                    backup_q: exists.then(|| mysql_qualified(dst_schema, &format!("__dbterm_backup_{}", uuid::Uuid::new_v4().simple()))),
+                    expected_ddl, original_ddl, content: None, expected_rows: None, raw_content: None, schema: if dst_schema.is_empty() {
+                        sqlx::query_scalar::<_, String>("SELECT DATABASE()").fetch_one(&mut conn).await.map_err(|e| e.to_string())?
+                    } else { dst_schema.to_string() },
+                });
+            }
+            if use_tx {
+                sqlx::Executor::execute(&mut conn, sqlx::raw_sql("START TRANSACTION")).await
+                    .map_err(|e| format!("开启目标事务失败；目标原表未替换，暂存表 {write_q}: {e}"))?;
+            }
+            // Acquire metadata lock on the actual writing connection, then revalidate.
+            sqlx::query(&format!("SELECT * FROM {write_q} LIMIT 0"))
+                .fetch_all(&mut conn).await.map_err(|e| format!("锁定实际目标元数据失败: {e}"))?;
+            let dependency_schema = if dst_schema.is_empty() {
+                sqlx::query_scalar::<_, String>("SELECT DATABASE()").fetch_one(&mut conn).await.map_err(|e| e.to_string())?
+            } else { dst_schema.to_string() };
+            if publication.is_none() {
+                mysql_validate_live_table(&mut conn, &dependency_schema, dst_table, use_tx, clear_before_insert).await?;
+                let raw = native_ddl.ok_or("仅数据迁移缺少源端完整定义，已在写入前中止")?;
+                let actual = mysql_read_ddl(&mut conn, &dst_q).await?;
+                if mysql_apply_ddl(raw, src_table, &dst_q)? != mysql_apply_ddl(&actual, dst_table, &dst_q)? {
+                    return Err("实际写连接上的源目标完整定义不一致，已在修改数据前中止".into());
                 }
             }
-            if disable_fk { let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=0").execute(&mut conn).await; }
-            if use_tx { sqlx::query("START TRANSACTION").execute(&mut conn).await.map_err(|e| format!("开启事务失败: {e}"))?; }
-            // MySQL TRUNCATE 是 DDL，会隐式提交事务无法回滚；事务模式改用 DELETE FROM（可回滚）
             if clear_before_insert {
-                let clear_sql = if use_tx { format!("DELETE FROM {dst_q}") } else { format!("TRUNCATE TABLE {dst_q}") };
-                sqlx::query(&tag_sql(&clear_sql)).execute(&mut conn).await.map_err(|e| format!("清空目标表失败: {e}"))?;
+                if !use_tx { return Err("清空目标必须在事务内执行".into()); }
+                sqlx::query(&tag_sql(&format!("DELETE FROM {write_q}"))).execute(&mut conn).await
+                    .map_err(|e| format!("事务内清空目标失败: {e}"))?;
             }
-            Ok(Some(DstSetup { dst: StreamDst::My(conn, g), dst_q: dst_q.clone(), pg_pk: vec![], bak_q, orig_q: Some(dst_q) }))
+            Ok(Some(DstSetup { dst: StreamDst::My(conn, g), dst_q: write_q, pg_pk: vec![],
+                bak_q: None, orig_q: None, pg_created_oid: None,
+                mysql_numeric_columns: col_names.iter().zip(col_types).filter(|(_,typ)| mysql_numeric_label_type(typ)).map(|(name,_)|name.clone()).collect(), verify_all_rows: publication.is_some() || clear_before_insert, publication }))
         }
+
         ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
             use sqlx::Row;
             let (mut conn, g) = pg_connect(dst_config, dst_pwd).await?;
@@ -4297,12 +6278,21 @@ async fn open_stream_dst(
             let mut pg_bak_q: Option<String> = None;
             if need_ddl(exists) {
                 if strategy == "replace" && exists {
+                    let incoming_fk: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM pg_catalog.pg_constraint WHERE contype='f' AND confrelid=to_regclass($1)"
+                    ).bind(&dst_q).fetch_one(&mut conn).await
+                        .map_err(|e| format!("无法核验目标表的外键依赖，未修改目标: {e}"))?;
+                    if incoming_fk > 0 {
+                        return Err("目标表被其他表外键引用；PostgreSQL替换会让依赖继续指向旧表，已拒绝替换".into());
+                    }
                     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
                     let bak_name = format!("__mig_bak_{}_{}", dst_table, ts);
                     let bq = format!("{}.{}", q_dq(&ds), q_dq(&bak_name));
-                    let _ = sqlx::query(&tag_sql(&format!("DROP TABLE IF EXISTS {bq}"))).execute(&mut conn).await;
+                    let backup_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL").bind(&bq).fetch_one(&mut conn).await
+                        .map_err(|e| format!("无法确认迁移备份名是否空闲，未触碰原表: {e}"))?;
+                    if backup_exists { return Err(format!("迁移备份表 {bq} 已存在；为保护旧数据，拒绝删除或覆盖")); }
                     sqlx::query(&tag_sql(&format!("ALTER TABLE {dst_q} RENAME TO {}", q_dq(&bak_name)))).execute(&mut conn).await
-                        .map_err(|e| format!("备份旧表失败: {e}"))?;
+                        .map_err(|e| format!("备份旧表操作未获确认；请核对目标 {dst_q} 和备份 {bq}，勿盲目重试: {e}"))?;
                     pg_bak_q = Some(bq);
                 }
                 let create_result = if can_like {
@@ -4312,19 +6302,46 @@ async fn open_stream_dst(
                     create_pg_table_mapped(&mut conn, &dst_q, col_names, col_types).await
                 };
                 if let Err(e) = create_result {
-                    if let Some(ref bq) = pg_bak_q {
-                        let _ = sqlx::query(&tag_sql(&format!("ALTER TABLE {bq} RENAME TO {}", q_dq(dst_table)))).execute(&mut conn).await;
-                    }
-                    return Err(e);
+                    return match pg_restore_backup(&mut conn, pg_bak_q.as_deref(), &dst_q, dst_table, None).await {
+                        Ok(()) => Err(e),
+                        Err(recovery) => Err(format!("{e}；{recovery}")),
+                    };
                 }
             }
-            let pg_pk: Vec<String> = sqlx::query(
+            let pg_created_oid = if need_ddl(exists) {
+                match pg_relation_oid(&mut conn, &dst_q).await {
+                    Ok(Some(oid)) => Some(oid),
+                    Ok(None) => return Err(pg_abort_replace_setup(&mut conn, pg_bak_q.as_deref(), &dst_q, dst_table, None,
+                        "新建目标表未出现在 PostgreSQL 目录中".into()).await),
+                    Err(error) => return Err(pg_abort_replace_setup(&mut conn, pg_bak_q.as_deref(), &dst_q, dst_table, None, error).await),
+                }
+            } else { None };
+            let pg_pk_rows = match sqlx::query(
                 "SELECT kcu.column_name FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name=kcu.constraint_name AND tc.table_schema=kcu.table_schema WHERE tc.constraint_type='PRIMARY KEY' AND tc.table_schema=$1 AND tc.table_name=$2 ORDER BY kcu.ordinal_position"
-            ).bind(&ds).bind(dst_table).fetch_all(&mut conn).await.ok()
-             .map(|rs| rs.iter().filter_map(|r| r.try_get::<String, _>(0).ok()).collect()).unwrap_or_default();
-            if use_tx { sqlx::query("BEGIN").execute(&mut conn).await.map_err(|e| format!("开启事务失败: {e}"))?; }
-            if clear_before_insert { sqlx::query(&tag_sql(&format!("TRUNCATE TABLE {dst_q}"))).execute(&mut conn).await.map_err(|e| format!("清空目标表失败: {e}"))?; }
-            Ok(Some(DstSetup { dst: StreamDst::Pg(conn, g), dst_q: dst_q.clone(), pg_pk, bak_q: pg_bak_q, orig_q: Some(dst_q) }))
+            ).bind(&ds).bind(dst_table).fetch_all(&mut conn).await {
+                Ok(rows) => rows,
+                Err(e) => return Err(pg_abort_replace_setup(&mut conn, pg_bak_q.as_deref(), &dst_q, dst_table,
+                    pg_created_oid, format!("读取目标主键失败: {e}")).await),
+            };
+            let pg_pk: Vec<String> = match pg_pk_rows.iter().map(|row| row.try_get::<String, _>(0).map_err(|e| e.to_string())).collect() {
+                Ok(keys) => keys,
+                Err(e) => return Err(pg_abort_replace_setup(&mut conn, pg_bak_q.as_deref(), &dst_q, dst_table,
+                    pg_created_oid, format!("解析目标主键失败: {e}")).await),
+            };
+            if use_tx {
+                if let Err(e) = sqlx::query("BEGIN").execute(&mut conn).await {
+                    return Err(pg_abort_replace_setup(&mut conn, pg_bak_q.as_deref(), &dst_q, dst_table,
+                        pg_created_oid, format!("开启事务失败: {e}")).await);
+                }
+            }
+            if clear_before_insert {
+                if let Err(e) = sqlx::query(&tag_sql(&format!("TRUNCATE TABLE {dst_q}"))).execute(&mut conn).await {
+                    let rollback = if use_tx { sqlx::query("ROLLBACK").execute(&mut conn).await.err().map(|e| format!("事务回滚未确认: {e}")) } else { None };
+                    let reason = rollback.map_or_else(|| format!("清空目标表失败: {e}"), |r| format!("清空目标表失败: {e}；{r}"));
+                    return Err(pg_abort_replace_setup(&mut conn, pg_bak_q.as_deref(), &dst_q, dst_table, pg_created_oid, reason).await);
+                }
+            }
+            Ok(Some(DstSetup { dst: StreamDst::Pg(conn, g), dst_q: dst_q.clone(), pg_pk, bak_q: pg_bak_q, orig_q: Some(dst_q), publication: None, pg_created_oid, verify_all_rows: false, mysql_numeric_columns: vec![] }))
         }
         ConnType::Sqlite => {
             use crate::commands::query::sqlite_url;
@@ -4365,7 +6382,7 @@ async fn open_stream_dst(
             if disable_fk { let _ = sqlx::query("PRAGMA foreign_keys=OFF").execute(&mut conn).await; }
             if use_tx { sqlx::query("BEGIN").execute(&mut conn).await.map_err(|e| format!("开启事务失败: {e}"))?; }
             if clear_before_insert { sqlx::query(&format!("DELETE FROM {dst_q}")).execute(&mut conn).await.map_err(|e| format!("清空目标表失败: {e}"))?; }
-            Ok(Some(DstSetup { dst: StreamDst::Lite(conn), dst_q: dst_q.clone(), pg_pk: vec![], bak_q: lite_bak_q, orig_q: Some(dst_q) }))
+            Ok(Some(DstSetup { dst: StreamDst::Lite(conn), dst_q: dst_q.clone(), pg_pk: vec![], bak_q: lite_bak_q, orig_q: Some(dst_q), publication: None, pg_created_oid: None, verify_all_rows: false, mysql_numeric_columns: vec![] }))
         }
         _ => Err("目标连接类型不支持流式迁移".into()),
     }
@@ -4381,7 +6398,7 @@ async fn stream_write_chunk(
     match &mut setup.dst {
         StreamDst::My(conn, _) => {
             let col_list = col_names.iter().map(|c| q_mysql(c)).collect::<Vec<_>>().join(", ");
-            let row_ph = (0..col_names.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+            let row_ph = col_names.iter().map(|name| if setup.mysql_numeric_columns.contains(name) { "CAST(? AS UNSIGNED)" } else { "?" }).collect::<Vec<_>>().join(", ");
             let verb = if conflict == "ignore" { "INSERT IGNORE INTO" } else { "INSERT INTO" };
             let dup = if conflict == "upsert" {
                 let sets = col_names.iter().map(|c| { let qc = q_mysql(c); format!("{qc}=VALUES({qc})") }).collect::<Vec<_>>().join(", ");
@@ -4400,6 +6417,10 @@ async fn stream_write_chunk(
                 let sql = tag_sql(&format!("{verb} {dst} ({col_list}) VALUES {all_ph}{dup}"));
                 let mut q = sqlx::query(&sql); for r in chunk { for v in r { q = q.bind(v.as_deref()); } }
                 q.execute(&mut *conn).await.map_err(|e| format!("批量写入失败: {e}"))?;
+                use sqlx::Row;
+                let warnings: u64 = sqlx::Executor::fetch_one(&mut *conn, "SHOW COUNT(*) WARNINGS").await
+                    .map_err(|e| format!("核验迁移写入警告失败: {e}"))?.try_get(0).map_err(|e| format!("解析迁移写入警告失败: {e}"))?;
+                if warnings > 0 { return Err("迁移写入产生数据库警告，拒绝提交以防静默转换".into()); }
                 Ok((chunk.len() as u64, 0))
             }
         }
@@ -4447,10 +6468,247 @@ async fn stream_write_chunk(
     }
 }
 
+/// Order-independent SHA-256 multiset fingerprint. Includes NULL and byte lengths.
+#[derive(Default, Debug, PartialEq)]
+struct TransferDigest { rows: u64, sum: [u64; 4] }
+impl TransferDigest {
+    fn add(&mut self, row: &[Option<String>]) {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update((row.len() as u64).to_le_bytes());
+        for cell in row {
+            match cell {
+                None => hash.update([0]),
+                Some(s) => { hash.update([1]); hash.update((s.len() as u64).to_le_bytes()); hash.update(s.as_bytes()); }
+            }
+        }
+        let digest = hash.finalize();
+        for (i, bytes) in digest.chunks_exact(8).enumerate() {
+            self.sum[i] = self.sum[i].wrapping_add(u64::from_le_bytes(bytes.try_into().unwrap()));
+        }
+        self.rows += 1;
+    }
+}
+
+async fn mysql_verify_staged_content(setup: &mut DstSetup, columns: &[String], expected: &TransferDigest) -> Result<(), String> {
+    if let StreamDst::My(conn, _) = &mut setup.dst {
+        mysql_verify_content(conn, &setup.dst_q, columns, expected).await?;
+    }
+    Ok(())
+}
+
+async fn mysql_verify_content(conn: &mut sqlx::mysql::MySqlConnection, target: &str, columns: &[String], expected: &TransferDigest) -> Result<(), String> {
+    use futures::TryStreamExt;
+    let mysql_numeric_columns=mysql_numeric_columns_for_target(conn,target,columns).await?;
+        let names = if columns.is_empty() { "1".into() } else { columns.iter().map(|c| mysql_migration_scalar(q_mysql(c).as_str(),mysql_numeric_columns.contains(c))).collect::<Vec<_>>().join(",") };
+        let sql = format!("SELECT {names} FROM {target}");
+        let mut rows = sqlx::query(&sql).fetch(conn);
+        let mut actual = TransferDigest::default();
+        while let Some(row) = rows.try_next().await.map_err(|e| format!("读取暂存数据校验失败: {e}"))? {
+            actual.add(&mysql_transfer_row(&row).map_err(|e| format!("解析暂存数据校验失败: {e}"))?);
+        }
+        if actual != *expected { return Err("暂存表行数或内容指纹不一致，已拒绝发布目标".into()); }
+    Ok(())
+}
+
+/// Hash protocol bytes, not String casts: copies retain BLOB, BIT, float and zero dates.
+async fn mysql_raw_content_digest(conn: &mut sqlx::mysql::MySqlConnection, table: &str, columns: &[String]) -> Result<TransferDigest, String> {
+    use futures::TryStreamExt;
+    use sqlx::{Decode, MySql, Row};
+    use sha2::{Digest, Sha256};
+    let names = columns.iter().map(|c| q_mysql(c)).collect::<Vec<_>>().join(",");
+    if names.is_empty() { return Err("复制内容校验字段不能为空".into()); }
+    let sql = format!("SELECT {names} FROM {table}");
+    let mut rows = sqlx::query(&sql).fetch(conn);
+    let mut out = TransferDigest::default();
+    while let Some(row) = rows.try_next().await.map_err(|e| format!("读取复制原始内容失败: {e}"))? {
+        let mut hash = Sha256::new();
+        hash.update((row.len() as u64).to_le_bytes());
+        for i in 0..row.len() {
+            let raw = row.try_get_raw(i).map_err(|e| format!("读取复制原始字段失败: {e}"))?;
+            // Bypass Option's is_null: SQLx treats binary zero dates as NULL.
+            match <&[u8] as Decode<MySql>>::decode(raw) {
+                Ok(bytes) => { hash.update([1]); hash.update((bytes.len() as u64).to_le_bytes()); hash.update(bytes); }
+                Err(error) if error.is::<sqlx::error::UnexpectedNullError>() => hash.update([0]),
+                Err(error) => return Err(format!("解码复制原始字段失败: {error}")),
+            }
+        }
+        let digest = hash.finalize();
+        for (i, bytes) in digest.chunks_exact(8).enumerate() {
+            out.sum[i] = out.sum[i].wrapping_add(u64::from_le_bytes(bytes.try_into().unwrap()));
+        }
+        out.rows += 1;
+    }
+    Ok(out)
+}
+
+fn mysql_qualified(schema: &str, table: &str) -> String {
+    if schema.is_empty() { q_mysql(table) } else { format!("{}.{}", q_mysql(schema), q_mysql(table)) }
+}
+
+fn mysql_numeric_label_type(typ: &str) -> bool {
+    let name = typ.split('(').next().unwrap_or(typ).trim();
+    name.eq_ignore_ascii_case("enum") || name.eq_ignore_ascii_case("set")
+}
+fn mysql_migration_scalar(quoted: &str, numeric: bool) -> String {
+    if numeric {
+        format!("CAST(CAST({quoted} AS UNSIGNED) AS CHAR CHARACTER SET utf8mb4)")
+    } else {
+        format!("CAST({quoted} AS CHAR CHARACTER SET utf8mb4)")
+    }
+}
+fn mysql_migration_projection(names: &[String], types: &[String]) -> Result<String, String> {
+    if names.len() != types.len() {
+        return Err("源字段名称和类型数量不一致，已拒绝迁移".into());
+    }
+    Ok(names
+        .iter()
+        .zip(types)
+        .map(|(n, t)| {
+            format!(
+                "{} AS {}",
+                mysql_migration_scalar(&q_mysql(n), mysql_numeric_label_type(t)),
+                q_mysql(n)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", "))
+}
+async fn mysql_numeric_columns_for_target(
+    conn: &mut sqlx::mysql::MySqlConnection,
+    target: &str,
+    columns: &[String],
+) -> Result<Vec<String>, String> {
+    use sqlx::Row;
+    // Protocol TypeInfo can call ENUM/SET CHAR; SHOW COLUMNS retains the declaration.
+    let rows = sqlx::query(&format!("SHOW COLUMNS FROM {target}"))
+        .fetch_all(conn)
+        .await
+        .map_err(|e| format!("读取目标字段类型失败: {e}"))?;
+    let mut numeric = Vec::new();
+    let mut found = std::collections::HashSet::new();
+    for row in rows {
+        let name: String = row
+            .try_get(0)
+            .map_err(|e| format!("解析目标字段名失败: {e}"))?;
+        let typ: String = row
+            .try_get::<String,_>(1).or_else(|_| row.try_get::<Vec<u8>,_>(1).and_then(|bytes| String::from_utf8(bytes).map_err(|e|sqlx::Error::Decode(Box::new(e)))))
+            .map_err(|e| format!("解析目标字段类型失败: {e}"))?;
+        if columns.contains(&name) {
+            found.insert(name.clone());
+            if mysql_numeric_label_type(&typ) {
+                numeric.push(name);
+            }
+        }
+    }
+    if found.len() != columns.len() {
+        return Err("目标校验字段元数据不完整，已拒绝发布".into());
+    }
+    Ok(numeric)
+}
+
+fn mysql_transfer_row(row: &sqlx::mysql::MySqlRow) -> Result<Vec<Option<String>>, sqlx::Error> {
+    use sqlx::Row;
+    (0..row.len()).map(|i| row.try_get::<Option<String>, _>(i)).collect()
+}
+
+fn pg_commit_outcome_unknown(error: &str) -> bool {
+    error.starts_with("提交事务失败:")
+}
+
+async fn mysql_read_ddl(conn: &mut sqlx::mysql::MySqlConnection, table: &str) -> Result<String, String> {
+    use sqlx::Row;
+    sqlx::query(&format!("SHOW CREATE TABLE {table}")).fetch_one(conn).await
+        .map_err(|e| format!("读取完整表定义失败: {e}"))?.try_get(1).map_err(|e| format!("解析完整表定义失败: {e}"))
+}
+
+async fn mysql_validate_live_table(conn: &mut sqlx::mysql::MySqlConnection, schema: &str, table: &str,
+    require_innodb: bool, reject_incoming_fk: bool) -> Result<(), String> {
+    use sqlx::Row;
+    let row = sqlx::query("SELECT CAST(ENGINE AS CHAR CHARACTER SET utf8mb4),CAST(TABLE_TYPE AS CHAR CHARACTER SET utf8mb4) FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?")
+        .bind(schema).bind(table).fetch_one(&mut *conn).await.map_err(|e| format!("核验实际表类型失败: {e}"))?;
+    let engine: Option<String> = row.try_get(0).map_err(|e| e.to_string())?;
+    let kind: String = row.try_get(1).map_err(|e| e.to_string())?;
+    if kind != "BASE TABLE" || require_innodb && engine.as_deref() != Some("InnoDB") {
+        return Err("实际表不满足普通表/InnoDB 安全条件，已拒绝迁移".into());
+    }
+    super::query::mysql_require_atomic_table(conn, schema, table).await?;
+    let triggers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA=? AND EVENT_OBJECT_TABLE=?")
+        .bind(schema).bind(table).fetch_one(&mut *conn).await.map_err(|e| e.to_string())?;
+    if triggers > 0 { return Err("实际表存在触发器，已拒绝迁移以保护数据".into()); }
+    if reject_incoming_fk {
+        let refs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE WHERE REFERENCED_TABLE_SCHEMA=? AND REFERENCED_TABLE_NAME=?")
+            .bind(schema).bind(table).fetch_one(conn).await.map_err(|e| e.to_string())?;
+        if refs > 0 { return Err("实际目标表被外键引用，已拒绝覆盖或清空".into()); }
+    }
+    Ok(())
+}
+
+async fn mysql_publish(conn: &mut sqlx::mysql::MySqlConnection, stage_q: &str, publish: &MySqlPublication) -> Result<(), String> {
+    let raw = mysql_read_ddl(conn, stage_q).await?;
+    if mysql_apply_ddl(&raw, &publish.stage_name, stage_q)? != publish.expected_ddl {
+        return Err(format!("暂存表结构与源定义不一致，原目标未替换；暂存表 {stage_q}"));
+    }
+    // Block destination writers/DDL while checking and publishing. LOCK TABLES follows
+    // stage COMMIT; a failed publication must never trigger blind restore/drop.
+    let locks = if publish.backup_q.is_some() { format!("LOCK TABLES {} WRITE, {stage_q} WRITE", publish.final_q) }
+        else { format!("LOCK TABLES {stage_q} WRITE") };
+    sqlx::Executor::execute(&mut *conn, sqlx::raw_sql(&locks)).await.map_err(|e| format!("取得发布锁失败，原目标未替换；暂存表 {stage_q}: {e}"))?;
+    let result = async {
+        let locked_ddl = mysql_read_ddl(conn, stage_q).await?;
+        if mysql_apply_ddl(&locked_ddl, &publish.stage_name, stage_q)? != publish.expected_ddl {
+            return Err(format!("发布锁内暂存结构校验失败，原目标未替换；暂存表 {stage_q}"));
+        }
+        mysql_validate_live_table(conn, &publish.schema, &publish.stage_name, publish.content.is_some(), false).await?;
+        if let Some((columns, expected)) = &publish.content {
+            mysql_verify_content(conn, stage_q, columns, expected).await?;
+        }
+        if let Some((columns, expected)) = &publish.raw_content {
+            let actual = mysql_raw_content_digest(conn, stage_q, columns).await?;
+            if actual != *expected { return Err("复制暂存内容发生变化，已拒绝发布正式目标".into()); }
+        }
+        if let Some(expected) = publish.expected_rows {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {stage_q}")).fetch_one(&mut *conn).await.map_err(|e| e.to_string())?;
+            if count < 0 || count as u64 != expected { return Err("复制暂存行数发生变化，已拒绝发布".into()); }
+        }
+        if let Some(expected) = &publish.original_ddl {
+            if mysql_read_ddl(conn, &publish.final_q).await? != *expected {
+                return Err(format!("装载期间目标结构发生变化，拒绝覆盖；暂存表 {stage_q}"));
+            }
+        }
+        if publish.backup_q.is_some() {
+            mysql_validate_live_table(conn, &publish.schema, &publish.final_name, false, true).await?;
+        }
+        let rename = match &publish.backup_q {
+            Some(backup) => format!("RENAME TABLE {} TO {backup}, {stage_q} TO {}", publish.final_q, publish.final_q),
+            None => format!("RENAME TABLE {stage_q} TO {}", publish.final_q),
+        };
+        sqlx::query(&tag_sql(&rename)).execute(&mut *conn).await
+            .map_err(|e| format!("发布未得到成功确认；请检查目标 {}、暂存 {stage_q}、备份 {:?}，禁止盲目重试或删除: {e}", publish.final_q, publish.backup_q))?;
+        let actual = mysql_read_ddl(conn, &publish.final_q).await?;
+        if mysql_apply_ddl(&actual, &publish.final_name, stage_q)? != publish.expected_ddl {
+            return Err(format!("发布后定义不一致，禁止自动恢复覆盖并保留备份 {:?}；需人工核对 {}", publish.backup_q, publish.final_q));
+        }
+        Ok(())
+    }.await;
+    let unlocked = sqlx::Executor::execute(conn, sqlx::raw_sql("UNLOCK TABLES")).await;
+    if let Err(e) = result { return Err(e); }
+    unlocked.map_err(|e| format!("发布已完成但释放锁未确认，需核对目标状态: {e}"))?;
+    Ok(())
+}
+
 async fn stream_finish(setup: &mut DstSetup, use_tx: bool, disable_fk: bool) -> Result<(), String> {
     match &mut setup.dst {
         StreamDst::My(conn, _) => {
-            if use_tx { sqlx::query("COMMIT").execute(&mut *conn).await.map_err(|e| format!("提交事务失败: {e}"))?; }
+            if let Some(p) = &setup.publication {
+                let raw = mysql_read_ddl(conn, &setup.dst_q).await?;
+                if mysql_apply_ddl(&raw, &p.stage_name, &setup.dst_q)? != p.expected_ddl {
+                    return Err("发布前结构校验失败，原目标未替换".into());
+                }
+            }
+            if use_tx { sqlx::Executor::execute(&mut *conn, sqlx::raw_sql("COMMIT")).await
+                .map_err(|e| format!("提交未得到成功确认，结果未知；请核对目标，禁止自动重试: {e}"))?; }
+            if let Some(p) = &setup.publication { mysql_publish(conn, &setup.dst_q, p).await?; }
             if disable_fk { let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1").execute(&mut *conn).await; }
         }
         StreamDst::Pg(conn, _) => { if use_tx { sqlx::query("COMMIT").execute(&mut *conn).await.map_err(|e| format!("提交事务失败: {e}"))?; } }
@@ -4464,10 +6722,22 @@ async fn stream_finish(setup: &mut DstSetup, use_tx: bool, disable_fk: bool) -> 
 
 async fn stream_rollback(setup: &mut DstSetup, use_tx: bool, disable_fk: bool) {
     match &mut setup.dst {
-        StreamDst::My(conn, _) => { if use_tx { let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await; } if disable_fk { let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1").execute(&mut *conn).await; } }
+        StreamDst::My(conn, _) => { if use_tx { let _ = sqlx::Executor::execute(&mut *conn, sqlx::raw_sql("ROLLBACK")).await; } if disable_fk { let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1").execute(&mut *conn).await; } }
         StreamDst::Pg(conn, _) => { if use_tx { let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await; } }
         StreamDst::Lite(conn) => { if use_tx { let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await; } if disable_fk { let _ = sqlx::query("PRAGMA foreign_keys=ON").execute(&mut *conn).await; } }
     }
+}
+
+async fn stream_abort_before_publish(setup: &mut DstSetup, use_tx: bool, disable_fk: bool, error: String) -> String {
+    stream_rollback(setup, use_tx, disable_fk).await;
+    if setup.publication.is_some() {
+        if let StreamDst::My(conn, _) = &mut setup.dst {
+            if let Err(cleanup) = sqlx::query(&format!("DROP TABLE {}", setup.dst_q)).execute(conn).await {
+                return format!("{error}；原目标未替换，暂存表 {} 清理失败: {cleanup}", setup.dst_q);
+            }
+        }
+    }
+    error
 }
 
 /// 驱动一个行流：缓冲到分批阈值后写入，内存与表大小无关
@@ -4484,45 +6754,63 @@ async fn drive_stream(
     let n_cols = col_names.len().max(1);
     let max_rows = ((65535 / n_cols).max(1)).min(batch_usize.max(1));
     let mut buf: Vec<Vec<Option<String>>> = Vec::with_capacity(max_rows);
+    // 行数限制不足以限制 LONGTEXT 批次；达到字节阈值就提前写出。
+    const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
+    let mut buffered_bytes = 0usize;
+    let mut expected_content = TransferDigest::default();
     let (mut migrated, mut failed) = (0u64, 0u64);
-    let errors: Vec<String> = vec![]; // 流式跳过错误行只计数，不逐条收集消息
+    let errors: Vec<String> = setup.publication.as_ref().and_then(|p| p.backup_q.as_ref())
+        .map(|b| vec![format!("旧目标完整保留为备份 {b}；确认业务数据后再手动清理")]).unwrap_or_default();
     let mut read_err: Option<String> = None;
     let mut done = false;
     while !done {
         match stream.try_next().await {
-            Ok(Some(row)) => buf.push(row),
+            Ok(Some(row)) => {
+                expected_content.add(&row);
+                buffered_bytes = buffered_bytes.saturating_add(row.iter().map(|v|
+                    std::mem::size_of::<Option<String>>() + v.as_ref().map_or(0, String::len)
+                ).sum::<usize>());
+                buf.push(row);
+            }
             Ok(None) => done = true,
             Err(e) => { read_err = Some(format!("读取源数据失败: {e}")); break; }
         }
-        if buf.len() >= max_rows || (done && !buf.is_empty()) {
+        if buf.len() >= max_rows || buffered_bytes >= MAX_BATCH_BYTES || (done && !buf.is_empty()) {
             match stream_write_chunk(&mut setup, col_names, conflict, skip_errors, &buf).await {
                 Ok((ok, bad)) => { migrated += ok; failed += bad; }
-                Err(e) => { drop(stream); stream_rollback(&mut setup, use_tx, disable_fk).await; return Err(e); }
+                Err(e) => { drop(stream); return Err(stream_abort_before_publish(&mut setup, use_tx, disable_fk, e).await); }
             }
             buf.clear();
+            buffered_bytes = 0;
             emit("migrating", total_est.max(migrated + failed), migrated);
         }
     }
     drop(stream);
-    if let Some(e) = read_err { stream_rollback(&mut setup, use_tx, disable_fk).await; return Err(e); }
+    if let Some(e) = read_err { return Err(stream_abort_before_publish(&mut setup, use_tx, disable_fk, e).await); }
+    if setup.verify_all_rows {
+        let verified = mysql_verify_staged_content(&mut setup, col_names, &expected_content).await;
+        if let Err(e) = verified { return Err(stream_abort_before_publish(&mut setup, use_tx, disable_fk, e).await); }
+    }
+    if let Some(p) = &mut setup.publication { p.content = Some((col_names.to_vec(), expected_content)); }
     stream_finish(&mut setup, use_tx, disable_fk).await?;
     let total = migrated + failed;
     emit("done", total, migrated);
     Ok(MigrateResult { total_rows: total, migrated_rows: migrated, skipped_rows: 0, failed_rows: failed, elapsed_ms: start.elapsed().as_millis() as u64, errors })
 }
 
-/// 镜像同步 / 影子表建表：同服务器用 CREATE TABLE LIKE 保留完整结构，跨库退化为按列建表
+/// 镜像同步 / 影子表建表：MySQL 同家族用原始 DDL，跨引擎才映射列类型。
 async fn create_mysql_like_or_columns(
     conn: &mut sqlx::mysql::MySqlConnection,
     tbl: &str,
-    same_server: bool,
-    src_q: &str,
     col_names: &[String],
     col_types: &[String],
+    native_ddl: Option<&str>,
+    src_table: &str,
 ) -> Result<(), String> {
-    if same_server {
-        sqlx::query(&tag_sql(&format!("CREATE TABLE {tbl} LIKE {src_q}"))).execute(conn).await
-            .map(|_| ()).map_err(|e| format!("创建表失败: {e}"))
+    if let Some(raw) = native_ddl {
+        let ddl = mysql_apply_ddl(raw, src_table, tbl)?;
+        sqlx::query(&tag_sql(&ddl)).execute(conn).await
+            .map(|_| ()).map_err(|e| format!("按源表原始 DDL 创建目标表失败: {e}"))
     } else if !col_types.is_empty() {
         create_mysql_table_mapped(conn, tbl, col_names, col_types).await
     } else {
@@ -4555,6 +6843,7 @@ const BACKUP_PROGRESS_INTERVAL: u64 = 1_000;
 pub async fn db_logical_backup(
     id:      String,
     schema:  String,
+    ss_schema: Option<String>,
     tables:  Vec<String>,
     // 额外导出的对象（仅 MySQL 系；视图/函数/存储过程导出的是结构）
     views:   Option<Vec<String>>,
@@ -4584,12 +6873,29 @@ pub async fn db_logical_backup(
 
     // 取消标志（复用导出取消机制）
     let cancel_flag: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-    if let Some(ref tid) = task_id {
-        cancel_map.lock().unwrap().insert(tid.clone(), Arc::clone(&cancel_flag));
+    struct BackupCancelGuard {
+        map: crate::commands::db_export::ExportCancelMap,
+        task_id: Option<String>,
+        flag: Arc<AtomicBool>,
     }
+    impl Drop for BackupCancelGuard {
+        fn drop(&mut self) {
+            if let Some(id) = &self.task_id {
+                let mut map = self.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if map.get(id).is_some_and(|flag| Arc::ptr_eq(flag, &self.flag)) { map.remove(id); }
+            }
+        }
+    }
+    if let Some(ref tid) = task_id {
+        let mut map = cancel_map.lock().map_err(|_| "备份取消状态不可用")?;
+        if map.contains_key(tid) { return Err("备份任务 ID 已在使用中".into()); }
+        map.insert(tid.clone(), Arc::clone(&cancel_flag));
+    }
+    let _cancel_guard = BackupCancelGuard { map: Arc::clone(&cancel_map), task_id: task_id.clone(), flag: Arc::clone(&cancel_flag) };
     let cleanup_cancel = || {
         if let Some(ref tid) = task_id {
-            cancel_map.lock().unwrap().remove(tid);
+            let mut map = cancel_map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if map.get(tid).is_some_and(|flag| Arc::ptr_eq(flag, &cancel_flag)) { map.remove(tid); }
         }
     };
 
@@ -4603,6 +6909,10 @@ pub async fn db_logical_backup(
 
     let total_tables = table_list.len() as u64;
 
+    let destination_path = path;
+    let mut staged = super::db_export::StagedExport::new(&destination_path)?;
+    let path = staged.path.clone();
+
     // SQL Server 大库按表拆分，避免单个 SQL 文件过大，也便于按表恢复。
     if config.conn_type == ConnType::SqlServer {
         use std::io::Write;
@@ -4614,6 +6924,10 @@ pub async fn db_logical_backup(
         let options = SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
             .large_file(true);
+
+        zip.start_file("恢复顺序.txt", options).map_err(|e| format!("创建恢复说明失败: {e}"))?;
+        zip.write_all("SQL Server 逻辑备份恢复顺序\n1. 核对脚本中的目标数据库，并先准备相应数据库、schema及自定义类型。\n2. 执行全部 tables/ 下的脚本，确认表结构及数据均执行成功。\n3. 执行 post-data.sql（如果存在），创建全部后置索引、外键及检查约束。不要只执行单个表文件后就认为约束已恢复。\n4. 按对象实际依赖关系执行 functions/、views/、procedures/；本归档尚未自动排列模块依赖。\n表结构脚本保留原有 DROP TABLE 行为；恢复前请核对目标，已有外键依赖的覆盖恢复未实现自动拆除。跨文件恢复不是单一事务，不能将本说明视为完整恢复验收。\n".as_bytes())
+            .map_err(|e| format!("写入恢复说明失败: {e}"))?;
 
         let emit = |current_table: &str, done: u64, current_rows: u64| {
             #[derive(serde::Serialize, Clone)]
@@ -4627,9 +6941,12 @@ pub async fn db_logical_backup(
         };
 
         let q = |name: &str| format!("[{}]", name.replace(']', "]]"));
-        // SchemaBrowser 的 `schema` 对 SQL Server 表示数据库名；当前平铺列表使用默认 dbo schema。
+        // SQL Server schema参数表示数据库名；对象schema由目录唯一解析。
         let database_name = schema.as_str();
-        let schema_name = "dbo";
+        let backup_config = super::sqlserver::table_write_config(&config, database_name);
+        let mut post_data_statements: Vec<String> = Vec::new();
+        let mut constraint_statements: Vec<String> = Vec::new();
+        let mut trigger_statements: Vec<String> = Vec::new();
         let mut tables_done = 0u64;
         let mut total_rows_backed = 0u64;
 
@@ -4640,15 +6957,31 @@ pub async fn db_logical_backup(
                 let _ = std::fs::remove_file(&path);
                 return Err("备份已取消".into());
             }
+            let target = super::sqlserver::backup_target::resolve_backup_table(
+                &id, &backup_config, database_name, tbl, ss_schema.as_deref(), &ss_pool,
+            ).await?;
+            let database_name = target.database.as_str();
+            let schema_name = &target.schema;
+            let restore_context = target.restore_context();
             emit(tbl, tables_done, 0);
             let entry_name = format!("tables/{}.sql", tbl.replace(['/', '\\', ':'], "_"));
             zip.start_file(entry_name, options).map_err(|e| format!("创建 ZIP 条目失败: {e}"))?;
             writeln!(zip, "-- DBTerm SQL Server logical backup\n-- Database: {}\n-- Table: {}.{}\nSET NOCOUNT ON;\n", database_name, schema_name, tbl)
                 .map_err(|e| format!("写入备份失败: {e}"))?;
 
-            let table_ref = format!("{}.{}", q(schema_name), q(tbl));
+            zip.write_all(restore_context.as_bytes()).map_err(|e| format!("写入备份数据库上下文失败: {e}"))?;
+            let table_ref = target.reference();
             if with_structure {
-                let ddl = dispatch_ss_ddl(&id, &config, database_name, tbl, &ss_pool).await?;
+                let script = super::sqlserver::dispatch_ss_archive_ddl(
+                    &id, &backup_config, database_name, tbl, Some(schema_name.as_str()), &ss_pool,
+                ).await?;
+                let deferred = super::sqlserver::ddl_script::TableScript::deferred_batch(&restore_context, &script.post_data);
+                if !deferred.is_empty() { post_data_statements.push(deferred); }
+                let constraints = super::sqlserver::ddl_script::TableScript::deferred_batch(&restore_context, &script.constraints);
+                if !constraints.is_empty() { constraint_statements.push(constraints); }
+                let triggers = super::sqlserver::ddl_script::TableScript::deferred_batch(&restore_context, &script.triggers);
+                if !triggers.is_empty() { trigger_statements.push(triggers); }
+                let ddl = script.definition;
                 writeln!(zip, "IF OBJECT_ID(N'{}', N'U') IS NOT NULL DROP TABLE {};\n{}\nGO\n", table_ref.replace('\'', "''"), table_ref, ddl)
                     .map_err(|e| format!("写入表结构失败: {e}"))?;
             }
@@ -4657,7 +6990,7 @@ pub async fn db_logical_backup(
             if with_data {
                 use futures::TryStreamExt;
                 use tiberius::QueryItem;
-                let entry_arc = super::sqlserver::get_entry(&id, &ss_pool, &config, password.as_deref()).await?;
+                let entry_arc = super::sqlserver::get_entry(&id, &ss_pool, &backup_config, password.as_deref()).await?;
                 let mut entry = entry_arc.lock().await;
                 let db_context = if database_name.is_empty() { String::new() } else { format!("USE {}; ", q(database_name)) };
                 let identity_sql = format!(
@@ -4673,7 +7006,12 @@ pub async fn db_logical_backup(
                     writeln!(zip, "SET IDENTITY_INSERT {table_ref} ON;")
                         .map_err(|e| format!("写入表 {tbl} 数据失败: {e}"))?;
                 }
-                let mut stream = entry.client.simple_query(format!("{db_context}SELECT * FROM {table_ref}")).await
+                let columns_sql = format!("{db_context}SELECT name FROM sys.columns WHERE object_id=OBJECT_ID(N'{}') AND is_computed=0 AND generated_always_type=0 AND system_type_id<>189 ORDER BY column_id", table_ref.replace('\'', "''"));
+                let column_rows = entry.client.simple_query(columns_sql).await.map_err(|e| format!("读取表 {tbl} 导出列失败: {e}"))?
+                    .into_first_result().await.map_err(|e| format!("读取表 {tbl} 导出列失败: {e}"))?;
+                let projection = column_rows.iter().filter_map(|row| row.get::<&str,_>(0)).map(q).collect::<Vec<_>>().join(", ");
+                if projection.is_empty() { return Err(format!("表 {tbl} 没有可导出的非生成列")); }
+                let mut stream = entry.client.simple_query(format!("{db_context}SELECT {projection} FROM {table_ref}")).await
                     .map_err(|e| format!("读取表 {tbl} 失败: {e}"))?;
                 let mut columns: Vec<String> = Vec::new();
                 while let Some(item) = stream.try_next().await.map_err(|e| format!("读取表 {tbl} 失败: {e}"))? {
@@ -4683,9 +7021,7 @@ pub async fn db_logical_backup(
                         }
                         QueryItem::Row(row) => {
                             if columns.is_empty() { columns = row.columns().iter().map(|c| q(c.name())).collect(); }
-                            let vals: Vec<Option<String>> = (0..columns.len())
-                                .map(|i| super::sqlserver::cell_to_string(&row, i)).collect();
-                            let values = vals.iter().map(sql_escape_value_std).collect::<Vec<_>>().join(", ");
+                            let values = super::db_export::sqlserver_sql_values(&row)?.join(", ");
                             writeln!(zip, "INSERT INTO {table_ref} ({}) VALUES ({values});", columns.join(", "))
                                 .map_err(|e| format!("写入表 {tbl} 数据失败: {e}"))?;
                             row_count += 1;
@@ -4721,18 +7057,37 @@ pub async fn db_logical_backup(
                         cleanup_cancel(); drop(zip); let _ = std::fs::remove_file(&path);
                         return Err("备份已取消".into());
                     }
-                    let ddl = dispatch_ss_ddl(&id, &config, database_name, name, &ss_pool).await?;
+                    let target = super::sqlserver::backup_target::resolve_backup_module(
+                        &id, &backup_config, database_name, name, ss_schema.as_deref(), &ss_pool,
+                    ).await?;
+                    let ddl = super::sqlserver::dispatch_ss_archive_ddl(
+                        &id, &backup_config, &target.database, name, Some(target.schema.as_str()), &ss_pool,
+                    ).await?.archive_complete();
                     let entry_name = format!("{dir}/{}.sql", name.replace(['/', '\\', ':'], "_"));
                     zip.start_file(entry_name, options).map_err(|e| format!("创建 ZIP 条目失败: {e}"))?;
+                    zip.write_all(target.restore_context().as_bytes()).map_err(|e| format!("写入对象数据库上下文失败: {e}"))?;
                     writeln!(zip, "-- DBTerm SQL Server logical backup\n-- Object: {name}\n{ddl}\nGO")
                         .map_err(|e| format!("写入对象 {name} 失败: {e}"))?;
                 }
             }
         }
 
-        zip.finish().map_err(|e| format!("完成 ZIP 备份失败: {e}"))?;
+        if !post_data_statements.is_empty() || !constraint_statements.is_empty() || !trigger_statements.is_empty() {
+            zip.start_file("post-data.sql", options).map_err(|e| format!("创建后置DDL条目失败: {e}"))?;
+            zip.write_all("-- 在全部表结构和数据脚本执行成功后，再执行本文件。先创建全部索引，再添加外键和检查约束，最后恢复触发器。\n".as_bytes())
+                .map_err(|e| format!("写入后置DDL说明失败: {e}"))?;
+            for statement in post_data_statements.iter().chain(&constraint_statements).chain(&trigger_statements) {
+                zip.write_all(statement.as_bytes()).map_err(|e| format!("写入后置DDL失败: {e}"))?;
+            }
+        }
+
+        let mut writer = zip.finish().map_err(|e| format!("完成 ZIP 备份失败: {e}"))?;
+        writer.flush().map_err(|e| format!("写入 ZIP 备份失败: {e}"))?;
+        drop(writer);
+        if cancel_flag.load(Ordering::Relaxed) { return Err("备份已取消".into()); }
+        staged.commit()?;
         cleanup_cancel();
-        let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let file_size = std::fs::metadata(&destination_path).map(|m| m.len()).unwrap_or(0);
         return Ok(BackupResult { tables_done, total_rows: total_rows_backed, file_size });
     }
 
@@ -4741,18 +7096,23 @@ pub async fn db_logical_backup(
     let mut writer = BufWriter::new(file);
 
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    writeln!(writer, "-- DBTerm logical backup").ok();
-    writeln!(writer, "-- Schema: {}", if schema.is_empty() { "(current)" } else { &schema }).ok();
-    writeln!(writer, "-- Date: {now}").ok();
-    writeln!(writer, "-- Tables: {total_tables}").ok();
-    writeln!(writer).ok();
+    writeln!(writer, "-- DBTerm logical backup").map_err(|e| format!("写入备份文件失败: {e}"))?;
+    writeln!(writer, "-- Schema: {}", if schema.is_empty() { "(current)" } else { &schema }).map_err(|e| format!("写入备份文件失败: {e}"))?;
+    writeln!(writer, "-- Date: {now}").map_err(|e| format!("写入备份文件失败: {e}"))?;
+    writeln!(writer, "-- Tables: {total_tables}").map_err(|e| format!("写入备份文件失败: {e}"))?;
+    writeln!(writer).map_err(|e| format!("写入备份文件失败: {e}"))?;
 
     // 实例级导出：写入建库 + USE，使单文件可独立还原（仅 MySQL 系，且指定了库名）
     if create_db == Some(true) && !schema.is_empty() {
         if let ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase = config.conn_type {
-            writeln!(writer, "CREATE DATABASE IF NOT EXISTS {};", q_mysql(&schema)).ok();
-            writeln!(writer, "USE {};", q_mysql(&schema)).ok();
-            writeln!(writer).ok();
+            use sqlx::Row;
+            let (mut conn, _guard) = mysql_connect(&config, password.as_deref()).await?;
+            let row = sqlx::query(&format!("SHOW CREATE DATABASE {}", q_mysql(&schema))).fetch_one(&mut conn).await
+                .map_err(|e| format!("读取源数据库定义失败: {e}"))?;
+            let raw: String = row.try_get(1).map_err(|e| format!("解析源数据库定义失败: {e}"))?;
+            writeln!(writer, "{};", mysql_export_database_ddl(&raw, &schema)?).map_err(|e| format!("写入备份文件失败: {e}"))?;
+            writeln!(writer, "USE {};", q_mysql(&schema)).map_err(|e| format!("写入备份文件失败: {e}"))?;
+            writeln!(writer).map_err(|e| format!("写入备份文件失败: {e}"))?;
         }
     }
 
@@ -4797,19 +7157,22 @@ pub async fn db_logical_backup(
                 let tgt = if schema.is_empty() { q_mysql(tbl) }
                           else { format!("{}.{}", q_mysql(&schema), q_mysql(tbl)) };
 
+                let mysql_header = super::db_export::mysql_export_session_header(&mut conn).await?;
+                writer.write_all(mysql_header.as_bytes()).map_err(|e| format!("写入失败: {e}"))?;
                 // DDL
                 use sqlx::Row;
                 if with_structure {
                     let ddl_sql = format!("SHOW CREATE TABLE {tgt}");
                     match sqlx::query(&ddl_sql).fetch_one(&mut conn).await {
                         Ok(row) => {
-                            let ddl = row.try_get::<String, _>(1).unwrap_or_default();
-                            writeln!(writer, "-- Table: {tbl}").ok();
-                            writeln!(writer, "DROP TABLE IF EXISTS {tgt};").ok();
-                            writeln!(writer, "{ddl};").ok();
-                            writeln!(writer).ok();
+                            let ddl = row.try_get::<String, _>(1).map_err(|e| format!("读取表 {tbl} 建表语句失败: {e}"))?;
+                            if ddl.trim().is_empty() { return Err(format!("表 {tbl} 建表语句为空，已终止备份")); }
+                            writeln!(writer, "-- Table: {tbl}").map_err(|e| format!("写入备份文件失败: {e}"))?;
+                            writeln!(writer, "DROP TABLE IF EXISTS {tgt};").map_err(|e| format!("写入备份文件失败: {e}"))?;
+                            writeln!(writer, "{ddl};").map_err(|e| format!("写入备份文件失败: {e}"))?;
+                            writeln!(writer).map_err(|e| format!("写入备份文件失败: {e}"))?;
                         }
-                        Err(e) => { writeln!(writer, "-- 获取 DDL 失败: {e}").ok(); writeln!(writer).ok(); }
+                        Err(e) => return Err(format!("获取表 {tbl} 建表语句失败: {e}")),
                     }
                 }
 
@@ -4817,7 +7180,9 @@ pub async fn db_logical_backup(
                 let mut row_count = 0u64;
                 if with_data {
                     use sqlx::Column;
-                    let data_sql = tag_sql(&format!("SELECT * FROM {tgt}"));
+                    let projection = super::db_export::mysql_export_projection(&mut conn, &tgt).await?;
+                    sqlx::query("SET time_zone = '+00:00'").execute(&mut conn).await.map_err(|e| format!("设置导出时区失败: {e}"))?;
+                    let data_sql = tag_sql(&format!("SELECT {projection} FROM {tgt}"));
                     let mut stream = sqlx::query(&data_sql).fetch(&mut conn);
                     let mut col_list_opt: Option<String> = None;
                     while let Some(row) = stream.try_next().await
@@ -4827,10 +7192,9 @@ pub async fn db_logical_backup(
                             let names: Vec<String> = row.columns().iter().map(|c| q_mysql(c.name())).collect();
                             col_list_opt = Some(names.join(", "));
                         }
-                        let vals = mysql_row_to_strings(&row);
-                        let val_str = vals.iter().map(sql_escape_value).collect::<Vec<_>>().join(", ");
+                        let val_str = super::db_export::mysql_sql_values(&row)?.join(", ");
                         if let Some(ref cl) = col_list_opt {
-                            writeln!(writer, "INSERT INTO {tgt} ({cl}) VALUES ({val_str});").ok();
+                            writeln!(writer, "INSERT INTO {tgt} ({cl}) VALUES ({val_str});").map_err(|e| format!("写入备份文件失败: {e}"))?;
                         }
                         row_count += 1;
                         if row_count % BACKUP_PROGRESS_INTERVAL == 0 {
@@ -4838,12 +7202,14 @@ pub async fn db_logical_backup(
                             check_cancel!();
                         }
                     }
-                    writeln!(writer).ok();
+                    writeln!(writer).map_err(|e| format!("写入备份文件失败: {e}"))?;
                 }
+                writer.write_all(super::db_export::MYSQL_EXPORT_SESSION_FOOTER.as_bytes()).map_err(|e| format!("写入失败: {e}"))?;
                 total_rows_backed += row_count;
                 emit(tbl, tables_done, row_count);
             }
             ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
+                if with_structure { return Err("PostgreSQL 结构备份请使用 ZIP 导出；旧版逻辑备份无法完整保留结构".into()); }
                 let s = if schema.is_empty() { "public" } else { &schema };
                 let tgt = format!("{}.{}", q_dq(s), q_dq(tbl));
                 let (mut conn, _t) = pg_connect(&config, password.as_deref()).await?;
@@ -4852,7 +7218,7 @@ pub async fn db_logical_backup(
                 let col_rows = sqlx::query(
                     "SELECT column_name, data_type, is_nullable, column_default \
                      FROM information_schema.columns \
-                     WHERE table_schema = $1 AND table_name = $2 \
+                     WHERE table_schema = $1 AND table_name = $2 AND is_generated='NEVER' \
                      ORDER BY ordinal_position"
                 ).bind(s).bind(tbl.as_str()).fetch_all(&mut conn).await
                  .map_err(|e| format!("获取列信息失败: {e}"))?;
@@ -4869,17 +7235,20 @@ pub async fn db_logical_backup(
                         Some(sd)
                     }).collect();
 
-                    writeln!(writer, "-- Table: {tbl}").ok();
-                    writeln!(writer, "DROP TABLE IF EXISTS {tgt};").ok();
-                    writeln!(writer, "CREATE TABLE {tgt} (\n{}\n);", col_defs.join(",\n")).ok();
-                    writeln!(writer).ok();
+                    writeln!(writer, "-- Table: {tbl}").map_err(|e| format!("写入备份文件失败: {e}"))?;
+                    writeln!(writer, "DROP TABLE IF EXISTS {tgt};").map_err(|e| format!("写入备份文件失败: {e}"))?;
+                    writeln!(writer, "CREATE TABLE {tgt} (\n{}\n);", col_defs.join(",\n")).map_err(|e| format!("写入备份文件失败: {e}"))?;
+                    writeln!(writer).map_err(|e| format!("写入备份文件失败: {e}"))?;
                 }
 
                 // Data — streaming
                 let mut row_count = 0u64;
                 if with_data {
-                    let data_sql = tag_sql(&format!("SELECT * FROM {tgt}"));
-                    let mut stream = sqlx::query(&data_sql).fetch(&mut conn);
+                    let projection = col_rows.iter().map(|r| r.try_get::<String, _>(0).map(|name| q_dq(&name))).collect::<Result<Vec<_>, _>>().map_err(|e| format!("读取导出列失败: {e}"))?.join(", ");
+                    if projection.is_empty() { return Err("未找到可导出的非生成列".into()); }
+                    let data_sql = tag_sql(&format!("SELECT {projection} FROM {tgt}"));
+                    super::db_export::pg_prepare_sql_export(&mut conn).await?;
+                    let mut stream = sqlx::Executor::fetch(&mut conn, data_sql.as_str());
                     let mut col_list_opt: Option<String> = None;
                     while let Some(row) = stream.try_next().await
                         .map_err(|e| format!("读取表 {tbl} 数据失败: {e}"))?
@@ -4888,10 +7257,9 @@ pub async fn db_logical_backup(
                             let names: Vec<String> = row.columns().iter().map(|c| q_dq(c.name())).collect();
                             col_list_opt = Some(names.join(", "));
                         }
-                        let vals = pg_row_to_strings(&row);
-                        let val_str = vals.iter().map(sql_escape_value).collect::<Vec<_>>().join(", ");
+                        let val_str = super::db_export::pg_sql_values(&row)?.join(", ");
                         if let Some(ref cl) = col_list_opt {
-                            writeln!(writer, "INSERT INTO {tgt} ({cl}) VALUES ({val_str});").ok();
+                            writeln!(writer, "INSERT INTO {tgt} ({cl}) OVERRIDING SYSTEM VALUE VALUES ({val_str});").map_err(|e| format!("写入备份文件失败: {e}"))?;
                         }
                         row_count += 1;
                         if row_count % BACKUP_PROGRESS_INTERVAL == 0 {
@@ -4899,7 +7267,7 @@ pub async fn db_logical_backup(
                             check_cancel!();
                         }
                     }
-                    writeln!(writer).ok();
+                    writeln!(writer).map_err(|e| format!("写入备份文件失败: {e}"))?;
                 }
                 total_rows_backed += row_count;
                 emit(tbl, tables_done, row_count);
@@ -4921,30 +7289,34 @@ pub async fn db_logical_backup(
         use sqlx::{Row, Executor};
         let (mut conn, _t) = mysql_connect(&config, password.as_deref()).await?;
         if !schema.is_empty() {
-            let _ = conn.execute(sqlx::raw_sql(&tag_sql(&format!("USE {}", q_mysql(&schema))))).await;
+            conn.execute(sqlx::raw_sql(&tag_sql(&format!("USE {}", q_mysql(&schema))))).await
+                .map_err(|e| format!("切换备份数据库失败: {e}"))?;
         }
         for v in &views {
             check_cancel!();
-            if let Ok(row) = sqlx::query(&tag_sql(&format!("SHOW CREATE VIEW {}", q_mysql(v))))
-                .fetch_one(&mut conn).await {
-                let ddl = row.try_get::<String, _>(1).unwrap_or_default();
-                writeln!(writer, "-- View: {v}").ok();
-                writeln!(writer, "DROP VIEW IF EXISTS {};", q_mysql(v)).ok();
-                writeln!(writer, "{ddl};\n").ok();
+            {
+                let row = sqlx::query(&tag_sql(&format!("SHOW CREATE VIEW {}", q_mysql(v))))
+                    .fetch_one(&mut conn).await.map_err(|e| format!("读取视图 {v} 失败: {e}"))?;
+                let ddl = row.try_get::<String, _>(1).map_err(|e| format!("解析视图 {v} 失败: {e}"))?;
+                if ddl.trim().is_empty() { return Err(format!("视图 {v} 定义为空，已中止备份")); }
+                writeln!(writer, "-- View: {v}").map_err(|e| format!("写入备份文件失败: {e}"))?;
+                writeln!(writer, "DROP VIEW IF EXISTS {};", q_mysql(v)).map_err(|e| format!("写入备份文件失败: {e}"))?;
+                writeln!(writer, "{ddl};\n").map_err(|e| format!("写入备份文件失败: {e}"))?;
             }
         }
         for (names, kw) in [(&funcs, "FUNCTION"), (&procs, "PROCEDURE")] {
             for n in names {
                 check_cancel!();
-                if let Ok(row) = sqlx::query(&tag_sql(&format!("SHOW CREATE {kw} {}", q_mysql(n))))
-                    .fetch_one(&mut conn).await {
-                    let ddl = row.try_get::<String, _>(2).unwrap_or_default();
-                    if ddl.trim().is_empty() { continue; }
-                    writeln!(writer, "-- {kw}: {n}").ok();
-                    writeln!(writer, "DROP {kw} IF EXISTS {};", q_mysql(n)).ok();
-                    writeln!(writer, "DELIMITER ;;").ok();
-                    writeln!(writer, "{}\n;;", ddl.trim_end()).ok();
-                    writeln!(writer, "DELIMITER ;\n").ok();
+                {
+                    let row = sqlx::query(&tag_sql(&format!("SHOW CREATE {kw} {}", q_mysql(n))))
+                        .fetch_one(&mut conn).await.map_err(|e| format!("读取 {kw} {n} 失败: {e}"))?;
+                    let ddl = row.try_get::<String, _>(2).map_err(|e| format!("解析 {kw} {n} 失败: {e}"))?;
+                    if ddl.trim().is_empty() { return Err(format!("{kw} {n} 定义为空或无权限，已中止备份")); }
+                    writeln!(writer, "-- {kw}: {n}").map_err(|e| format!("写入备份文件失败: {e}"))?;
+                    writeln!(writer, "DROP {kw} IF EXISTS {};", q_mysql(n)).map_err(|e| format!("写入备份文件失败: {e}"))?;
+                    writeln!(writer, "DELIMITER ;;").map_err(|e| format!("写入备份文件失败: {e}"))?;
+                    writeln!(writer, "{}\n;;", ddl.trim_end()).map_err(|e| format!("写入备份文件失败: {e}"))?;
+                    writeln!(writer, "DELIMITER ;\n").map_err(|e| format!("写入备份文件失败: {e}"))?;
                 }
             }
         }
@@ -4956,25 +7328,31 @@ pub async fn db_logical_backup(
         use sqlx::{Row, Executor};
         let (mut conn, _t) = mysql_connect(&config, password.as_deref()).await?;
         if !schema.is_empty() {
-            let _ = conn.execute(sqlx::raw_sql(&tag_sql(&format!("USE {}", q_mysql(&schema))))).await;
+            conn.execute(sqlx::raw_sql(&tag_sql(&format!("USE {}", q_mysql(&schema))))).await
+                .map_err(|e| format!("切换备份数据库失败: {e}"))?;
         }
         for seq in &seqs {
             check_cancel!();
             let sref = q_mysql(seq);
-            if let Ok(row) = sqlx::query(&tag_sql(&format!("SHOW CREATE SEQUENCE {sref}")))
-                .fetch_one(&mut conn).await {
-                let ddl: String = row.try_get(1).unwrap_or_default();
+            {
+                let row = sqlx::query(&tag_sql(&format!("SHOW CREATE SEQUENCE {sref}")))
+                    .fetch_one(&mut conn).await.map_err(|e| format!("读取序列 {seq} 失败: {e}"))?;
+                let ddl: String = row.try_get(1).map_err(|e| format!("解析序列 {seq} 失败: {e}"))?;
+                if ddl.trim().is_empty() { return Err(format!("序列 {seq} 定义为空，已中止备份")); }
                 if !ddl.trim().is_empty() {
-                    writeln!(writer, "-- Sequence: {seq}").ok();
-                    writeln!(writer, "DROP SEQUENCE IF EXISTS {sref};").ok();
-                    writeln!(writer, "{ddl};\n").ok();
+                    writeln!(writer, "-- Sequence: {seq}").map_err(|e| format!("写入备份文件失败: {e}"))?;
+                    writeln!(writer, "DROP SEQUENCE IF EXISTS {sref};").map_err(|e| format!("写入备份文件失败: {e}"))?;
+                    writeln!(writer, "{ddl};\n").map_err(|e| format!("写入备份文件失败: {e}"))?;
                 }
             }
         }
     }
 
     writer.flush().map_err(|e| format!("写入备份文件失败: {e}"))?;
-    let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    drop(writer);
+    if cancel_flag.load(Ordering::Relaxed) { return Err("备份已取消".into()); }
+    staged.commit()?;
+    let file_size = std::fs::metadata(&destination_path).map(|m| m.len()).unwrap_or(0);
 
     cleanup_cancel();
     Ok(BackupResult { tables_done, total_rows: total_rows_backed, file_size })
@@ -5142,71 +7520,8 @@ pub async fn db_cancel_query(
     if token.is_empty() || !token.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err("无效的取消令牌".into());
     }
-    let known_pid = crate::commands::query::cancel_pid(&token);
-    // 中止正在执行该查询的那条连接（关连接 → 取数据类查询服务端会随之中止；客户端立即解阻塞）。
-    let aborted = crate::commands::query::cancel_abort(&token);
-    let (config, password) = load_conn(&id, &storage).await?;
-    if aborted {
-        if let Some(pid) = known_pid.filter(|pid| *pid > 0) {
-            let config = config.clone();
-            let password = password.clone();
-            tauri::async_runtime::spawn(async move {
-                match config.conn_type {
-                    ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => {
-                        if let Ok((mut conn, _t)) = mysql_connect(&config, password.as_deref()).await {
-                            let _ = sqlx::query(&format!("KILL {pid}")).execute(&mut conn).await;
-                        }
-                    }
-                    ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
-                        if let Ok((mut conn, _t)) = pg_connect(&config, password.as_deref()).await {
-                            let _ = sqlx::query("SELECT pg_terminate_backend($1::int4)")
-                                .bind(pid as i32)
-                                .execute(&mut conn)
-                                .await;
-                        }
-                    }
-                    _ => {}
-                }
-            });
-        }
-        return Ok(true);
-    }
-    match config.conn_type {
-        ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => {
-            let (mut conn, _t) = mysql_connect(&config, password.as_deref()).await?;
-            // 用 `KILL <id>`（终止整条会话线程，连同其正在跑的查询），而非 `KILL QUERY`（只停语句、线程仍在）
-            // —— 确保不留僵尸后台线程。杀的是本应用自己发起的查询连接（同用户），无需 SUPER 权限。
-            let mut acted = false;
-            // 直接杀登记的执行连接线程（线程可能已因客户端断连被回收 → KILL 报错属正常，无残留）
-            if let Some(pid) = known_pid {
-                if pid > 0 && sqlx::query(&format!("KILL {pid}")).execute(&mut conn).await.is_ok() {
-                    acted = true;
-                }
-            }
-            // 返回值只表达“服务端 KILL 已确认”。aborted 只代表本地执行连接已断开，
-            // 对 FEDERATED / 代理 / 多节点场景不能等价为远端数据库已终止。
-            Ok(acted)
-        }
-        ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
-            let (mut conn, _t) = pg_connect(&config, password.as_deref()).await?;
-            // 用 pg_terminate_backend（终止整个后端连接，连同其正在跑的查询）而非 pg_cancel_backend
-            // （只取消语句、后端仍在）—— 确保不留残留后端。
-            let mut acted = false;
-            if let Some(pid) = known_pid {
-                if pid > 0 && sqlx::query("SELECT pg_terminate_backend($1::int4)").bind(pid as i32)
-                    .execute(&mut conn).await.is_ok() {
-                    acted = true;
-                }
-            }
-            // 返回值只表达“服务端 terminate 已确认”。aborted 只代表本地执行连接已断开。
-            Ok(acted)
-        }
-        ConnType::Sqlite | ConnType::Duckdb => {
-            // SQLite/DuckDB 通过 abort 信号中断 select!，无需服务端 KILL
-            Ok(aborted)
-        }
-        _ => Err("此连接类型暂不支持取消查询".into()),
-    }
+    let _ = storage;
+    Ok(crate::commands::query::cancel_abort_for(&token, &id))
 }
 
 // ── 15. db_table_sizes (F2 容量统计) ─────────────────────────────────────────
@@ -6186,11 +8501,11 @@ pub async fn db_call_procedure(
     storage: State<'_, StorageState>,
 ) -> Result<serde_json::Value, String> {
     let (config, password) = load_conn(&id, &storage).await?;
+    ensure_writable(&config)?;
     let param_values: Vec<&str> = params.iter().map(|p| p.value.as_str()).collect();
 
     match config.conn_type {
         ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => {
-            use sqlx::Row;
             let (mut conn, _t) = mysql_connect(&config, password.as_deref()).await?;
             let qualified = if schema.is_empty() { q_mysql(&name) }
                             else { format!("{}.{}", q_mysql(&schema), q_mysql(&name)) };
@@ -6198,20 +8513,15 @@ pub async fn db_call_procedure(
             let sql = tag_sql(&format!("CALL {qualified}({placeholders})"));
             let mut q = sqlx::query(&sql);
             for v in &param_values { q = q.bind(v); }
-            // CALL may return result sets; execute and capture rows from first result
-            let rows = q.fetch_all(&mut conn).await.map_err(|e| format!("执行存储过程失败: {e}"))?;
-            let result: Vec<serde_json::Value> = rows.iter().map(|r| {
-                let mut obj = serde_json::Map::new();
-                for i in 0..r.len() {
-                    let val: String = r.try_get(i).unwrap_or_else(|_| "NULL".to_string());
-                    obj.insert(format!("col{i}"), serde_json::Value::String(val));
-                }
-                serde_json::Value::Object(obj)
+            let (_, rows) = super::query::collect_query_rows(q.fetch(&mut conn), super::query::mysql_cell).await?;
+            let result: Vec<serde_json::Value> = rows.into_iter().map(|row| {
+                serde_json::Value::Object(row.into_iter().enumerate().map(|(i, value)|
+                    (format!("col{i}"), value.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null))
+                ).collect())
             }).collect();
             Ok(serde_json::json!({ "rows": result, "message": format!("执行成功，返回 {} 行", result.len()) }))
         }
         ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
-            use sqlx::Row;
             let (mut conn, _t) = pg_connect(&config, password.as_deref()).await?;
             let schema_name = if schema.is_empty() { "public" } else { &schema };
             let qualified = format!("{}.{}", q_dq(schema_name), q_dq(&name));
@@ -6219,14 +8529,11 @@ pub async fn db_call_procedure(
             let sql = tag_sql(&format!("CALL {qualified}({placeholders})"));
             let mut q = sqlx::query(&sql);
             for v in &param_values { q = q.bind(v); }
-            let rows = q.fetch_all(&mut conn).await.map_err(|e| format!("执行存储过程失败: {e}"))?;
-            let result: Vec<serde_json::Value> = rows.iter().map(|r| {
-                let mut obj = serde_json::Map::new();
-                for i in 0..r.len() {
-                    let val: String = r.try_get(i).unwrap_or_else(|_| "NULL".to_string());
-                    obj.insert(format!("col{i}"), serde_json::Value::String(val));
-                }
-                serde_json::Value::Object(obj)
+            let (_, rows) = super::query::collect_query_rows(q.fetch(&mut conn), super::query::pg_cell).await?;
+            let result: Vec<serde_json::Value> = rows.into_iter().map(|row| {
+                serde_json::Value::Object(row.into_iter().enumerate().map(|(i, value)|
+                    (format!("col{i}"), value.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null))
+                ).collect())
             }).collect();
             Ok(serde_json::json!({ "rows": result, "message": format!("执行成功，返回 {} 行", result.len()) }))
         }
@@ -6236,6 +8543,61 @@ pub async fn db_call_procedure(
 
 // ── 25. db_verify_migration (Q6 迁移后校验) ──────────────────────────────────
 
+#[cfg(test)]
+mod migration_verification_tests {
+    #[tokio::test]
+    async fn admin_sql_tls_unknown_mode_fails_before_network() {
+        let mut config: crate::models::ConnConfig = serde_json::from_value(serde_json::json!({"id":"admin-tls","name":"test","type":"mysql","host":"127.0.0.1","port":1,"useSsl":false,"extraJson":"{\"sslMode\":\"typo\"}","createdAt":0,"updatedAt":0})).unwrap();
+        let error = match super::mysql_connect(&config, None).await { Ok(_) => panic!("unexpected connection"), Err(e) => e };
+        assert!(error.contains("TLS 模式"), "{error}");
+        config.conn_type = crate::models::ConnType::Postgres;
+        let error = match super::pg_connect(&config, None).await { Ok(_) => panic!("unexpected connection"), Err(e) => e };
+        assert!(error.contains("TLS 模式"), "{error}");
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated MySQL at DBTERM_TEST_MYSQL_URL"]
+    async fn real_mysql_migration_verification_detects_equal_count_different_content() {
+        use sqlx::{Connection, Executor};
+        let url = std::env::var("DBTERM_TEST_MYSQL_URL").unwrap();
+        let options: sqlx::mysql::MySqlConnectOptions = url.parse().unwrap();
+        let mut conn = sqlx::mysql::MySqlConnection::connect(&url).await.unwrap();
+        let db = format!("dbterm_verify_{}", uuid::Uuid::new_v4().simple());
+        conn.execute(format!("CREATE DATABASE `{db}`").as_str()).await.unwrap();
+        conn.execute(format!("USE `{db}`").as_str()).await.unwrap();
+        conn.execute("CREATE TABLE a(id INT PRIMARY KEY, value VARBINARY(8), computed INT AS (id+1) STORED, hidden INT INVISIBLE) ENGINE=InnoDB; CREATE TABLE b LIKE a; INSERT INTO a(id,value,hidden) VALUES(1,0x00ff,7); INSERT INTO b(id,value,hidden) VALUES(1,0x00ff,8)").await.unwrap();
+        let config: crate::models::ConnConfig = serde_json::from_value(serde_json::json!({"id":"verify","name":"test","type":"mysql","host":options.get_host(),"port":options.get_port(),"username":options.get_username(),"database":db,"useSsl":false,"createdAt":0,"updatedAt":0})).unwrap();
+        let password = std::env::var("DBTERM_TEST_MYSQL_PASSWORD").ok();
+        let result = super::mysql_verify_migration_table(&config, password.as_deref(), &db, "a", &config, password.as_deref(), &db, "b").await.unwrap();
+        assert!(result.count_match);
+        assert_eq!(result.structure_match, Some(true));
+        assert_eq!(result.content_match, Some(false));
+        conn.execute("UPDATE b SET hidden=7").await.unwrap();
+        let result = super::mysql_verify_migration_table(&config, password.as_deref(), &db, "a", &config, password.as_deref(), &db, "b").await.unwrap();
+        assert_eq!(result.content_match, Some(true));
+        conn.execute("ALTER TABLE b ADD COLUMN extra INT").await.unwrap();
+        let result = super::mysql_verify_migration_table(&config, password.as_deref(), &db, "a", &config, password.as_deref(), &db, "b").await.unwrap();
+        assert_eq!(result.structure_match, Some(false));
+        conn.execute("CREATE TABLE ts_a(id INT PRIMARY KEY, instant TIMESTAMP(6)) ENGINE=InnoDB; CREATE TABLE ts_b LIKE ts_a; SET time_zone='+00:00'; INSERT INTO ts_a VALUES(1,'2026-11-14 10:20:30.123456'); INSERT INTO ts_b SELECT * FROM ts_a").await.unwrap();
+        let mut source_tz = sqlx::mysql::MySqlConnection::connect(&url).await.unwrap();
+        let mut target_tz = sqlx::mysql::MySqlConnection::connect(&url).await.unwrap();
+        source_tz.execute("SET time_zone='+08:00'").await.unwrap();
+        target_tz.execute("SET time_zone='-05:00'").await.unwrap();
+        super::mysql_begin_verification_snapshot(&mut source_tz).await.unwrap();
+        super::mysql_begin_verification_snapshot(&mut target_tz).await.unwrap();
+        let source_zone: String = sqlx::query_scalar("SELECT @@SESSION.time_zone").fetch_one(&mut source_tz).await.unwrap();
+        let target_zone: String = sqlx::query_scalar("SELECT @@SESSION.time_zone").fetch_one(&mut target_tz).await.unwrap();
+        assert_eq!(source_zone, "+00:00");
+        assert_eq!(target_zone, "+00:00");
+        let columns = vec!["id".into(), "instant".into()];
+        let source_digest = super::mysql_raw_content_digest(&mut source_tz, &super::mysql_qualified(&db, "ts_a"), &columns).await.unwrap();
+        let target_digest = super::mysql_raw_content_digest(&mut target_tz, &super::mysql_qualified(&db, "ts_b"), &columns).await.unwrap();
+        assert_eq!(source_digest, target_digest);
+        source_tz.execute("ROLLBACK").await.unwrap();
+        target_tz.execute("ROLLBACK").await.unwrap();
+        conn.execute(format!("DROP DATABASE `{db}`").as_str()).await.unwrap();
+    }
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VerifyTableResult {
@@ -6243,7 +8605,10 @@ pub struct VerifyTableResult {
     pub src_count:   i64,
     pub dst_count:   i64,
     pub count_match: bool,
-    pub sample_ok:   bool,
+    pub content_checked: Option<bool>,
+    pub content_match: Option<bool>,
+    pub structure_match: Option<bool>,
+    pub snapshot_boundary: Option<String>,
     pub error:       Option<String>,
 }
 
@@ -6282,12 +8647,19 @@ async fn verify_one_table(
     table: &str,
     duck_pool: &DuckPool, registry: &super::driver::DriverRegistry,
 ) -> VerifyTableResult {
+    let mysql = |kind: &ConnType| matches!(kind, ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase);
+    if mysql(&src_cfg.conn_type) && mysql(&dst_cfg.conn_type) {
+        return match mysql_verify_migration_table(src_cfg, src_pwd, src_schema, table, dst_cfg, dst_pwd, dst_schema, table).await {
+            Ok(result) => result,
+            Err(error) => VerifyTableResult { table: table.into(), src_count: -1, dst_count: -1, count_match: false, content_checked: Some(false), content_match: None, structure_match: None, snapshot_boundary: None, error: Some(error) },
+        };
+    }
     // Count from source
     let src_count = match get_table_count(src_cfg, src_pwd, src_schema, table, duck_pool, registry).await {
         Ok(n) => n,
         Err(e) => return VerifyTableResult {
             table: table.to_string(), src_count: -1, dst_count: -1,
-            count_match: false, sample_ok: false,
+            count_match: false, content_checked: Some(false), content_match: None, structure_match: None, snapshot_boundary: None,
             error: Some(format!("源库计数失败: {e}")),
         },
     };
@@ -6297,7 +8669,7 @@ async fn verify_one_table(
         Ok(n) => n,
         Err(e) => return VerifyTableResult {
             table: table.to_string(), src_count, dst_count: -1,
-            count_match: false, sample_ok: false,
+            count_match: false, content_checked: Some(false), content_match: None, structure_match: None, snapshot_boundary: None,
             error: Some(format!("目标库计数失败: {e}")),
         },
     };
@@ -6309,9 +8681,55 @@ async fn verify_one_table(
         src_count,
         dst_count,
         count_match,
-        sample_ok: count_match,
-        error: None,
+        content_checked: Some(false), content_match: None, structure_match: None, snapshot_boundary: None,
+        error: Some("仅完成行数比较；未执行内容校验，不能据此确认数据一致".into()),
     }
+}
+
+async fn mysql_begin_verification_snapshot(conn: &mut sqlx::mysql::MySqlConnection) -> Result<(), String> {
+    sqlx::Executor::execute(&mut *conn, "SET time_zone = '+00:00'").await.map_err(|e| format!("设置校验时区失败: {e}"))?;
+    sqlx::Executor::execute(&mut *conn, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await.map_err(|e| format!("设置校验快照隔离级别失败: {e}"))?;
+    sqlx::Executor::execute(&mut *conn, "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY").await.map_err(|e| format!("开启只读校验快照失败: {e}"))?;
+    Ok(())
+}
+
+async fn mysql_verify_migration_table(
+    src_cfg: &ConnConfig, src_pwd: Option<&str>, src_schema: &str, src_table: &str,
+    dst_cfg: &ConnConfig, dst_pwd: Option<&str>, dst_schema: &str, dst_table: &str,
+) -> Result<VerifyTableResult, String> {
+    let (mut source, _source_tunnel) = mysql_connect(src_cfg, src_pwd).await?;
+    let (mut target, _target_tunnel) = mysql_connect(dst_cfg, dst_pwd).await?;
+    let source_schema = if src_schema.is_empty() { sqlx::query_scalar::<_, Option<String>>("SELECT DATABASE()").fetch_one(&mut source).await.map_err(|e| e.to_string())?.ok_or("源库未选择数据库")? } else { src_schema.into() };
+    let target_schema = if dst_schema.is_empty() { sqlx::query_scalar::<_, Option<String>>("SELECT DATABASE()").fetch_one(&mut target).await.map_err(|e| e.to_string())?.ok_or("目标库未选择数据库")? } else { dst_schema.into() };
+    for conn in [&mut source, &mut target] {
+        mysql_begin_verification_snapshot(conn).await?;
+    }
+    let result: Result<VerifyTableResult, String> = async {
+        async fn snapshot_table(conn: &mut sqlx::mysql::MySqlConnection, schema: &str, table: &str) -> Result<(String, Vec<String>), String> {
+            let qualified = mysql_qualified(schema, table);
+            sqlx::Executor::execute(&mut *conn, format!("SELECT * FROM {qualified} LIMIT 0").as_str()).await.map_err(|e| format!("获取校验元数据锁失败: {e}"))?;
+            let (engine, kind): (Option<String>, String) = sqlx::query_as("SELECT CAST(ENGINE AS CHAR),CAST(TABLE_TYPE AS CHAR) FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?")
+                .bind(schema).bind(table).fetch_one(&mut *conn).await.map_err(|e| format!("读取校验表类型失败: {e}"))?;
+            if kind != "BASE TABLE" || !engine.as_deref().is_some_and(|e| e.eq_ignore_ascii_case("InnoDB")) { return Err("完整内容校验仅支持 InnoDB 普通表，其他引擎无法保证一致性快照".into()); }
+            let columns: Vec<String> = sqlx::query_scalar("SELECT CAST(COLUMN_NAME AS CHAR CHARACTER SET utf8mb4) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION")
+                .bind(schema).bind(table).fetch_all(&mut *conn).await.map_err(|e| format!("读取完整校验字段失败: {e}"))?;
+            if columns.is_empty() { return Err("完整校验字段为空，已拒绝给出一致结论".into()); }
+            Ok((mysql_read_ddl(conn, &qualified).await?, columns))
+        }
+        let (source_ddl, source_columns) = snapshot_table(&mut source, &source_schema, src_table).await?;
+        let (target_ddl, target_columns) = snapshot_table(&mut target, &target_schema, dst_table).await?;
+        let structure_match = mysql_apply_ddl(&source_ddl, src_table, "`__DBTERM_VERIFY__`")? == mysql_apply_ddl(&target_ddl, dst_table, "`__DBTERM_VERIFY__`")?;
+        let source_digest = mysql_raw_content_digest(&mut source, &mysql_qualified(&source_schema, src_table), &source_columns).await?;
+        let target_digest = mysql_raw_content_digest(&mut target, &mysql_qualified(&target_schema, dst_table), &target_columns).await?;
+        let src_count = i64::try_from(source_digest.rows).map_err(|_| "源表行数超出显示范围")?;
+        let dst_count = i64::try_from(target_digest.rows).map_err(|_| "目标表行数超出显示范围")?;
+        Ok(VerifyTableResult { table: src_table.into(), src_count, dst_count, count_match: src_count == dst_count, content_checked: Some(true), content_match: Some(source_columns == target_columns && source_digest == target_digest), structure_match: Some(structure_match), snapshot_boundary: Some("逐表校验双方各自的只读一致性快照；不共享跨库或迁移时点快照，也不代表整库同一时点。全量逐行读取生成指纹，非逐字节证明。".into()), error: None })
+    }.await;
+    let source_rollback = sqlx::Executor::execute(&mut source, "ROLLBACK").await;
+    let target_rollback = sqlx::Executor::execute(&mut target, "ROLLBACK").await;
+    if let Err(error) = source_rollback { return Err(format!("结束源校验快照失败: {error}")); }
+    if let Err(error) = target_rollback { return Err(format!("结束目标校验快照失败: {error}")); }
+    result
 }
 
 async fn get_table_count(
@@ -7098,194 +9516,31 @@ pub async fn db_change_password(
 
 #[tauri::command]
 pub async fn db_incremental_migrate(
-    src_id:     String,
-    src_schema: String,
-    src_table:  String,
-    dst_id:     String,
-    dst_schema: String,
-    dst_table:  String,
-    pk_col:     String,
-    last_value: String,   // last migrated pk/time value (as string)
-    batch_size: u64,
-    app:        tauri::AppHandle,
-    storage:    State<'_, StorageState>,
+    src_id: String, src_schema: String, src_table: String,
+    dst_id: String, dst_schema: String, dst_table: String,
+    pk_col: String, last_value: String, batch_size: u64,
+    app: tauri::AppHandle,
+    storage: State<'_, StorageState>,
+    duck_pool: State<'_, DuckPool>,
+    registry: State<'_, DriverRegistry>,
+    ss_pool: State<'_, SsPool>,
 ) -> Result<serde_json::Value, String> {
-    use sqlx::Row;
-    validate_ident(&src_table)?;
-    validate_ident(&dst_table)?;
     validate_ident(&pk_col)?;
-    if batch_size == 0 || batch_size > 100_000 {
-        return Err("batch_size 必须在 1-100000 之间".into());
+    if batch_size == 0 || batch_size > 10_000 {
+        return Err("batch_size 必须在 1-10000 之间".into());
     }
-
-    let (src_cfg, src_pwd) = load_conn(&src_id, &storage).await?;
-    let (dst_cfg, dst_pwd) = load_conn(&dst_id, &storage).await?;
-    ensure_writable(&dst_cfg)?;   // 增量迁移写入目标连接，目标只读则拒绝
-
-    // Only source is read; dest is written
-    let total_migrated = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
-    let total_migrated_c = total_migrated.clone();
-
-    let result: Result<i64, String> = (async {
-        // 1. Get columns from source
-        let cols = match src_cfg.conn_type {
-            ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => {
-                let (mut conn, _t) = mysql_connect(&src_cfg, src_pwd.as_deref()).await?;
-                let schema_name = if src_schema.is_empty() { src_cfg.database.as_deref().unwrap_or("") } else { &src_schema };
-                let sql = format!(
-                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
-                     WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' ORDER BY ORDINAL_POSITION",
-                    schema_name.replace('\'', "\\'"), src_table.replace('\'', "\\'")
-                );
-                sqlx::query(&sql).fetch_all(&mut conn).await
-                    .map_err(|e| format!("{e}"))?
-                    .iter().map(|r| r.try_get::<String, _>(0).unwrap_or_default()).collect::<Vec<_>>()
-            }
-            ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
-                let (mut conn, _t) = pg_connect(&src_cfg, src_pwd.as_deref()).await?;
-                let schema_name = if src_schema.is_empty() { "public" } else { &src_schema };
-                let sql = "SELECT column_name FROM information_schema.columns \
-                           WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position";
-                sqlx::query(sql).bind(schema_name).bind(&src_table).fetch_all(&mut conn).await
-                    .map_err(|e| format!("{e}"))?
-                    .iter().map(|r| r.try_get::<String, _>(0).unwrap_or_default()).collect::<Vec<_>>()
-            }
-            ConnType::Sqlite => {
-                use sqlx::{sqlite::SqliteConnection, Connection};
-                use crate::commands::query::sqlite_url;
-                let url = sqlite_url(&src_cfg)?;
-                let mut conn = SqliteConnection::connect(&url).await.map_err(|e| e.to_string())?;
-                let sql = format!("PRAGMA {}.table_info({})", if src_schema.is_empty() { "main" } else { &src_schema }, q_dq(&src_table));
-                sqlx::query(&sql).fetch_all(&mut conn).await.map_err(|e| format!("{e}"))?
-                    .iter().map(|r| r.try_get::<String, _>(1).unwrap_or_default()).collect::<Vec<_>>()
-            }
-            _ => return Err("不支持的连接类型".into()),
-        };
-
-        if cols.is_empty() {
-            return Err(format!("表 {src_table} 没有列"));
-        }
-
-        // 2. Read new rows from source (WHERE pk_col > last_value) in batches
-        let mut offset: u64 = 0;
-        let mut rows_migrated: i64 = 0;
-
-        loop {
-            let batch_rows: Vec<Vec<Option<String>>> = match src_cfg.conn_type {
-                ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => {
-                    let (mut conn, _t) = mysql_connect(&src_cfg, src_pwd.as_deref()).await?;
-                    let src_ref = if src_schema.is_empty() { q_mysql(&src_table) }
-                                  else { format!("{}.{}", q_mysql(&src_schema), q_mysql(&src_table)) };
-                    let where_clause = if last_value.is_empty() { String::new() }
-                                       else { format!("WHERE {} > '{}'", q_mysql(&pk_col), last_value.replace('\'', "\\'")) };
-                    let sql = format!("SELECT * FROM {src_ref} {where_clause} ORDER BY {} LIMIT {} OFFSET {}",
-                        q_mysql(&pk_col), batch_size, offset);
-                    let rows = sqlx::query(&sql).fetch_all(&mut conn).await.map_err(|e| format!("{e}"))?;
-                    rows.iter().map(|row| {
-                        (0..cols.len()).map(|i| row.try_get::<Option<String>, _>(i).ok().flatten()).collect()
-                    }).collect()
-                }
-                ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
-                    let (mut conn, _t) = pg_connect(&src_cfg, src_pwd.as_deref()).await?;
-                    let schema_name = if src_schema.is_empty() { "public" } else { &src_schema };
-                    let src_ref = format!("{}.{}", q_dq(schema_name), q_dq(&src_table));
-                    let where_clause = if last_value.is_empty() { String::new() }
-                                       else { format!("WHERE {} > '{}'", q_dq(&pk_col), last_value.replace('\'', "''")) };
-                    let sql = format!("SELECT * FROM {src_ref} {where_clause} ORDER BY {} LIMIT {} OFFSET {}",
-                        q_dq(&pk_col), batch_size, offset);
-                    let rows = sqlx::query(&sql).fetch_all(&mut conn).await.map_err(|e| format!("{e}"))?;
-                    rows.iter().map(|row| {
-                        (0..cols.len()).map(|i| row.try_get::<Option<String>, _>(i).ok().flatten()).collect()
-                    }).collect()
-                }
-                ConnType::Sqlite => {
-                    use sqlx::{sqlite::SqliteConnection, Connection};
-                    use crate::commands::query::sqlite_url;
-                    let url = sqlite_url(&src_cfg)?;
-                    let mut conn = SqliteConnection::connect(&url).await.map_err(|e| e.to_string())?;
-                    let src_ref = if src_schema.is_empty() { q_dq(&src_table) } else { format!("{}.{}", q_dq(&src_schema), q_dq(&src_table)) };
-                    let where_clause = if last_value.is_empty() { String::new() }
-                                       else { format!("WHERE {} > '{}'", q_dq(&pk_col), last_value.replace('\'', "''")) };
-                    let sql = format!("SELECT * FROM {src_ref} {where_clause} ORDER BY {} LIMIT {} OFFSET {}",
-                        q_dq(&pk_col), batch_size, offset);
-                    let rows = sqlx::query(&sql).fetch_all(&mut conn).await.map_err(|e| format!("{e}"))?;
-                    rows.iter().map(|row| {
-                        (0..cols.len()).map(|i| row.try_get::<Option<String>, _>(i).ok().flatten()).collect()
-                    }).collect()
-                }
-                _ => return Err("不支持的连接类型".into()),
-            };
-
-            if batch_rows.is_empty() { break; }
-            let batch_count = batch_rows.len() as u64;
-
-            // 3. Insert batch into destination
-            match dst_cfg.conn_type {
-                ConnType::Mysql | ConnType::Mariadb | ConnType::Tidb | ConnType::OceanBase => {
-                    let (mut conn, _t) = mysql_connect(&dst_cfg, dst_pwd.as_deref()).await?;
-                    let dst_ref = if dst_schema.is_empty() { q_mysql(&dst_table) }
-                                  else { format!("{}.{}", q_mysql(&dst_schema), q_mysql(&dst_table)) };
-                    let col_list = cols.iter().map(|c| q_mysql(c)).collect::<Vec<_>>().join(", ");
-                    for row in &batch_rows {
-                        let vals = row.iter().map(|v| match v {
-                            None => "NULL".to_string(),
-                            Some(s) => format!("'{}'", s.replace('\'', "\\'")),
-                        }).collect::<Vec<_>>().join(", ");
-                        let sql = format!("INSERT IGNORE INTO {dst_ref} ({col_list}) VALUES ({vals})");
-                        sqlx::query(&sql).execute(&mut conn).await.map_err(|e| format!("{e}"))?;
-                    }
-                }
-                ConnType::Postgres | ConnType::KingBase | ConnType::OpenGauss => {
-                    let (mut conn, _t) = pg_connect(&dst_cfg, dst_pwd.as_deref()).await?;
-                    let schema_name = if dst_schema.is_empty() { "public" } else { &dst_schema };
-                    let dst_ref = format!("{}.{}", q_dq(schema_name), q_dq(&dst_table));
-                    let col_list = cols.iter().map(|c| q_dq(c)).collect::<Vec<_>>().join(", ");
-                    for row in &batch_rows {
-                        let vals = row.iter().map(|v| match v {
-                            None => "NULL".to_string(),
-                            Some(s) => format!("'{}'", s.replace('\'', "''")),
-                        }).collect::<Vec<_>>().join(", ");
-                        let sql = format!("INSERT INTO {dst_ref} ({col_list}) VALUES ({vals}) ON CONFLICT DO NOTHING");
-                        sqlx::query(&sql).execute(&mut conn).await.map_err(|e| format!("{e}"))?;
-                    }
-                }
-                ConnType::Sqlite => {
-                    use sqlx::{sqlite::SqliteConnection, Connection};
-                    use crate::commands::query::sqlite_url;
-                    let url = sqlite_url(&dst_cfg)?;
-                    let mut conn = SqliteConnection::connect(&url).await.map_err(|e| e.to_string())?;
-                    let dst_ref = if dst_schema.is_empty() { q_dq(&dst_table) } else { format!("{}.{}", q_dq(&dst_schema), q_dq(&dst_table)) };
-                    let col_list = cols.iter().map(|c| q_dq(c)).collect::<Vec<_>>().join(", ");
-                    for row in &batch_rows {
-                        let vals = row.iter().map(|v| match v {
-                            None => "NULL".to_string(),
-                            Some(s) => format!("'{}'", s.replace('\'', "''")),
-                        }).collect::<Vec<_>>().join(", ");
-                        let sql = format!("INSERT OR IGNORE INTO {dst_ref} ({col_list}) VALUES ({vals})");
-                        sqlx::query(&sql).execute(&mut conn).await.map_err(|e| format!("{e}"))?;
-                    }
-                }
-                _ => return Err("不支持的连接类型".into()),
-            }
-
-            rows_migrated += batch_count as i64;
-            total_migrated_c.store(rows_migrated, std::sync::atomic::Ordering::SeqCst);
-
-            let _ = app.emit("incremental_migrate_progress", serde_json::json!({
-                "rows": rows_migrated,
-                "batchRows": batch_count,
-            }));
-
-            offset += batch_count;
-            if batch_count < batch_size { break; }
-        }
-        Ok(rows_migrated)
-    }).await;
-
-    match result {
-        Ok(n) => Ok(serde_json::json!({ "rowsMigrated": n })),
-        Err(e) => Err(e),
-    }
+    // 同主迁移使用一致性快照、严格类型前置检查和单事务。原实现把整数
+    // 解码成 NULL 并 INSERT IGNORE，既丢值又将冲突行计入迁移成功。
+    let where_clause = if last_value.is_empty() { None } else {
+        Some(format!("{} > CAST(X'{}' AS CHAR)", q_mysql(&pk_col), hex::encode(last_value.as_bytes())))
+    };
+    let result = db_migrate_table(src_id, src_schema, src_table, dst_id, dst_schema, dst_table,
+        "append".into(), batch_size, Some(MigrateOptions {
+            content: Some("data".into()), use_transaction: Some(true), where_clause,
+            ..Default::default()
+        }), app.clone(), storage, duck_pool, registry, ss_pool).await?;
+    let _ = app.emit("incremental_migrate_progress", serde_json::json!({ "rows": result.migrated_rows, "batchRows": result.migrated_rows }));
+    Ok(serde_json::json!({ "rowsMigrated": result.migrated_rows }))
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -7362,6 +9617,7 @@ fn empty_query_result() -> crate::models::QueryResult {
 pub async fn db_data_dictionary(
     id:      String,
     schema:  String,
+    ss_schema: Option<String>,
     // 可选：仅生成这些表的字典（单表/多选）；None 或空 → 整库全部基表
     tables:  Option<Vec<String>>,
     storage: State<'_, StorageState>,
@@ -7428,7 +9684,10 @@ pub async fn db_data_dictionary(
 
                 // Indexes
                 let idx_sql = format!(
-                    "SELECT CAST(INDEX_NAME AS CHAR), CAST(GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS CHAR), \
+                    "SELECT CAST(INDEX_NAME AS CHAR), \
+                            CASE WHEN COUNT(*) = COUNT(COLUMN_NAME) AND COUNT(SUB_PART) = 0 \
+                                 THEN CAST(GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS CHAR) \
+                                 ELSE '' END, \
                             CAST(NON_UNIQUE = 0 AS SIGNED), CAST(INDEX_TYPE AS CHAR) \
                      FROM information_schema.STATISTICS \
                      WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' \
@@ -7682,19 +9941,24 @@ pub async fn db_data_dictionary(
                     &ss_pool).await?;
                 tr.rows.iter().filter_map(|r| r.get(0).cloned().flatten()).collect()
             };
+            let selected = ss_schema.as_deref().map(|value| value.replace(char::from(39), "''"));
             let mut out = Vec::new();
             for tname in names {
                 if tname.is_empty() { continue; }
                 let tn = tname.replace('\'', "''");
+                let target_sql = format!("SELECT s.name FROM [{db}].sys.tables t JOIN [{db}].sys.schemas s ON s.schema_id=t.schema_id WHERE t.name=N'{tn}'{}", selected.as_ref().map(|value| format!(" AND s.name=N'{value}'")).unwrap_or_default());
+                let candidates = dispatch_ss_query(&id, &cfg, &target_sql, &ss_pool).await?;
+                if candidates.rows.len() != 1 { return Err(format!("数据字典目标 {tname} 无法唯一定位，请指定 schema")); }
+                let actual_schema = candidates.rows[0].first().and_then(|v| v.as_deref()).ok_or("无法读取数据字典目标schema")?.replace(char::from(39), "''");
                 let col_sql = format!(
                     "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE, \
                        CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 'PRI' ELSE '' END, \
                        ISNULL(c.COLUMN_DEFAULT,''), '' \
                      FROM [{db}].INFORMATION_SCHEMA.COLUMNS c \
                      LEFT JOIN (SELECT ku.COLUMN_NAME FROM [{db}].INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc \
-                         JOIN [{db}].INFORMATION_SCHEMA.KEY_COLUMN_USAGE ku ON tc.CONSTRAINT_NAME=ku.CONSTRAINT_NAME AND tc.TABLE_SCHEMA=ku.TABLE_SCHEMA \
-                         WHERE tc.CONSTRAINT_TYPE='PRIMARY KEY' AND tc.TABLE_NAME='{tn}') pk ON pk.COLUMN_NAME=c.COLUMN_NAME \
-                     WHERE c.TABLE_NAME='{tn}' ORDER BY c.ORDINAL_POSITION",
+                         JOIN [{db}].INFORMATION_SCHEMA.KEY_COLUMN_USAGE ku ON tc.CONSTRAINT_CATALOG=ku.CONSTRAINT_CATALOG AND tc.CONSTRAINT_SCHEMA=ku.CONSTRAINT_SCHEMA AND tc.CONSTRAINT_NAME=ku.CONSTRAINT_NAME AND tc.TABLE_CATALOG=ku.TABLE_CATALOG AND tc.TABLE_SCHEMA=ku.TABLE_SCHEMA AND tc.TABLE_NAME=ku.TABLE_NAME \
+                         WHERE tc.CONSTRAINT_TYPE='PRIMARY KEY' AND tc.TABLE_NAME=N'{tn}' AND tc.TABLE_SCHEMA=N'{actual_schema}') pk ON pk.COLUMN_NAME=c.COLUMN_NAME \
+                     WHERE c.TABLE_NAME=N'{tn}' AND c.TABLE_SCHEMA=N'{actual_schema}' ORDER BY c.ORDINAL_POSITION",
                     db = db, tn = tn);
                 let cr = dispatch_ss_query(&id, &cfg, &col_sql, &ss_pool).await?;
                 let idx_sql = format!(
@@ -7707,7 +9971,8 @@ pub async fn db_data_dictionary(
                        CASE WHEN i.is_unique=1 THEN '1' ELSE '0' END, i.type_desc \
                      FROM [{db}].sys.indexes i \
                      JOIN [{db}].sys.tables t ON t.object_id=i.object_id \
-                     WHERE t.name='{tn}' AND i.index_id>0 AND i.is_hypothetical=0 \
+                     JOIN [{db}].sys.schemas s ON s.schema_id=t.schema_id \
+                     WHERE t.name=N'{tn}' AND s.name=N'{actual_schema}' AND i.index_id>0 AND i.is_hypothetical=0 \
                      ORDER BY i.name",
                     db = db, tn = tn);
                 let ir = dispatch_ss_query(&id, &cfg, &idx_sql, &ss_pool).await
@@ -8225,4 +10490,115 @@ pub async fn db_fulltext_search(
         }
     }
     Ok(hits)
+}
+
+
+#[cfg(test)]
+mod copy_publication_atomicity_tests {
+    use super::*;
+    #[tokio::test]
+    #[ignore = "requires disposable MySQL DBTERM_TEST_MYSQL_PORT"]
+    async fn real_mysql_copy_is_invisible_until_complete_and_preserves_raw_ddl() {
+        let port: u16 = std::env::var("DBTERM_TEST_MYSQL_PORT").unwrap().parse().unwrap();
+        let config: ConnConfig = serde_json::from_value(serde_json::json!({
+            "id":"copy-disposable", "name":"test", "type":"mysql", "host":"127.0.0.1", "port":port,
+            "username":"root", "useSsl":false,"createdAt":0,"updatedAt":0
+        })).unwrap();
+        let db = format!("dbterm_copy_{}", uuid::Uuid::new_v4().simple());
+        let (mut conn, _) = mysql_connect(&config, None).await.unwrap();
+        sqlx::query(&format!("CREATE DATABASE {} DEFAULT CHARSET=latin1", q_mysql(&db))).execute(&mut conn).await.unwrap();
+        let raw = include_str!("fixtures/mc_pos_settlement_company.sql").trim_end();
+        let source_name = "mc_pos_settlement_company";
+        let source = mysql_qualified(&db, source_name);
+        sqlx::query(&mysql_apply_ddl(raw, source_name, &source).unwrap()).execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("INSERT INTO {source} (plan_code,plan_name) VALUES ('A','方案'),('B','')")).execute(&mut conn).await.unwrap();
+        let current_raw = mysql_read_ddl(&mut conn, &source).await.unwrap();
+        for with_data in [false, true] {
+            let dest_name = if with_data { "full_copy" } else { "structure_copy" };
+            let dest = mysql_qualified(&db, dest_name);
+            let db_for_check = db.clone();
+            let host_config = config.clone();
+            let checked = std::sync::atomic::AtomicBool::new(false);
+            let before = |stage: &str| {
+                checked.store(true, std::sync::atomic::Ordering::SeqCst);
+                assert_ne!(stage, dest, "copy must write private stage, never final table");
+                let host_config = host_config.clone();
+                let db_for_check = db_for_check.clone();
+                let dest_name = dest_name.to_string();
+                std::thread::spawn(move || {
+                    tokio::runtime::Runtime::new().unwrap().block_on(async move {
+                        let (mut c, _) = mysql_connect(&host_config, None).await.unwrap();
+                        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?")
+                            .bind(db_for_check).bind(dest_name).fetch_one(&mut c).await.unwrap();
+                        assert_eq!(exists, 0, "final destination must not be visible before publication");
+                    });
+                }).join().unwrap();
+            };
+            mysql_copy_table_atomic(&config, None, &db, source_name, dest_name, with_data, &before).await.unwrap();
+            assert!(checked.load(std::sync::atomic::Ordering::SeqCst), "publication checkpoint must be exercised");
+            let after = mysql_read_ddl(&mut conn, &dest).await.unwrap();
+            assert_eq!(mysql_apply_ddl(&after, dest_name, "same").unwrap(), mysql_apply_ddl(&current_raw, source_name, "same").unwrap());
+            let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {dest}")).fetch_one(&mut conn).await.unwrap();
+            assert_eq!(n, if with_data {2} else {0});
+            assert!(mysql_copy_table_atomic(&config, None, &db, source_name, dest_name, true, &|_| {}).await.is_err());
+            let n_after: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {dest}")).fetch_one(&mut conn).await.unwrap();
+            assert_eq!(n_after, n, "existing destination must be untouched");
+        }
+        let typed = mysql_qualified(&db, "typed_source");
+        sqlx::query(&format!("CREATE TABLE {typed} (id int PRIMARY KEY, payload varbinary(16), amount double, flag bit(9), empty_value blob, invisible_value varchar(8) INVISIBLE, instant timestamp(6), derived int GENERATED ALWAYS AS (id+1) STORED) ENGINE=InnoDB"))
+            .execute(&mut conn).await.unwrap();
+        sqlx::query("SET time_zone = '+08:00'").execute(&mut conn).await.unwrap();
+        sqlx::query(&format!("INSERT INTO {typed} (id,payload,amount,flag,empty_value,invisible_value,instant) VALUES (1,X'ff00',1.25,b'100000001',X'','hidden','2026-11-14 12:34:56.123456'),(2,NULL,-2.5,b'000000001',NULL,'two',NULL)"))
+            .execute(&mut conn).await.unwrap();
+        sqlx::query("SET time_zone = '+00:00'").execute(&mut conn).await.unwrap();
+        mysql_copy_table_atomic(&config, None, &db, "typed_source", "typed_copy", true, &|_| {}).await.unwrap();
+        let cols = ["id","payload","amount","flag","empty_value","invisible_value","instant","derived"].into_iter().map(String::from).collect::<Vec<_>>();
+        assert_eq!(mysql_raw_content_digest(&mut conn, &typed, &cols).await.unwrap(),
+            mysql_raw_content_digest(&mut conn, &mysql_qualified(&db, "typed_copy"), &cols).await.unwrap());
+        let config_for_tamper = config.clone();
+        let tamper = |stage: &str| {
+            let stage = stage.to_string();
+            let config_for_tamper = config_for_tamper.clone();
+            std::thread::spawn(move || tokio::runtime::Runtime::new().unwrap().block_on(async move {
+                let (mut c, _) = mysql_connect(&config_for_tamper, None).await.unwrap();
+                sqlx::query(&format!("UPDATE {stage} SET plan_name='tampered'")).execute(&mut c).await.unwrap();
+            })).join().unwrap();
+        };
+        let error = mysql_copy_table_atomic(&config, None, &db, source_name, "tampered_copy", true, &tamper).await.unwrap_err();
+        assert!(error.contains("内容"), "{error}");
+        let absent: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME='tampered_copy'")
+            .bind(&db).fetch_one(&mut conn).await.unwrap();
+        assert_eq!(absent, 0, "tampered stage must not publish");
+        sqlx::query(&format!("DROP DATABASE {}", q_mysql(&db))).execute(&mut conn).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod connection_policy_audit_tests {
+    use super::*;
+    #[test]
+    fn credential_store_failure_never_becomes_empty_authentication(){
+        let cfg=DbConnCfg{ssh_auth_type:"password".into(),..Default::default()};
+        assert!(cfg.tunnel_password_with("r20",|_|Err("sensitive backend failure".into())).is_err());
+    }
+    #[test]
+    fn irrelevant_agent_credentials_are_not_read(){
+        for kind in ["agent","none"]{let cfg=DbConnCfg{ssh_auth_type:kind.into(),..Default::default()};assert!(cfg.tunnel_password_with("r20",|_|panic!("unused credential lookup")).unwrap().is_empty());}
+    }
+    fn fixture(raw:&str)->ConnConfig{serde_json::from_value(serde_json::json!({"id":"r20-fixture","name":"fixture","type":"mysql","host":"127.0.0.1","port":1,"useSsl":false,"extraJson":raw,"createdAt":0,"updatedAt":0})).unwrap()}
+    #[tokio::test]
+    async fn malformed_tunnel_policy_never_becomes_direct_connection(){
+        for raw in [r#"{"sshTunnel":true,"sshPort":"bad"}"#,r#"{"sshTunnel":true,"sshPassword":42}"#]{
+            let c=fixture(raw);
+            let mysql=mysql_connect(&c,None).await.err().expect("malformed MySQL policy accepted");
+            assert!(mysql.contains("配置格式错误"),"must reject before networking: {mysql}");
+            let pg=pg_connect(&c,None).await.err().expect("malformed pg_connect policy accepted");
+            assert!(pg.contains("配置格式错误"),"must reject before networking: {pg}");
+        }
+    }
+    #[test]
+    fn malformed_policy_objects_reject_without_losing_valid_defaults(){
+        for raw in ["[]","null","{",r#"{"sshTunnel":"true"}"#]{assert!(DbConnCfg::from_config(&fixture(raw)).is_err());}
+        for raw in ["","  ","{}"]{assert!(DbConnCfg::from_config(&fixture(raw)).is_ok());}
+    }
 }

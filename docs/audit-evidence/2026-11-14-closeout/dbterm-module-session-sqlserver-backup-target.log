@@ -1,0 +1,1 @@
+PASS actual exportSchemaArchive forwards selected database/object schema for structure/data/both without starting generic table export; simulated IPC, no filesystem export.

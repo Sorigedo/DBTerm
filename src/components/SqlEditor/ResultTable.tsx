@@ -1,6 +1,6 @@
 import { useState, useMemo, useCallback, useEffect, useRef } from 'react'
 import { createPortal } from 'react-dom'
-import { Loader2, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, ChevronUp, Filter, X, ArrowUpDown, BarChart2, AlertCircle, Copy, PanelRight, ChevronRight as ChevronRightIcon, Plus, Minus, Check } from 'lucide-react'
+import { Loader2, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, ChevronUp, Filter, X, ArrowUpDown, BarChart2, AlertCircle, Copy, PanelRight, ChevronRight as ChevronRightIcon, Plus, Minus, Check, Clock, CalendarDays, Pencil } from 'lucide-react'
 import type { EditCtx } from './index'
 import type { ConnType } from '../../types'
 import { qid, tableRef as dialectTableRef, sqlStr } from '../../utils/sqlDialect'
@@ -19,6 +19,13 @@ import { requireProdConfirm } from '../../stores/confirmStore'
 import { formatDuration } from '../../utils/formatDuration'
 import { queueBackgroundExport } from '../../utils/exportTasks'
 import { copyText } from '../../utils/clipboard'
+import { resolveResultCopyMode } from './resultCopyMode'
+import { formatDateQuickValue, resolveDateQuickFillKind, type DateQuickFillKind } from './dateQuickFill'
+import { planAtomicSave } from './atomicSavePlan'
+import { createSaveLifecycle } from './saveLifecycle'
+import { stageCellUpdate } from './stagedCellUpdates'
+import { projectResultRows, rowRangeSourceIndices } from './resultRowIdentity'
+import { buildRollbackUpdates, requireRollbackScalarType, rollbackScalarLiteral } from './rollbackSql'
 
 interface QueryResult {
   columns: string[]
@@ -104,7 +111,6 @@ interface Props {
   connType: ConnType
   /** 非空表示结果可行内编辑（单表查询且主键齐全） */
   editCtx?: EditCtx | null
-  onCellUpdate?: (rowIdx: number, colIdx: number, value: string | null) => void
   onRefresh?: () => void
   /** 工具栏传送目标：传入则把操作栏渲染到该节点（如结果区页签行右侧） */
   toolbarSlot?: HTMLElement | null
@@ -128,6 +134,15 @@ interface BlobViewState {
   value: string | null
   column: string
   onSave?: (value: string | null) => void
+}
+
+interface DateQuickFillState {
+  x: number
+  y: number
+  column: string
+  kind: DateQuickFillKind
+  onSave: (value: string | null) => void
+  onManualEdit: () => void
 }
 
 const VIEW_LABELS: Record<'grid' | 'json' | 'text' | 'form', string> = { grid: '表格', json: 'JSON', text: '文本', form: '表单' }
@@ -217,6 +232,9 @@ function copyWindowSelection(): boolean {
   if (t) { navigator.clipboard.writeText(t).then(() => toast.success('已复制')).catch(() => {}); return true }
   return false
 }
+function hasWindowTextSelection(): boolean {
+  return Boolean(window.getSelection()?.toString())
+}
 // 当前是否存在「表格区域外」的真实文本选区（如 DDL/属性面板）。
 // 用于让 Cmd+C 把这类选区交还浏览器原生复制，而不是被残留的单元格选区抢走。
 function textSelectionOutsideGrid(): boolean {
@@ -262,7 +280,6 @@ export default function ResultTable({
   connectionId,
   connType,
   editCtx,
-  onCellUpdate,
   onRefresh,
   toolbarSlot,
   active = true,
@@ -285,6 +302,7 @@ export default function ResultTable({
   const showForm = useCallback((absRow: number) => { setFormIdx(absRow); setViewMode('form') }, [])
   // R7 — BLOB 查看器
   const [blobView, setBlobView] = useState<BlobViewState | null>(null)
+  const [dateQuickFill, setDateQuickFill] = useState<DateQuickFillState | null>(null)
   const cellPreviewTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => () => {
     if (cellPreviewTimer.current) clearTimeout(cellPreviewTimer.current)
@@ -307,6 +325,46 @@ export default function ResultTable({
       cellPreviewTimer.current = null
     }
   }, [])
+  useEffect(() => {
+    if (!dateQuickFill) return
+    const close = () => setDateQuickFill(null)
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') close()
+    }
+    window.addEventListener('mousedown', close)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', close)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [dateQuickFill])
+  const openDateQuickFill = useCallback((
+    e: React.MouseEvent,
+    col: number,
+    onSave: (value: string | null) => void,
+    onManualEdit: () => void,
+  ): boolean => {
+    if (!editCtx || !result) return false
+    const column = result.columns[col] ?? ''
+    const kind = resolveDateQuickFillKind(editCtx.columnTypes[column])
+    if (!kind) return false
+    cancelCellPreview()
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+    setDateQuickFill({
+      x: Math.min(rect.left, window.innerWidth - 220),
+      y: Math.min(rect.bottom + 4, window.innerHeight - 190),
+      column,
+      kind,
+      onSave,
+      onManualEdit,
+    })
+    return true
+  }, [cancelCellPreview, editCtx, result])
+  const applyDateQuickFill = useCallback((kind: DateQuickFillKind) => {
+    if (!dateQuickFill) return
+    dateQuickFill.onSave(formatDateQuickValue(new Date(), kind))
+    setDateQuickFill(null)
+  }, [dateQuickFill])
   // M3 — 图表
   const [chartOpen, setChartOpen] = useState(false)
 
@@ -315,6 +373,17 @@ export default function ResultTable({
   const [filterCol, setFilterCol] = useState<number>(-1) // -1 = 全列
   const [sortCol, setSortCol] = useState<number>(-1)
   const [sortAsc, setSortAsc] = useState(true)
+  // Store source indices for edits and selected rows; display order is independent.
+  const visibleRows = useMemo(() => projectResultRows(result?.rows ?? [], row => {
+    const q = filterText.trim().toLowerCase()
+    if (!q) return true
+    return filterCol >= 0 ? (row[filterCol] ?? '').toLowerCase().includes(q)
+      : row.some(cell => (cell ?? '').toLowerCase().includes(q))
+  }, sortCol >= 0 ? (a, b) => {
+    const cmp = compareCellValue(a[sortCol] ?? '', b[sortCol] ?? '')
+    return sortAsc ? cmp : -cmp
+  } : undefined), [result, filterText, filterCol, sortCol, sortAsc])
+  const filteredRows = useMemo(() => visibleRows.map(item => item.row), [visibleRows])
   const [showFilter, setShowFilter] = useState(dbResultFilterDefaultOpen) // 过滤栏默认值来自偏好设置，Mod+F 可临时切换
   const [viewMode, setViewMode] = useState<DbResultDefaultView | 'form'>(dbResultDefaultView) // 结果展示形态
   const [viewMenuOpen, setViewMenuOpen] = useState(false) // 展示方式上弹菜单
@@ -458,11 +527,8 @@ export default function ResultTable({
     return () => window.removeEventListener('mousedown', close)
   }, [rowMenu])
   const selectRowRange = useCallback((a: number, b: number) => {
-    const lo = Math.min(a, b), hi = Math.max(a, b)
-    const next = new Set<string>()
-    for (let i = lo; i <= hi; i++) next.add(String(i))
-    setSelectedRows(next)
-  }, [])
+    setSelectedRows(new Set(rowRangeSourceIndices(visibleRows, a, b).map(String)))
+  }, [visibleRows])
   const blurEditorOrInput = () => {
     const ae = document.activeElement as HTMLElement | null
     if (ae && (ae.classList.contains('cm-content') || ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA')) ae.blur()
@@ -473,13 +539,11 @@ export default function ResultTable({
     const t = e.target as HTMLElement
     if (t.closest('input, textarea, button')) return
     if (e.shiftKey && cellSel) { setCellSel({ a: cellSel.a, f: { r, v } }); return }
-    e.preventDefault()
-    // preventDefault 会保留 SQL 编辑器焦点，导致 Mod+C 被输入框保护逻辑跳过。
+    // SQL 编辑器保留焦点时会导致 Mod+C 被输入框保护逻辑跳过。
     blurEditorOrInput()
-    window.getSelection()?.removeAllRanges()
     cellDragRef.current = true
     setCellSel({ a: { r, v }, f: { r, v } })
-    setFocusedCell({ absRow: r, col: colOrderRef.current[v] ?? v })
+    setFocusedCell({ absRow: visibleRows[r]?.sourceIndex ?? -1, col: colOrderRef.current[v] ?? v })
     if (selectedRows.size) setSelectedRows(new Set())   // 选单元格清整行选择（互斥）
   }
   function onCellMouseEnter(r: number, v: number) {
@@ -515,13 +579,19 @@ export default function ResultTable({
   }, [selectRowRange])
 
   // 行内编辑（双击 → 暂存 update）
-  const [editing, setEditing] = useState<{ absRow: number; col: number; val: string } | null>(null)
+  const [editing, setEditing] = useState<{ absRow: number; col: number; val: string; initialVal: string } | null>(null)
   const editInputRef = useRef<HTMLInputElement>(null)
   const filterInputRef = useRef<HTMLInputElement>(null)
 
   // 暂存变更
   const [stagedChanges, setStagedChanges] = useState<StagedChange[]>([])
   const [committing, setCommitting] = useState(false)
+  const [saveNeedsRefresh, setSaveNeedsRefresh] = useState(false)
+  const saveLifecycle = useRef(createSaveLifecycle()).current
+  const saveContext = useRef({ result, connectionId, schema: editCtx?.schema, table: editCtx?.table })
+  saveContext.current = { result, connectionId, schema: editCtx?.schema, table: editCtx?.table }
+  const mounted = useRef(true)
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
 
   // 预览 SQL 模态
   const [previewOpen, setPreviewOpen] = useState(false)
@@ -558,7 +628,7 @@ export default function ResultTable({
   }
 
   // 新增行 — 暂存 insert 的行内编辑
-  const [insertEditing, setInsertEditing] = useState<{ tempId: string; col: number; val: string } | null>(null)
+  const [insertEditing, setInsertEditing] = useState<{ tempId: string; col: number; val: string; initialVal: string } | null>(null)
   const insertInputRef = useRef<HTMLInputElement>(null)
 
   // 新查询结果重置
@@ -566,6 +636,7 @@ export default function ResultTable({
   useEffect(() => {
     setPage(0)
     setEditing(null)
+    setInsertEditing(null)
     setStagedChanges([])
     setSelectedRows(new Set())
     setFilterText('')
@@ -573,10 +644,21 @@ export default function ResultTable({
     setSortCol(-1)
     setShowFilter(dbResultFilterDefaultOpen)
     setViewMode(dbResultDefaultView)
+    setDateQuickFill(null)
     setGridScrollTop(0)
     tableScrollRef.current?.scrollTo({ top: 0 })
     lastClickedRow.current = null
-  }, [result?.columns, dbResultDefaultView, dbResultFilterDefaultOpen])
+  }, [result, connectionId, editCtx?.schema, editCtx?.table, dbResultDefaultView, dbResultFilterDefaultOpen])
+  useEffect(() => { setSaveNeedsRefresh(false) }, [result, connectionId, editCtx?.schema, editCtx?.table])
+  useEffect(() => {
+    setCellSel(null)
+    setEditing(null)
+    setCtxMenu(null)
+    setRowMenu(null)
+    setFormIdx(0)
+    rowDragRef.current = null
+    cellDragRef.current = false
+  }, [filterText, filterCol, sortCol, sortAsc])
 
   // 关闭右键菜单（点击别处）
   useEffect(() => {
@@ -603,14 +685,14 @@ export default function ResultTable({
   // 暂存操作
   // ──────────────────────────────────────────────
   const addInsertRow = useCallback(() => {
-    if (!result) return
+    if (!result || saveLifecycle.busy || saveNeedsRefresh) return
     const tempId = `insert-${Date.now()}-${Math.random()}`
     const emptyRow: (string | null)[] = result.columns.map(() => null)
     setStagedChanges((prev) => [...prev, { type: 'insert', row: emptyRow, tempId }])
-  }, [result])
+  }, [result, saveLifecycle, saveNeedsRefresh])
 
   const deleteSelectedRows = useCallback(() => {
-    if (!editCtx || !result) return
+    if (!editCtx || !result || saveLifecycle.busy || saveNeedsRefresh) return
     setStagedChanges((prev) => {
       const next = [...prev]
       for (const key of selectedRows) {
@@ -623,138 +705,148 @@ export default function ResultTable({
           if (isNaN(absRow)) continue
           // 避免重复
           if (next.some((c) => c.type === 'delete' && c.absRow === absRow)) continue
-          next.push({ type: 'delete', absRow, pkValues: getPkValues(absRow) })
+          const original = next.find(c => c.type === 'update' && c.absRow === absRow)
+          const pkValues = original?.type === 'update' ? original.pkValues : getPkValues(absRow)
+          for (let i = next.length - 1; i >= 0; i--) {
+            const change = next[i]
+            if (change.type === 'update' && change.absRow === absRow) next.splice(i, 1)
+          }
+          next.push({ type: 'delete', absRow, pkValues })
         }
       }
       return next
     })
     setSelectedRows(new Set())
-  }, [editCtx, result, selectedRows, getPkValues])
+  }, [editCtx, result, selectedRows, getPkValues, saveLifecycle, saveNeedsRefresh])
 
   // 双击单元格 → 暂存 update（而非立即提交）
   const startCellEdit = useCallback(
     (absRow: number, col: number, currentVal: string | null) => {
-      if (!editCtx) return
-      setEditing({ absRow, col, val: currentVal ?? '' })
+      if (!editCtx || saveLifecycle.busy || saveNeedsRefresh) return
+      setEditing({ absRow, col, val: currentVal ?? '', initialVal: currentVal ?? '' })
       setTimeout(() => editInputRef.current?.select(), 30)
     },
-    [editCtx]
+    [editCtx, saveLifecycle, saveNeedsRefresh]
   )
 
   // 统一处理网格与内容预览弹窗提交的单元格更新。
   const saveCellValue = useCallback((absRow: number, col: number, val: string | null) => {
-    if (!result || !editCtx || !result.rows[absRow]) return
+    if (!result || !editCtx || !result.rows[absRow] || saveLifecycle.busy || saveNeedsRefresh) return
     const oldVal = result.rows[absRow][col]
-    if ((oldVal ?? '') === (val ?? '')) return
-    setStagedChanges((prev) => {
-      const existIdx = prev.findIndex(c => c.type === 'update' && c.absRow === absRow && c.col === col)
-      if (existIdx !== -1) {
-        const next = [...prev]
-        next[existIdx] = { ...(next[existIdx] as Extract<StagedChange, { type: 'update' }>), newVal: val }
-        return next
-      }
-      return [...prev, { type: 'update', absRow, col, oldVal, newVal: val, pkValues: getPkValues(absRow) }]
-    })
-    onCellUpdate?.(absRow, col, val)
-  }, [result, editCtx, getPkValues, onCellUpdate])
+    setStagedChanges(prev => stageCellUpdate(prev, absRow, col, oldVal, val, getPkValues(absRow)))
+  }, [result, editCtx, getPkValues, saveLifecycle, saveNeedsRefresh])
 
   const commitCellEdit = useCallback(() => {
     if (!editing || !result || !editCtx) return
     const { absRow, col, val } = editing
     const row = result.rows[absRow]
     if (!row) { setEditing(null); return }
-    const oldVal = row[col]
-    // 值未变
-    if ((oldVal ?? '') === val) { setEditing(null); return }
-    if (oldVal === null && val === '') { setEditing(null); return }
-
-    const newVal = val === '' ? null : val
-    saveCellValue(absRow, col, newVal)
+    if (val === editing.initialVal) { setEditing(null); return }
+    // 空字符串与 NULL 是不同数据；设为 NULL 使用独立操作。
+    saveCellValue(absRow, col, val)
     setEditing(null)
   }, [editing, result, editCtx, saveCellValue])
 
   // Insert 行单元格编辑
   const commitInsertEdit = useCallback(() => {
-    if (!insertEditing) return
+    if (!insertEditing || saveLifecycle.busy || saveNeedsRefresh) return
     const { tempId, col, val } = insertEditing
+    if (val === insertEditing.initialVal) { setInsertEditing(null); return }
     setStagedChanges((prev) =>
       prev.map((c) => {
         if (c.type === 'insert' && c.tempId === tempId) {
           const newRow = [...c.row]
-          newRow[col] = val === '' ? null : val
+          newRow[col] = val
           return { ...c, row: newRow }
         }
         return c
       })
     )
     setInsertEditing(null)
-  }, [insertEditing])
+  }, [insertEditing, saveLifecycle, saveNeedsRefresh])
 
   // ──────────────────────────────────────────────
   // 提交 / 放弃
   // ──────────────────────────────────────────────
   const commitAll = useCallback(async () => {
-    if (!editCtx || !connectionId || stagedChanges.length === 0 || committing) return
-    // 生产环境写操作二次确认
+    if (!editCtx || !connectionId || stagedChanges.length === 0 || saveLifecycle.busy || saveNeedsRefresh) return
+    const snapshot = saveContext.current
+    const isCurrent = () => mounted.current && saveContext.current.result === snapshot.result
+      && saveContext.current.connectionId === snapshot.connectionId
+      && saveContext.current.schema === snapshot.schema && saveContext.current.table === snapshot.table
     const conn = useAppStore.getState().connections.find(c => c.id === connectionId)
-    if (!(await requireProdConfirm(conn, `提交 ${stagedChanges.length} 项数据变更到 ${editCtx.schema}.${editCtx.table}`))) return
+    let operation: ReturnType<typeof planAtomicSave>
+    try { operation = planAtomicSave(stagedChanges) } catch (e) { toast.error(String(e)); return }
+    const columns = result?.columns ?? []
+    const inserts = stagedChanges.filter((c): c is Extract<StagedChange, { type: 'insert' }> => c.type === 'insert')
+    const deletes = stagedChanges.filter((c): c is Extract<StagedChange, { type: 'delete' }> => c.type === 'delete')
+    const updates = stagedChanges.filter((c): c is Extract<StagedChange, { type: 'update' }> => c.type === 'update')
+    let dispatched = false
     setCommitting(true)
-    try {
+    const outcome = await saveLifecycle.run({
+      confirm: () => requireProdConfirm(conn, `提交 ${stagedChanges.length} 项数据变更到 ${editCtx.schema}.${editCtx.table}`),
+      current: isCurrent,
+      write: async () => {
       const { invoke } = await import('@tauri-apps/api/core')
-      const columns = result?.columns ?? []
-
-      const inserts = stagedChanges.filter((c) => c.type === 'insert') as Extract<StagedChange, { type: 'insert' }>[]
-      const deletes = stagedChanges.filter((c) => c.type === 'delete') as Extract<StagedChange, { type: 'delete' }>[]
-      const updates = stagedChanges.filter((c) => c.type === 'update') as Extract<StagedChange, { type: 'update' }>[]
-
-      for (const ins of inserts) {
+      if (!isCurrent()) throw new Error('结果集已切换，本次变更未提交')
+      dispatched = true
+      if (operation === 'insert') {
         await invoke('db_insert_rows', {
           id: connectionId,
           schema: editCtx.schema,
           table: editCtx.table,
           columns,
-          rows: [ins.row],
+          rows: inserts.map(ins => ins.row),
         })
       }
 
-      for (const del of deletes) {
+      if (operation === 'delete') {
         await invoke('db_delete_rows', {
           id: connectionId,
           schema: editCtx.schema,
           table: editCtx.table,
           pkColumns: editCtx.pkCols,
-          pkValuesList: [del.pkValues],
+          pkValuesList: deletes.map(del => del.pkValues),
+          baseline: { columns, rows: deletes.map(del => result!.rows[del.absRow]) },
         })
       }
 
-      for (const upd of updates) {
-        await invoke('update_cell', {
-          id: connectionId,
-          schema: editCtx.schema,
-          table: editCtx.table,
-          column: columns[upd.col],
-          newValue: upd.newVal,
-          pkColumns: editCtx.pkCols,
-          pkValues: upd.pkValues,
-        })
+      if (operation === 'update') {
+        const grouped = new Map<number, { columns: string[]; values: (string | null)[]; pkColumns: string[]; pkValues: (string | null)[]; expectedValues: (string | null)[] }>()
+        for (const upd of updates) {
+          const row = grouped.get(upd.absRow) ?? { columns: [], values: [], pkColumns: editCtx.pkCols, pkValues: upd.pkValues, expectedValues: [] }
+          row.columns.push(columns[upd.col])
+          row.values.push(upd.newVal)
+          row.expectedValues.push(upd.oldVal)
+          grouped.set(upd.absRow, row)
+        }
+        if (updates.length === 1) {
+          const upd = updates[0]
+          await invoke('update_cell', { id: connectionId, schema: editCtx.schema, table: editCtx.table,
+            column: columns[upd.col], newValue: upd.newVal, pkColumns: editCtx.pkCols, pkValues: upd.pkValues, expectedValues: [upd.oldVal] })
+        } else {
+          await invoke('update_cells', { id: connectionId, schema: editCtx.schema, table: editCtx.table, changes: [...grouped.values()] })
+        }
       }
 
+      },
+      committed: () => {
+        setStagedChanges([])
+        setSelectedRows(new Set())
+      },
+      followUp: async () => {
+      let archiveWarning: unknown
+      try {
       // R6 回滚 SQL 存档
       if (connectionId && editCtx && result) {
         const tgt = dialectTableRef(connType, editCtx.schema, editCtx.table)
-        const reverseLines: string[] = []
-
-        for (const upd of updates) {
-          const colName = columns[upd.col]
-          const setCl = `${qid(connType, colName)} = ${sqlLiteral(upd.oldVal)}`
-          const where = editCtx.pkCols.map((pk, i) => `${qid(connType, pk)} = ${sqlLiteral(upd.pkValues[i])}`).join(' AND ')
-          reverseLines.push(`UPDATE ${tgt} SET ${setCl} WHERE ${where};`)
-        }
+        const reverseLines = buildRollbackUpdates(connType, tgt, columns, editCtx.pkCols, editCtx.columnTypes, updates)
 
         for (const del of deletes) {
           const rowData = result.rows[del.absRow]
+          columns.forEach(column => requireRollbackScalarType(column, editCtx.columnTypes))
           const colList = columns.map(c => qid(connType, c)).join(', ')
-          const valList = rowData.map(v => sqlLiteral(v)).join(', ')
+          const valList = rowData.map(v => rollbackScalarLiteral(connType, v)).join(', ')
           reverseLines.push(`INSERT INTO ${tgt} (${colList}) VALUES (${valList});`)
         }
 
@@ -769,19 +861,25 @@ export default function ResultTable({
           })
         }
       }
-
-      setStagedChanges([])
-      setSelectedRows(new Set())
-      onRefresh?.()
-      toast.success('已提交变更')
-    } catch (e) {
-      toast.error('提交失败：' + String(e))
-    } finally {
-      setCommitting(false)
+      } catch (error) { archiveWarning = error }
+      await onRefresh?.()
+      if (archiveWarning) throw archiveWarning
+      },
+    })
+    if (outcome.status === 'committed') {
+      if (outcome.warning) toast.warning('数据已提交，但刷新或本地记录失败；请刷新核对，勿重复提交：' + String(outcome.warning))
+      else toast.success('已提交变更')
+    } else if (outcome.status === 'failed') {
+      if (dispatched && isCurrent()) setSaveNeedsRefresh(true)
+      toast.error((dispatched ? '保存未获成功确认，请先刷新核对数据库后再编辑，勿直接重试：' : '提交失败：') + String(outcome.error))
+    } else if (outcome.status === 'stale') {
+      toast.info('结果集已切换，本次变更未提交')
     }
-  }, [editCtx, connectionId, connType, stagedChanges, committing, result, onRefresh])
+    if (mounted.current) setCommitting(false)
+  }, [editCtx, connectionId, connType, stagedChanges, result, onRefresh, saveLifecycle, saveNeedsRefresh])
 
   const rollbackAll = useCallback(() => {
+    if (saveLifecycle.busy) return
     setStagedChanges([])
     setSelectedRows(new Set())
   }, [])
@@ -789,32 +887,11 @@ export default function ResultTable({
   // ──────────────────────────────────────────────
   // 分页 & 行列表
   // ──────────────────────────────────────────────
-  // K7 — filtered + sorted rows (client-side, no DB query)
-  const filteredRows = useMemo(() => {
-    let rows = result?.rows ?? []
-    if (filterText.trim()) {
-      const q = filterText.toLowerCase()
-      rows = rows.filter(row => {
-        if (filterCol >= 0) return (row[filterCol] ?? '').toLowerCase().includes(q)
-        return row.some(cell => (cell ?? '').toLowerCase().includes(q))
-      })
-    }
-    if (sortCol >= 0) {
-      rows = [...rows].sort((a, b) => {
-        const av = a[sortCol] ?? ''
-        const bv = b[sortCol] ?? ''
-        const cmp = compareCellValue(av, bv)
-        return sortAsc ? cmp : -cmp
-      })
-    }
-    return rows
-  }, [result, filterText, filterCol, sortCol, sortAsc])
-
   // 选中行的数据（按行号升序）
   const selectedRowData = useCallback(() => {
     const idxs = [...selectedRows].map(k => parseInt(k, 10)).filter(n => !isNaN(n)).sort((a, b) => a - b)
-    return idxs.map(i => filteredRows[i]).filter(Boolean)
-  }, [selectedRows, filteredRows])
+    return idxs.map(i => result?.rows[i]).filter((row): row is (string | null)[] => !!row)
+  }, [selectedRows, result])
 
   // 生成选中行文本（多格式），不写剪贴板
   const buildRowsText = useCallback((fmt: 'tsv' | 'csv' | 'json' | 'sql' | 'md'): string => {
@@ -859,21 +936,21 @@ export default function ResultTable({
   // 仅当"选了行 / 聚焦单元格但无文本选区"时由我们接管，避免"选中即复制 + 到处弹提示"。
   useEffect(() => {
     const onCopy = (e: ClipboardEvent) => {
-      if (isInEditorOrInput(e.target)) return
-      // 显式选中行优先于浏览器自带文本选区（拖拽选行常残留文本选区，否则会退化成单行原生复制）
-      if (selectedRows.size > 0) {
+      const mode = resolveResultCopyMode({
+        inputSelection: false,
+        editorOrInput: isInEditorOrInput(e.target),
+        textSelection: hasWindowTextSelection(),
+        selectedRows: selectedRows.size > 0,
+        cellSelection: Boolean(cellSel),
+        focusedCell: Boolean(focusedCell),
+      })
+      if (mode === 'ignore-editor' || mode === 'text-selection') return
+      if (mode === 'rows') {
         const t = buildRowsText(viewMode === 'json' ? 'json' : 'tsv')
         if (t) { e.preventDefault(); e.clipboardData?.setData('text/plain', t); toast.success(`已复制 ${selectedRows.size} 行`) }
-        return
-      }
-      if (cellSel) {   // 选中单元格区域 → 复制为 TSV
+      } else if (mode === 'cells' && cellSel) {
         e.preventDefault(); e.clipboardData?.setData('text/plain', cellSelToTsv(cellSel)); toast.success('已复制选中单元格')
-        return
-      }
-      // 表格外（DDL / 属性面板等）有真实文本选区 → 交还浏览器原生复制
-      if (textSelectionOutsideGrid()) return
-      if (window.getSelection()?.toString()) return
-      if (focusedCell && result) {
+      } else if (mode === 'focused-cell' && focusedCell && result) {
         e.preventDefault()
         e.clipboardData?.setData('text/plain', result.rows[focusedCell.absRow]?.[focusedCell.col] ?? '')
         toast.success('已复制单元格')
@@ -895,7 +972,7 @@ export default function ResultTable({
 
   // KB2 结果表快捷键
   useShortcuts('result-table', {
-    tableRefresh:  () => onRefresh?.(),
+    tableRefresh:  () => { if (!saveLifecycle.busy) onRefresh?.() },
     tableFilter:   () => {
       if (showFilter || filterText) {
         setShowFilter(false); setFilterText(''); setPage(0)
@@ -908,17 +985,12 @@ export default function ResultTable({
     tableCommit:   () => { if (stagedChanges.length > 0) commitAll() },
     tableRowDetail: () => {
       if (!filteredRows.length) return
-      showForm(focusedCell?.absRow ?? 0)
+      showForm(Math.max(0, visibleRows.findIndex(item => item.sourceIndex === focusedCell?.absRow)))
     },
     tableSetNull: () => {
-      if (!focusedCell || !editCtx || !result) return
+      if (!focusedCell || !editCtx || !result || saveLifecycle.busy || saveNeedsRefresh) return
       const { absRow, col } = focusedCell
-      const pkValues = getPkValues(absRow)
-      setStagedChanges(prev => {
-        const filtered = prev.filter(c => !(c.type === 'update' && c.absRow === absRow && c.col === col))
-        return [...filtered, { type: 'update', absRow, col, oldVal: result.rows[absRow]?.[col] ?? null, newVal: null, pkValues }]
-      })
-      onCellUpdate?.(absRow, col, null)
+      saveCellValue(absRow, col, null)
     },
     // 注意：Ctrl+C 不再走全局 keydown 拦截，改由原生 copy 事件处理（见上方 useEffect），
     // 以免选中文本时也被接管。Mod+Shift+C 仍保留为"显式复制选中行/单元格"。
@@ -954,18 +1026,18 @@ export default function ResultTable({
   const virtualGrid = useMemo(() => {
     const rowCount = filteredRows.length
     if (rowCount === 0) {
-      return { rows: [] as Array<{ row: (string | null)[]; absRow: number }>, start: 0, topPad: 0, bottomPad: 0 }
+      return { rows: [] as Array<{ row: (string | null)[]; absRow: number; visibleIndex: number }>, start: 0, topPad: 0, bottomPad: 0 }
     }
     const visibleCount = Math.ceil(gridViewportH / GRID_ROW_HEIGHT) + GRID_OVERSCAN * 2
     const start = Math.max(0, Math.floor(gridScrollTop / GRID_ROW_HEIGHT) - GRID_OVERSCAN)
     const end = Math.min(rowCount, start + visibleCount)
     return {
-      rows: filteredRows.slice(start, end).map((row, i) => ({ row, absRow: start + i })),
+      rows: visibleRows.slice(start, end).map(({ row, sourceIndex }, i) => ({ row, absRow: sourceIndex, visibleIndex: start + i })),
       start,
       topPad: start * GRID_ROW_HEIGHT,
       bottomPad: Math.max(0, (rowCount - end) * GRID_ROW_HEIGHT),
     }
-	  }, [filteredRows, gridScrollTop, gridViewportH])
+	  }, [visibleRows, filteredRows.length, gridScrollTop, gridViewportH])
   const gridTableWidth = 6 + colOrder.reduce((sum, ci) => sum + (colWidths.get(ci) ?? GRID_DEFAULT_COL_WIDTH), 0)
 
   // Mod+A：全选当前结果区所有单元格（仅激活标签响应；编辑器/输入框内不拦）
@@ -990,20 +1062,25 @@ export default function ResultTable({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!active || !(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'c' || e.shiftKey || e.altKey) return
-      if (isInEditorOrInput(e.target)) return
-      if (selectedRows.size > 0) {
+      const mode = resolveResultCopyMode({
+        inputSelection: false,
+        editorOrInput: isInEditorOrInput(e.target),
+        textSelection: textSelectionOutsideGrid() || hasWindowTextSelection(),
+        selectedRows: selectedRows.size > 0,
+        cellSelection: Boolean(cellSel),
+        focusedCell: Boolean(focusedCell),
+      })
+      if (mode === 'ignore-editor' || mode === 'text-selection') return
+      if (mode === 'rows') {
         const t = buildRowsText(viewMode === 'json' ? 'json' : 'tsv')
         if (t) { e.preventDefault(); navigator.clipboard.writeText(t).then(() => toast.success(`已复制 ${selectedRows.size} 行`)).catch(() => {}) }
         return
       }
-      if (cellSel) {
+      if (mode === 'cells' && cellSel) {
         e.preventDefault(); navigator.clipboard.writeText(cellSelToTsv(cellSel)).then(() => toast.success('已复制选中单元格')).catch(() => {})
         return
       }
-      // 表格外（DDL / 属性面板等）有真实文本选区 → 交还浏览器原生复制
-      if (textSelectionOutsideGrid()) return
-      if (window.getSelection()?.toString()) return
-      if (focusedCell && result) {
+      if (mode === 'focused-cell' && focusedCell && result) {
         e.preventDefault()
         navigator.clipboard.writeText(result.rows[focusedCell.absRow]?.[focusedCell.col] ?? '').then(() => toast.success('已复制单元格')).catch(() => {})
       }
@@ -1115,7 +1192,7 @@ export default function ResultTable({
   )
 
   const handleCtxSetNull = useCallback(() => {
-    if (!ctxMenu || !editCtx || !result) return
+    if (!ctxMenu || !editCtx || !result || saveLifecycle.busy || saveNeedsRefresh) return
     const { absRow, col, isStaged, tempId } = ctxMenu
     if (isStaged && tempId) {
       setStagedChanges((prev) =>
@@ -1131,22 +1208,10 @@ export default function ResultTable({
     } else {
       const row = result.rows[absRow]
       if (!row) return
-      const oldVal = row[col]
-      setStagedChanges((prev) => {
-        const existIdx = prev.findIndex(
-          (c) => c.type === 'update' && c.absRow === absRow && c.col === col
-        )
-        if (existIdx !== -1) {
-          const next = [...prev]
-          next[existIdx] = { ...(next[existIdx] as Extract<StagedChange, { type: 'update' }>), newVal: null }
-          return next
-        }
-        return [...prev, { type: 'update', absRow, col, oldVal, newVal: null, pkValues: getPkValues(absRow) }]
-      })
-      onCellUpdate?.(absRow, col, null)
+      saveCellValue(absRow, col, null)
     }
     setCtxMenu(null)
-  }, [ctxMenu, editCtx, result, getPkValues, onCellUpdate])
+  }, [ctxMenu, editCtx, result, saveCellValue, saveLifecycle, saveNeedsRefresh])
 
   const handleCtxCopyCell = useCallback(() => {
     if (!ctxMenu || !result) return
@@ -1177,7 +1242,7 @@ export default function ResultTable({
   }, [ctxMenu, result, stagedChanges])
 
   const handleCtxDeleteRow = useCallback(() => {
-    if (!ctxMenu || !editCtx) return
+    if (!ctxMenu || !editCtx || saveLifecycle.busy || saveNeedsRefresh) return
     const { absRow, isStaged, tempId } = ctxMenu
     if (isStaged && tempId) {
       setStagedChanges((prev) => prev.filter((c) => !(c.type === 'insert' && c.tempId === tempId)))
@@ -1188,7 +1253,7 @@ export default function ResultTable({
       })
     }
     setCtxMenu(null)
-  }, [ctxMenu, editCtx, getPkValues])
+  }, [ctxMenu, editCtx, getPkValues, saveLifecycle, saveNeedsRefresh])
 
   // ──────────────────────────────────────────────
   // Early returns
@@ -1256,10 +1321,12 @@ export default function ResultTable({
   })() : ''
 
   // 行内详情目标行：优先聚焦单元格所在行，否则首个选中行
-  const detailRow = focusedCell?.absRow ?? (() => {
+  const detailSourceRow = focusedCell?.absRow ?? (() => {
     for (const k of selectedRows) { const n = parseInt(k, 10); if (!isNaN(n)) return n }
     return null
   })()
+  const detailRow = detailSourceRow === null ? null : visibleRows.findIndex(item => item.sourceIndex === detailSourceRow)
+  const formSourceIndex = visibleRows[formIdx]?.sourceIndex ?? -1
 
   return (
     <div className="result-wrap">
@@ -1355,13 +1422,13 @@ export default function ResultTable({
         <div className="result-form-body">
           {result.columns.map((c, i) => {
             const raw = filteredRows[formIdx]?.[i] ?? null
-            const v = updateMap.has(`${formIdx}-${i}`) ? updateMap.get(`${formIdx}-${i}`)! : raw
-            const isEditing = editing?.absRow === formIdx && editing.col === i
+            const v = updateMap.has(`${formSourceIndex}-${i}`) ? updateMap.get(`${formSourceIndex}-${i}`)! : raw
+            const isEditing = editing?.absRow === formSourceIndex && editing.col === i
             return (
               <div className="result-form-row" key={i}>
                 <div className="result-form-key" title={c}>{c}</div>
                 <div className={`result-form-val${v === null ? ' result-form-val--null' : ''}${hasEditable ? ' result-form-val--editable' : ''}`}
-                  onDoubleClick={() => { if (hasEditable) startCellEdit(formIdx, i, v ?? null) }}>
+                  onDoubleClick={() => { if (hasEditable) startCellEdit(formSourceIndex, i, v ?? null) }}>
                   {isEditing ? (
                     <input ref={editInputRef} className="result-cell-input"
                       value={editing.val}
@@ -1433,7 +1500,7 @@ export default function ResultTable({
                 <td colSpan={colOrder.length + 1} style={{ height: virtualGrid.topPad }} />
               </tr>
             )}
-            {virtualGrid.rows.map(({ row, absRow }) => {
+            {virtualGrid.rows.map(({ row, absRow, visibleIndex }) => {
               const rowKey = String(absRow)
               const isDeleted = deletedAbsRows.has(absRow)
               const isSelected = selectedRows.has(rowKey)
@@ -1448,7 +1515,7 @@ export default function ResultTable({
                     data-tip="点击/拖拽选择行 · 双击查看详情 · 右键更多"
                     onMouseDown={(e) => onRownumMouseDown(absRow, e)}
                     onMouseEnter={() => onRownumEnter(absRow)}
-                    onDoubleClick={() => showForm(absRow)}
+                    onDoubleClick={() => showForm(visibleIndex)}
                     onContextMenu={(e) => onRowCtxMenu(e, absRow)}
                   />
                   {/* 行号栏只留窄间隔，不显示序号 */}
@@ -1468,13 +1535,19 @@ export default function ResultTable({
                           shouldPreviewCell(displayVal) ? 'result-td--previewable' : '',
                           hasEditable && !isDeleted ? 'result-td--editable' : '',
                           hasUpdate ? 'result-td--updated' : '',
-                          cellInSel(absRow, vi) ? 'result-td--cellsel' : '',
+                          cellInSel(visibleIndex, vi) ? 'result-td--cellsel' : '',
                         ].filter(Boolean).join(' ')}
                         style={{ width: w, maxWidth: w }}
-                        onMouseDown={(e) => onCellMouseDown(e, absRow, vi)}
-                        onMouseEnter={() => onCellMouseEnter(absRow, vi)}
+                        onMouseDown={(e) => onCellMouseDown(e, visibleIndex, vi)}
+                        onMouseEnter={() => onCellMouseEnter(visibleIndex, vi)}
                         onClick={(e) => {
                           if (isEditing) return
+                          if (hasEditable && !isDeleted && openDateQuickFill(
+                            e,
+                            ci,
+                            (nextValue) => saveCellValue(absRow, ci, nextValue),
+                            () => startCellEdit(absRow, ci, displayVal ?? null),
+                          )) return
                           scheduleCellPreview(
                             e,
                             displayVal,
@@ -1536,8 +1609,27 @@ export default function ResultTable({
                         className={`result-td result-td--editable${cell === null ? ' result-td--null' : ''}${shouldPreviewCell(cell) ? ' result-td--previewable' : ''}`}
                         style={{ width: w, maxWidth: w }}
                         onClick={(e) => {
+                          if (saveLifecycle.busy || saveNeedsRefresh) return
                           if (isEditingInsert) return
+                          if (openDateQuickFill(
+                            e,
+                            ci,
+                            (nextValue) => {
+                              if (saveLifecycle.busy || saveNeedsRefresh) return
+                              setStagedChanges(prev => prev.map(change => {
+                                if (change.type !== 'insert' || change.tempId !== ins.tempId) return change
+                                const row = [...change.row]
+                                row[ci] = nextValue
+                                return { ...change, row }
+                              }))
+                            },
+                            () => {
+                              setInsertEditing({ tempId: ins.tempId, col: ci, val: cell ?? '', initialVal: cell ?? '' })
+                              setTimeout(() => insertInputRef.current?.select(), 30)
+                            },
+                          )) return
                           scheduleCellPreview(e, cell, result.columns[ci] ?? '', (nextValue) => {
+                            if (saveLifecycle.busy || saveNeedsRefresh) return
                             setStagedChanges(prev => prev.map(change => {
                               if (change.type !== 'insert' || change.tempId !== ins.tempId) return change
                               const row = [...change.row]
@@ -1548,7 +1640,8 @@ export default function ResultTable({
                         }}
                         onDoubleClick={() => {
                           cancelCellPreview()
-                          setInsertEditing({ tempId: ins.tempId, col: ci, val: cell ?? '' })
+                          if (saveLifecycle.busy || saveNeedsRefresh) return
+                          setInsertEditing({ tempId: ins.tempId, col: ci, val: cell ?? '', initialVal: cell ?? '' })
                           setTimeout(() => insertInputRef.current?.select(), 30)
                         }}
                         onContextMenu={(e) => handleCellCtxMenu(e, -1, ci, true, ins.tempId)}
@@ -1586,10 +1679,11 @@ export default function ResultTable({
         {/* 左侧：编辑栏（无边框图标按钮 + hover 放大 + 提示） */}
         {hasEditable && (
           <span className="result-editbar">
-            <button className="result-tbtn result-tbtn--icon" data-tip="新增行" onClick={addInsertRow}><Plus size={15} /></button>
-            <button className="result-tbtn result-tbtn--icon" data-tip="删除选中行" disabled={selectedCount === 0} onClick={deleteSelectedRows}><Minus size={15} /></button>
-            <button className="result-tbtn result-tbtn--icon result-tbtn--ok" data-tip="提交变更" disabled={stagedChanges.length === 0 || committing} onClick={commitAll}><Check size={15} /></button>
-            <button className="result-tbtn result-tbtn--icon" data-tip="放弃变更" disabled={stagedChanges.length === 0} onClick={rollbackAll}><X size={15} /></button>
+            <button className="result-tbtn result-tbtn--icon" data-tip="新增行" disabled={committing || saveNeedsRefresh} onClick={addInsertRow}><Plus size={15} /></button>
+            <button className="result-tbtn result-tbtn--icon" data-tip="删除选中行" disabled={selectedCount === 0 || committing || saveNeedsRefresh} onClick={deleteSelectedRows}><Minus size={15} /></button>
+            <button className="result-tbtn result-tbtn--icon result-tbtn--ok" data-tip="提交变更" disabled={stagedChanges.length === 0 || committing || saveNeedsRefresh} onClick={commitAll}><Check size={15} /></button>
+            <button className="result-tbtn result-tbtn--icon" data-tip="放弃变更" disabled={stagedChanges.length === 0 || committing} onClick={rollbackAll}><X size={15} /></button>
+            {saveNeedsRefresh && <span className="result-editbar__count">保存结果待核实，请刷新后再编辑</span>}
             {stagedChanges.length > 0 && <span className="result-editbar__count">{stagedChanges.length} 项待提交</span>}
             {selectedCount > 0 && stagedChanges.length === 0 && <span className="result-editbar__count">已选 {selectedCount}</span>}
           </span>
@@ -1644,7 +1738,7 @@ export default function ResultTable({
               <button
                 className="btn-primary"
                 onClick={() => { setPreviewOpen(false); commitAll() }}
-                disabled={committing}
+                disabled={committing || saveNeedsRefresh}
               >
                 提交
               </button>
@@ -1652,6 +1746,38 @@ export default function ResultTable({
                 关闭
               </button>
             </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* 日期/时间字段快捷填值 */}
+      {dateQuickFill && createPortal(
+        <div
+          className="date-quick-pop"
+          style={{ left: dateQuickFill.x, top: dateQuickFill.y }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <div className="date-quick-pop__title" title={dateQuickFill.column}>
+            {dateQuickFill.column}
+          </div>
+          <div className="date-quick-pop__actions">
+            {(dateQuickFill.kind === 'datetime' || dateQuickFill.kind === 'time') && (
+              <button className="date-quick-pop__item" onClick={() => applyDateQuickFill(dateQuickFill.kind === 'time' ? 'time' : 'datetime')}>
+                <Clock size={13} />当前时间
+              </button>
+            )}
+            {(dateQuickFill.kind === 'datetime' || dateQuickFill.kind === 'date') && (
+              <button className="date-quick-pop__item" onClick={() => applyDateQuickFill('date')}>
+                <CalendarDays size={13} />当前日期
+              </button>
+            )}
+            <button className="date-quick-pop__item" onClick={() => { dateQuickFill.onManualEdit(); setDateQuickFill(null) }}>
+              <Pencil size={13} />手动编辑
+            </button>
+            <button className="date-quick-pop__item date-quick-pop__item--muted" onClick={() => { dateQuickFill.onSave(null); setDateQuickFill(null) }}>
+              <X size={13} />置为 NULL
+            </button>
           </div>
         </div>,
         document.body
@@ -1686,7 +1812,7 @@ export default function ResultTable({
               const staged = stagedChanges.find(c => c.type === 'insert' && c.tempId === tempId)
               if (staged && staged.type === 'insert') cellVal = staged.row[col] ?? null
             } else {
-              cellVal = filteredRows[absRow]?.[col] ?? null
+              cellVal = result.rows[absRow]?.[col] ?? null
             }
             setBlobView({ value: cellVal, column: result.columns[col] ?? '' })
             setCtxMenu(null)
@@ -1709,7 +1835,7 @@ export default function ResultTable({
           <div className="cell-ctx-menu__hint">已选 {selectedRows.size} 行</div>
           <button className="cell-ctx-menu__item" onClick={() => {
             const first = selectedRowData().length ? [...selectedRows].map(k => parseInt(k, 10)).filter(n => !isNaN(n)).sort((a, b) => a - b)[0] : null
-            if (first != null) showForm(first)
+            if (first != null) showForm(Math.max(0, visibleRows.findIndex(item => item.sourceIndex === first)))
             setRowMenu(null)
           }}>查看行详情</button>
           <button className="cell-ctx-menu__item" onClick={() => { copyRows(viewMode === 'json' ? 'json' : 'tsv'); setRowMenu(null) }}>

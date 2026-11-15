@@ -70,8 +70,12 @@ export default function BackupRestorePanel({ connectionId, schema, onClose }: Pr
     setStep('executing')
     setProgress('正在执行 SQL 文件...')
     try {
-      await invoke('db_exec_sql_file', { id: connectionId, schema, filePath })
-      setResult({ ok: true, msg: '备份文件执行完成，数据已恢复' })
+      const response = await invoke<{ executed: number; failed: number; errors: string[] }>('db_exec_sql_file', { id: connectionId, schema, path: filePath })
+      if (response.failed > 0 || response.errors.length > 0) {
+        setResult({ ok: false, msg: `已停止恢复：此前成功执行 ${response.executed} 条，部分修改可能已提交。${response.errors.join('；')}` })
+      } else {
+        setResult({ ok: true, msg: `SQL 文件执行完成，共 ${response.executed} 条语句；请核对恢复结果` })
+      }
     } catch (e) {
       setResult({ ok: false, msg: String(e) })
     } finally {

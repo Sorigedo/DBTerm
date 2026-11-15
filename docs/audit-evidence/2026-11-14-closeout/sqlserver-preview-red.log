@@ -1,0 +1,18 @@
+node:internal/modules/run_main:107
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: same-name tables in two schemas must open separate preview tabs
+
+1 !== 2
+
+    at file:///Users/Nico/workSpace/claude/DBterm/scripts/acceptance/sqlserver-preview-target.mjs:47:9 {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: 1,
+  expected: 2,
+  operator: 'strictEqual',
+  diff: 'simple'
+}
+
+Node.js v26.8.2

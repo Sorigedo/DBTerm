@@ -1,0 +1,12 @@
+MySQL version: 8.4.11
+127.0.0.1 - - [15/Nov/2026 00:26:47] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [15/Nov/2026 00:26:47] "GET /assets/index-BjXBCaoK.js HTTP/1.1" 200 -
+127.0.0.1 - - [15/Nov/2026 00:26:47] "GET /assets/index-BGMijY7Z.css HTTP/1.1" 200 -
+127.0.0.1 - - [15/Nov/2026 00:26:47] "GET /assets/index-BwEqUg7L.css HTTP/1.1" 200 -
+127.0.0.1 - - [15/Nov/2026 00:26:47] "GET /assets/jetbrains-mono-latin-400-normal-V6pRDFza.woff2 HTTP/1.1" 200 -
+{"ok": true, "checks": ["真实IPC读取完整DDL与独立MySQL客户端一致", "真实IPC完整结构导出及结构加数据备份", "真实IPC流式SQL导出", "执行失败后任务释放且同任务ID可重新导出"]}
+PASS native backup replay: structure
+PASS native backup replay: both
+PASS native stream export replay; exact text/binary/NULL/decimal/uint64/BIT/ENUM/SET/invisible/generated values
+PASS failed export preserved existing file; no part files; source unchanged
+Disposable fixture stopped; evidence at /var/folders/29/p22btbvx12n6p5bqjgkjwy800000gn/T/dbterm-native-export-lb9s6p8a

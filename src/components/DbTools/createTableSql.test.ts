@@ -1,0 +1,60 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import { buildIndexAlterStatements, validateMysqlExistingIndexEdits } from './createTableSql.ts'
+
+const uniqueIndex = { name: 'g_barcode', columns: 'g_barcode', unique: true, method: 'BTREE' as const }
+
+test('existing MySQL index cannot be rebuilt from its incomplete metadata summary', () => {
+  assert.match(validateMysqlExistingIndexEdits([{ ...uniqueIndex, unique: false }], [uniqueIndex]) ?? '', /原始 DDL/)
+  assert.match(validateMysqlExistingIndexEdits([], [uniqueIndex]) ?? '', /原始 DDL/)
+  assert.equal(validateMysqlExistingIndexEdits([uniqueIndex, { ...uniqueIndex, name: 'new_idx' }], [uniqueIndex]), null)
+})
+
+test('changing a mysql index from unique to non-unique produces executable alter clauses', () => {
+  const clauses = buildIndexAlterStatements('mysql', 'historical_prod', 'xmg_goods_store_list', [
+    { ...uniqueIndex, unique: false },
+  ], [uniqueIndex])
+
+  assert.deepEqual(clauses, [
+    '  DROP INDEX `g_barcode`',
+    '  ADD INDEX `g_barcode` (`g_barcode`)',
+  ])
+})
+
+test('unchanged indexes do not make table ddl dirty', () => {
+  assert.deepEqual(
+    buildIndexAlterStatements('mysql', 'historical_prod', 'xmg_goods_store_list', [uniqueIndex], [uniqueIndex]),
+    [],
+  )
+})
+
+test('unrepresented functional index is not dropped by an unrelated table edit', () => {
+  const functionalIndex = {
+    name: 'uk_pos_settlement_plan_code', columns: '', unique: true, method: 'BTREE' as const,
+  }
+  assert.deepEqual(
+    buildIndexAlterStatements('mysql', 'b', 'mc_pos_settlement_company',
+      [functionalIndex, { ...uniqueIndex, name: 'idx_new', unique: false }],
+      [functionalIndex]),
+    ['  ADD INDEX `idx_new` (`g_barcode`)'],
+  )
+})
+
+test('unrepresented functional index cannot be replaced by a regular index through metadata guesswork', () => {
+  const functionalIndex = { name: 'uk_pos_settlement_plan_code', columns: '', unique: true, method: 'BTREE' as const }
+  assert.deepEqual(
+    buildIndexAlterStatements('mysql', 'b', 'mc_pos_settlement_company',
+      [{ ...functionalIndex, columns: 'plan_code' }], [functionalIndex]),
+    [],
+  )
+})
+
+test('all mysql-family engines emit ALTER clauses for removing a regular index', () => {
+  for (const connType of ['tidb', 'oceanBase'] as const) {
+    assert.deepEqual(
+      buildIndexAlterStatements(connType, 'b', 't', [], [uniqueIndex]),
+      ['  DROP INDEX `g_barcode`'],
+    )
+  }
+})
+

@@ -1,0 +1,2 @@
+{"production":true,"cycles":12,"usedHeapAfterClose":[7006284,7170408,7399488,7640404,7752408,7811668,7834924,7861744,7939412,7896224,7945624,7969400],"retainedResultObjects":[true,false,false,false,false,false,false,false,false,false,false,false],"retainedAfterUnmount":[false,false,false,false,false,false,false,false,false,false,false,false],"usedHeapAfterUnmount":7111252,"unexpectedIpc":[],"errors":[]}
+PASS actual SQL editor: at most one result retained across cycles, all release on unmount. Retention arrays report current behavior; isolated Chrome heap is not desktop RSS.

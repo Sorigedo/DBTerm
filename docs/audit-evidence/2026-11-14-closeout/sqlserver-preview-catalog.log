@@ -1,0 +1,1 @@
+PASS production SQL Server column SELECT: schema isolation and correct PK markers; SQLite synthetic catalogs only, not native SQL Server.

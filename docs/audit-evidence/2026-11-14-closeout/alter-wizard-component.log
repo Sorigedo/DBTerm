@@ -1,0 +1,1 @@
+PASS actual DuckDB AlterTableWizard: preview equals IPC statements, synchronous double-click sends once, failed receipt blocks repeats even after editing; isolated browser and simulated IPC only.

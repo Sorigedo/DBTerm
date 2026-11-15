@@ -1,0 +1,2 @@
+5:58:50 AM [vite] (client) Re-optimizing dependencies because vite config has changed
+PASS actual TableBrowser: single cell, Shift columns, rectangle, staged saves, baseline values, unknown-outcome block and double-submit guard; simulated IPC/clipboard only.

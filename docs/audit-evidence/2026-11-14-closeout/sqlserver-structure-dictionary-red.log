@@ -1,0 +1,20 @@
+node:internal/modules/run_main:107
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: structure index dictionary must retain selected schema
++ actual - expected
+
++ undefined
+- "ops'.]中文"
+
+    at file:///Users/Nico/workSpace/claude/DBterm/scripts/acceptance/sqlserver-preview-target.mjs:93:9 {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: undefined,
+  expected: "ops'.]中文",
+  operator: 'strictEqual',
+  diff: 'simple'
+}
+
+Node.js v26.8.2

@@ -21,8 +21,9 @@ export async function copyText(text: string): Promise<boolean> {
 }
 
 function legacyCopy(text: string): boolean {
+  let ta: HTMLTextAreaElement | undefined
   try {
-    const ta = document.createElement('textarea')
+    ta = document.createElement('textarea')
     ta.value = text
     ta.style.position = 'fixed'
     ta.style.top = '-9999px'
@@ -31,10 +32,13 @@ function legacyCopy(text: string): boolean {
     document.body.appendChild(ta)
     ta.select()
     ta.setSelectionRange(0, text.length)
-    const ok = document.execCommand('copy')
-    document.body.removeChild(ta)
-    return ok
+    return document.execCommand('copy')
   } catch {
     return false
+  } finally {
+    if (ta) {
+      ta.value = ''
+      try { document.body.removeChild(ta) } catch { /* 未插入或已移除 */ }
+    }
   }
 }

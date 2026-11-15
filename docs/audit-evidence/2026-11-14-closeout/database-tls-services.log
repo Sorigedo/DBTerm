@@ -1,0 +1,65 @@
+2026-11-14T17:53:46.805330Z 0 [System] [MY-015017] [Server] MySQL Server Initialization - start.
+2026-11-14T17:53:46.806712Z 0 [System] [MY-013169] [Server] /opt/homebrew/opt/mysql@8.4/bin/mysqld (mysqld 8.4.11) initializing of server in progress as process 43747
+2026-11-14T17:53:46.808362Z 0 [Warning] [MY-010159] [Server] Setting lower_case_table_names=2 because file system for /var/folders/29/p22btbvx12n6p5bqjgkjwy800000gn/T/dbterm-isolated-databases-adgsonzy/mysql/ is case insensitive
+2026-11-14T17:53:46.810624Z 1 [System] [MY-013576] [InnoDB] InnoDB initialization has started.
+2026-11-14T17:53:46.849208Z 1 [System] [MY-013577] [InnoDB] InnoDB initialization has ended.
+2026-11-14T17:53:47.131085Z 5 [Warning] [MY-010453] [Server] root@localhost is created with an empty password ! Please consider switching off the --initialize-insecure option.
+2026-11-14T17:53:47.347919Z 0 [System] [MY-013172] [Server] Received SHUTDOWN from user <via user signal>. Shutting down mysqld (Version: 8.4.11).
+2026-11-14T17:53:48.011336Z 0 [System] [MY-015018] [Server] MySQL Server Initialization - end.
+2026-11-14T17:53:48.100814Z 0 [System] [MY-015015] [Server] MySQL Server - start.
+2026-11-14T17:53:48.233942Z 0 [System] [MY-010116] [Server] /opt/homebrew/opt/mysql@8.4/bin/mysqld (mysqld 8.4.11) starting as process 43755
+2026-11-14T17:53:48.234989Z 0 [Warning] [MY-010159] [Server] Setting lower_case_table_names=2 because file system for /var/folders/29/p22btbvx12n6p5bqjgkjwy800000gn/T/dbterm-isolated-databases-adgsonzy/mysql/ is case insensitive
+2026-11-14T17:53:48.237907Z 1 [System] [MY-013576] [InnoDB] InnoDB initialization has started.
+2026-11-14T17:53:48.262645Z 1 [System] [MY-013577] [InnoDB] InnoDB initialization has ended.
+2026-11-14T17:53:48.368301Z 0 [Warning] [MY-010068] [Server] CA certificate ca.pem is self signed.
+2026-11-14T17:53:48.368318Z 0 [System] [MY-013602] [Server] Channel mysql_main configured to support TLS. Encrypted connections are now supported for this channel.
+2026-11-14T17:53:48.373671Z 0 [System] [MY-010931] [Server] /opt/homebrew/opt/mysql@8.4/bin/mysqld: ready for connections. Version: '8.4.11'  socket: '/var/folders/29/p22btbvx12n6p5bqjgkjwy800000gn/T/dbterm-isolated-databases-adgsonzy/mysql.sock'  port: 58552  Homebrew.
+The files belonging to this database system will be owned by user "Nico".
+This user must also own the server process.
+
+The database cluster will be initialized with locale "C".
+The default text search configuration will be set to "english".
+
+Data page checksums are disabled.
+
+creating directory /var/folders/29/p22btbvx12n6p5bqjgkjwy800000gn/T/dbterm-isolated-databases-adgsonzy/postgres ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default "max_connections" ... 100
+selecting default "shared_buffers" ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... ok
+performing post-bootstrap initialization ... ok
+syncing data to disk ... ok
+
+Success. You can now start the database server using:
+
+    '/opt/homebrew/opt/postgresql@17/bin/pg_ctl' -D /var/folders/29/p22btbvx12n6p5bqjgkjwy800000gn/T/dbterm-isolated-databases-adgsonzy/postgres -l logfile start
+
+Generating a 2048 bit RSA private key
+..................................................................+++++
+...........................................+++++
+writing new private key to '/var/folders/29/p22btbvx12n6p5bqjgkjwy800000gn/T/dbterm-isolated-databases-adgsonzy/ca.key'
+-----
+Generating a 2048 bit RSA private key
+..........................+++++
+..............................................+++++
+writing new private key to '/var/folders/29/p22btbvx12n6p5bqjgkjwy800000gn/T/dbterm-isolated-databases-adgsonzy/unrelated.key'
+-----
+Generating a 2048 bit RSA private key
+......................................................................................................+++++
+..............................................................+++++
+writing new private key to '/var/folders/29/p22btbvx12n6p5bqjgkjwy800000gn/T/dbterm-isolated-databases-adgsonzy/server.key'
+-----
+Signature ok
+subject=/CN=localhost
+Getting CA Private Key
+waiting for server to start.... done
+server started
+waiting for server to shut down.... done
+server stopped
+2026-11-14T17:54:00.238760Z 169 [System] [MY-013172] [Server] Received SHUTDOWN from user root. Shutting down mysqld (Version: 8.4.11).
+2026-11-14T17:54:00.238805Z 0 [System] [MY-013172] [Server] Received SHUTDOWN from user <via user signal>. Shutting down mysqld (Version: 8.4.11).
+2026-11-14T17:54:00.406283Z 0 [System] [MY-010910] [Server] /opt/homebrew/opt/mysql@8.4/bin/mysqld: Shutdown complete (mysqld 8.4.11)  Homebrew.
+2026-11-14T17:54:00.406300Z 0 [System] [MY-015016] [Server] MySQL Server - end.

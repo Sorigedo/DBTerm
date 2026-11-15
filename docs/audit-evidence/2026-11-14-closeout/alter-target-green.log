@@ -1,0 +1,1 @@
+PASS actual DuckDB AlterTableWizard: preview equals IPC, double-click sends once, unknown receipt blocks repeats, target switch clears pending edits and rejects late old metadata; isolated browser and simulated IPC only.

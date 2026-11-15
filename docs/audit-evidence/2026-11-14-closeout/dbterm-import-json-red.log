@@ -1,0 +1,58 @@
+warning: use of deprecated method `futures_channel::mpsc::UnboundedReceiver::<T>::try_next`: please use `try_recv` instead
+   --> vendor/sqlx-postgres/src/listener.rs:335:56
+    |
+335 |         if let Ok(Some(notification)) = self.buffer_rx.try_next() {
+    |                                                        ^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: variant `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/mod.rs:78:5
+   |
+70 | pub enum FrontendMessageFormat {
+   |          --------------------- variant in this enum
+...
+78 |     Flush = b'H',
+   |     ^^^^^
+   |
+   = note: `FrontendMessageFormat` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/flush.rs:11:12
+   |
+11 | pub struct Flush;
+   |            ^^^^^
+
+warning: `sqlx-postgres` (lib) generated 3 warnings
+   Compiling app v0.1.23 (/Users/Nico/workSpace/claude/DBterm/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 27.81s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/app_lib-bccc94f7de71602a)
+
+running 2 tests
+test commands::import_json::tests::non_object_rows_and_duplicate_fields_fail_before_writes ... FAILED
+test commands::import_json::tests::exact_numbers_and_explicit_json_null_are_preserved ... FAILED
+
+failures:
+
+---- commands::import_json::tests::non_object_rows_and_duplicate_fields_fail_before_writes stdout ----
+
+thread 'commands::import_json::tests::non_object_rows_and_duplicate_fields_fail_before_writes' (623602) panicked at src/commands/import_json.rs:21:60:
+invalid input accepted: [{"id":1},42]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- commands::import_json::tests::exact_numbers_and_explicit_json_null_are_preserved stdout ----
+
+thread 'commands::import_json::tests::exact_numbers_and_explicit_json_null_are_preserved' (623601) panicked at src/commands/import_json.rs:18:2:
+assertion `left == right` failed
+  left: [Some("1.2345678901234568e+29"), None, None, Some("1.2345678901234567")]
+ right: [Some("123456789012345678901234567890"), Some("NULL"), None, Some("1.2345678901234567890123456789")]
+
+
+failures:
+    commands::import_json::tests::exact_numbers_and_explicit_json_null_are_preserved
+    commands::import_json::tests::non_object_rows_and_duplicate_fields_fail_before_writes
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 507 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

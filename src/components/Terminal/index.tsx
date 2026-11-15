@@ -13,8 +13,9 @@ import { useCommandHistoryStore } from '../../stores/commandHistoryStore'
 import { THEMES, ANSI_PALETTES } from '../../themes'
 import { consumeAdopt, isDetaching, registerSerializer, unregisterSerializer, consumeAdoptSnapshot } from '../../utils/adopt'
 import { commandsFromInputData, isRecordableShellCommand, stripShellPrompt } from '../../utils/terminalCommand'
-import { shouldCommitCanceledAsciiComposition, shouldSuppressImeAsciiCommit, shouldSuppressReturnAfterCanceledAsciiCommit } from './ime'
 import { addFrame, isRecording } from '../SshPanels/RecordingPanel'
+import { installTerminalDragRecovery } from './terminalDragRecovery'
+import { isCurrentSshEvent } from './sshEventRun'
 
 // trzsz 文件传输触发串；仅当服务器输出含此串（或正在传输）时才走 trzsz 过滤器，普通输出直写终端
 const TRZSZ_MARK = 'TRZSZ:TRANSFER:'
@@ -240,11 +241,6 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
   const mountedRef      = useRef(true)
   const hasNavigatedRef = useRef(false)
   const lastCwdRef      = useRef('')
-  const imeComposingRef = useRef(false)
-  const imeSuppressRef  = useRef<{ text: string; until: number } | null>(null)
-  const imeSuppressReturnUntilRef = useRef(0)
-  const imeLastKeyRef   = useRef('')
-  const imePendingTextRef = useRef('')
 
   const [disconnected, setDisconnected] = useState(false)
   const disconnectedRef                 = useRef(false)
@@ -670,59 +666,19 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
       xterm.unicode.activeVersion = '11'
     } catch { /* 退回默认 unicode 处理 */ }
     xterm.open(containerRef.current)
+    // WKWebView can miss mouseup across a focus/window boundary. xterm 6 keeps
+    // selecting on every subsequent mousemove unless its mouseup handler runs.
+    const terminalElement = xterm.element!
+    const terminalDocument = terminalElement.ownerDocument
+    const terminalWindow = terminalDocument.defaultView!
+    const disposeDragRecovery = installTerminalDragRecovery(terminalElement, terminalDocument, terminalWindow, () => {
+      terminalDocument.dispatchEvent(new MouseEvent('mouseup', { button: 0, buttons: 0 }))
+    })
     // 注：不启用 WebglAddon——其字形纹理图集在 WKWebView 下不能正确使用自定义/Web 字体，
     // 会回退成通用 monospace，无视用户设置的字体。改用 xterm 默认 DOM 渲染器以正确套用字体。
     fit.fit()
     xtermRef.current = xterm
     fitRef.current   = fit
-
-    const helperTextarea = containerRef.current.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | null
-    const onImeStart = () => {
-      imeComposingRef.current = true
-      imeLastKeyRef.current = ''
-      imeSuppressRef.current = null
-      imePendingTextRef.current = ''
-    }
-    const onImeKeyDown = (e: KeyboardEvent) => {
-      if (imeComposingRef.current) imeLastKeyRef.current = e.key
-    }
-    const onImeUpdate = (e: CompositionEvent) => {
-      if (imeComposingRef.current) imePendingTextRef.current = e.data ?? imePendingTextRef.current
-    }
-    const onImeEnd = (e: CompositionEvent) => {
-      imeComposingRef.current = false
-      const text = e.data ?? ''
-      const lastKey = imeLastKeyRef.current
-      imeLastKeyRef.current = ''
-      imePendingTextRef.current = ''
-      if (shouldSuppressImeAsciiCommit(lastKey, text)) {
-        imeSuppressRef.current = { text, until: Date.now() + 80 }
-      }
-    }
-    const onImeCancel = () => {
-      const text = imePendingTextRef.current
-      const lastKey = imeLastKeyRef.current
-      imeComposingRef.current = false
-      imeLastKeyRef.current = ''
-      imeSuppressRef.current = null
-      imePendingTextRef.current = ''
-      if (shouldCommitCanceledAsciiComposition(lastKey, text)) {
-        sendRef.current(text)
-        if (shouldSuppressReturnAfterCanceledAsciiCommit(lastKey, text)) {
-          imeSuppressReturnUntilRef.current = Date.now() + 120
-        }
-        const xa = xtermRef.current
-        if (xa && xa.buffer.active.type === 'normal') {
-          inputBufRef.current += text
-          setInputBuf(inputBufRef.current)
-        }
-      }
-    }
-    helperTextarea?.addEventListener('compositionstart', onImeStart)
-    helperTextarea?.addEventListener('keydown', onImeKeyDown)
-    helperTextarea?.addEventListener('compositionupdate', onImeUpdate)
-    helperTextarea?.addEventListener('compositionend', onImeEnd)
-    helperTextarea?.addEventListener('compositioncancel', onImeCancel)
 
     // ── 高亮叠加层：直接在 .xterm-screen 上插入绝对定位 div，绕过 registerDecoration 的时序问题 ──
     const screen = containerRef.current.querySelector('.xterm-screen') as HTMLElement | null
@@ -946,17 +902,6 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
     }
 
     xterm.onData((data) => {
-      if (data === '\r' && Date.now() <= imeSuppressReturnUntilRef.current) {
-        imeSuppressReturnUntilRef.current = 0
-        return
-      }
-      const imeSuppress = imeSuppressRef.current
-      if (imeSuppress && Date.now() <= imeSuppress.until && data === imeSuppress.text) {
-        imeSuppressRef.current = null
-        return
-      }
-      if (imeSuppress && Date.now() > imeSuppress.until) imeSuppressRef.current = null
-
       // 断联状态下按回车触发重连
       if (disconnectedRef.current && localConn && data === '\r') {
         reconnectRef.current()
@@ -1144,10 +1089,9 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
         catch { return undefined }
       })()
 
-      // 过滤旧会话迟到事件：runId 不匹配则丢弃
+      // 每个事件都必须带当前 runId；连接 IPC 返回前也拒绝旧事件。
       const staleEvent = (p: { id: string; runId?: string }) =>
-        p.id !== sessionId || !mountedRef.current ||
-        (!!p.runId && !!runIdRef.current && p.runId !== runIdRef.current)
+        !isCurrentSshEvent(p, sessionId, runIdRef.current, mountedRef.current)
 
       import('@tauri-apps/api/event').then(({ listen }) => {
         Promise.all([
@@ -1242,8 +1186,15 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
           unlisten = fns
           import('@tauri-apps/api/core').then(({ invoke }) => {
             const doConnect = () => {
-              invoke<string>('connect_ssh', { sessionId, connId: connectionId })
-                .then((rid) => { runIdRef.current = rid })
+              const runId = crypto.randomUUID()
+              runIdRef.current = runId
+              invoke<string>('connect_ssh', { sessionId, connId: connectionId, runId })
+                .then((rid) => {
+                  if (mountedRef.current && rid !== runId) {
+                    sshErrorRef.current = 'proto'
+                    setSshError({ type: 'proto', detail: 'SSH 会话标识不一致' })
+                  }
+                })
                 .catch((e: unknown) => {
                   if (!mountedRef.current) return
                   const msg = String(e)
@@ -1258,15 +1209,17 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
             }
             if (adopt) {
               // 接管：会话存活则取其 runId 续上事件过滤并标记已连接，不再 connect（重连会顶掉原会话）
-              invoke<boolean>('ssh_session_alive', { id: sessionId }).then((alive) => {
+              invoke<string | null>('ssh_session_runid', { id: sessionId }).then(async (rid) => {
                 if (!mountedRef.current) return
-                if (alive) {
+                if (rid) {
+                  runIdRef.current = rid
+                  hasConnectedRef.current = true
+                  const current = await invoke<string | null>('ssh_session_runid', { id: sessionId })
+                  if (!mountedRef.current) return
+                  if (current !== rid) { doConnect(); return }
+                  if (sshErrorRef.current) return
                   const snap = consumeAdoptSnapshot(sessionId)
                   if (snap) xterm.write(snap)
-                  invoke<string | null>('ssh_session_runid', { id: sessionId })
-                    .then((rid) => { if (rid && mountedRef.current) runIdRef.current = rid })
-                    .catch(() => {})
-                  hasConnectedRef.current = true
                   sshErrorRef.current = null
                   setSshError(null)
                   setDisconnected(false)
@@ -1313,11 +1266,7 @@ export default function Terminal({ sessionId, connectionId, connType, active = f
       clearSshInitTimer()
       sshInitPendingRef.current = null
       ro.disconnect()
-      helperTextarea?.removeEventListener('compositionstart', onImeStart)
-      helperTextarea?.removeEventListener('keydown', onImeKeyDown)
-      helperTextarea?.removeEventListener('compositionupdate', onImeUpdate)
-      helperTextarea?.removeEventListener('compositionend', onImeEnd)
-      helperTextarea?.removeEventListener('compositioncancel', onImeCancel)
+      disposeDragRecovery()
       unlisten.forEach((fn) => fn())
       searchMatchesRef.current = []
       unregisterSerializer(sessionId)

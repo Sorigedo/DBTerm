@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useCallback, useRef } from 'react'
+﻿import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import {
   X, RefreshCw, Download, Loader2, Filter, ChevronUp, ChevronDown, ChevronsUpDown,
@@ -21,12 +21,16 @@ import { useShortcuts } from '../../utils/useShortcuts'
 import { useWheelScroll } from '../../utils/wheelScroll'
 import { isMysqlFamily, supportsMyMaintenance, supportsOptimizeTable, checkTableSql, isSqlite, qid, tableRef as dialectTableRef, buildIndexSql } from '../../utils/sqlDialect'
 import { queueTableExport } from '../../utils/exportTasks'
+import { tableDataLiteral } from './tableDataSql'
+import { insertTableDrafts } from './tableDrafts'
+import { validateGridBudget, editableGridExtra, encodeGridText, parseGridText, planGridPaste, mergeGridEdits, groupGridEdits, type GridEdit, type GridValue, type GridSelection } from './tableClipboard'
 
 interface Props {
   connectionId: string
   connType: string
   schema: string
   table: string
+  ssSchema?: string
   onClose?: () => void
   embedded?: boolean   // true 时作为标签页内嵌渲染（无遮罩/portal）
   active?: boolean     // 是否为当前激活标签：非激活时关闭区域快捷键，避免隐藏标签"吃掉"快捷键
@@ -55,7 +59,7 @@ const TB_MIN_COL_WIDTH = 56
 // 禁止在组件内再写一份 backtick 实现（历史上漏 sqlServer/sqlite/duckdb 导致拼 SQL 崩）。
 function isOracle(connType: string) { return connType.toLowerCase() === 'oracle' }
 
-export default function TableBrowser({ connectionId, connType, schema, table, onClose, embedded, active = true }: Props) {
+export default function TableBrowser({ connectionId, connType, schema, table, ssSchema, onClose, embedded, active = true }: Props) {
   const userShortcuts = useSettingsStore(s => s.shortcuts)
   const sc = (id: string) => {
     const combo = userShortcuts[id] ?? SHORTCUT_DEFS.find(d => d.id === id)?.defaultCombo ?? ''
@@ -68,11 +72,11 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
   const [totalCount, setTotalCount]   = useState<number | null>(null)
   const [loading, setLoading]         = useState(false)
   const [error, setError]             = useState('')
-  const [pageSize, setPageSize]       = useState<PageSize>(100)
-  const [page, setPage]               = useState(0)
-  const [sortCol, setSortCol]         = useState<string | null>(null)
-  const [sortDir, setSortDir]         = useState<SortDir>('asc')
-  const [filters, setFilters]         = useState<Record<string, ColFilter>>({})
+  const [pageSize, setPageSizeRaw]       = useState<PageSize>(100)
+  const [page, setPageRaw]               = useState(0)
+  const [sortCol, setSortColRaw]         = useState<string | null>(null)
+  const [sortDir, setSortDirRaw]         = useState<SortDir>('asc')
+  const [filters, setFiltersRaw]         = useState<Record<string, ColFilter>>({})
   const [filterDrafts, setFilterDrafts] = useState<Record<string, string>>({})
   const [filterOpen, setFilterOpen]   = useState<string | null>(null)
   const [filterSummaryOpen, setFilterSummaryOpen] = useState(false)
@@ -86,6 +90,8 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
   const [draftRows, setDraftRows]     = useState<Record<string, string>[]>([])
   const [committing, setCommitting]   = useState(false)
   const [commitErr, setCommitErr]     = useState('')
+  const draftBusy = useRef(false)
+  const [draftBlocked, setDraftBlocked] = useState(false)
   const [exportOpen, setExportOpen]   = useState(false)
   const [copyOpen, setCopyOpen]       = useState(false)
   // 表级操作菜单 / DDL 查看 / 修改结构 / 清空表
@@ -123,11 +129,12 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
   const [savingCell, setSavingCell]   = useState(false)
   const cellBusyRef = useRef(false)   // 防 Enter + onBlur 双提交
   // 删除行确认（支持批量）
-  const [delRows, setDelRows]         = useState<number[] | null>(null)
+  const [delRows, setDelRows]         = useState<{ connectionId: string; schema: string; table: string; ssSchema?: string; columns: string[]; pkCols: string[]; rows: (string | null)[][] } | null>(null)
   const [deleting, setDeleting]       = useState(false)
+  const deleteBusyRef = useRef(false)
   // WHERE 自定义过滤 + 行选择（Ctrl/Cmd 多选）
   const [whereInput, setWhereInput]   = useState('')
-  const [appliedWhere, setAppliedWhere] = useState('')
+  const [appliedWhere, setAppliedWhereRaw] = useState('')
   const [whereBarOpen, setWhereBarOpen] = useState(false)
   const [selectedRows, setSelectedRows] = useState<Set<number>>(new Set())
   // 当前聚焦单元格（单击选中）：用于单元格级快捷键（复制单元格 / 置 NULL 等）
@@ -135,7 +142,32 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
   // 单元格矩形区域选择（锚点 a + 焦点 f）：鼠标在单元格上划过即框选，整行用最左窄边 gutter 选
   const [cellSel, setCellSel] = useState<{ a: { ri: number; ci: number }; f: { ri: number; ci: number } } | null>(null)
   const cellDragRef = useRef(false)
+  const [selectedColumns, setSelectedColumns] = useState<number[]>([])
+  const columnAnchor = useRef<number | null>(null)
+  const [pasteEdits, setPasteEdits] = useState<GridEdit[]>([])
+  const [pasteSaving, setPasteSaving] = useState(false)
+  const [pasteBlocked, setPasteBlocked] = useState(false)
+  const pasteBusy = useRef(false)
+  const pasteEditsRef = useRef(pasteEdits); pasteEditsRef.current = pasteEdits
+  const dataEpoch = useRef(0)
+  const loadedOwner = useRef(String())
+  const metadataOwner = useRef(String())
+  const contextKey = JSON.stringify([connectionId, schema, table, ssSchema, page, pageSize, sortCol, sortDir, filters, appliedWhere])
+  const contextRef = useRef(contextKey); contextRef.current = contextKey
+  const mountedRef = useRef(true)
+  useEffect(() => { mountedRef.current=true;return () => { mountedRef.current = false } }, [])
+  useEffect(()=>{setDraftRows([]);setDraftBlocked(false);setCommitErr('')},[connectionId,schema,table,ssSchema])
+  useEffect(() => { pasteEditsRef.current=[];setPasteEdits([]);setPasteBlocked(false);setSelectedColumns([]);columnAnchor.current=null }, [contextKey])
+  const pasteMap = useMemo(()=>new Map(pasteEdits.map(e=>[`${e.ri}:${e.ci}`,e])),[pasteEdits])
+  function navigationAllowed(){if(draftBusy.current||committing){toast.warning('新增正在确认或提交，请等待操作完成');return false}if(pasteEditsRef.current.length||pasteBusy.current){toast.warning('请先保存或撤销粘贴修改');return false}return true}
+  function setPage(value: React.SetStateAction<number>){if(navigationAllowed())setPageRaw(value)}
+  function setPageSize(value: React.SetStateAction<PageSize>){if(navigationAllowed())setPageSizeRaw(value)}
+  function setSortCol(value: React.SetStateAction<string|null>){if(navigationAllowed())setSortColRaw(value)}
+  function setSortDir(value: React.SetStateAction<SortDir>){if(navigationAllowed())setSortDirRaw(value)}
+  function setFilters(value: React.SetStateAction<Record<string,ColFilter>>){if(navigationAllowed())setFiltersRaw(value)}
+  function setAppliedWhere(value: React.SetStateAction<string>){if(navigationAllowed())setAppliedWhereRaw(value)}
   const cellInSel = (ri: number, ci: number) => {
+    if (selectedColumns.includes(ci)) return true
     if (!cellSel) return false
     const r0 = Math.min(cellSel.a.ri, cellSel.f.ri), r1 = Math.max(cellSel.a.ri, cellSel.f.ri)
     const c0 = Math.min(cellSel.a.ci, cellSel.f.ci), c1 = Math.max(cellSel.a.ci, cellSel.f.ci)
@@ -151,11 +183,12 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
   const cellDetailTimerRef = useRef<number | null>(null)
   const rowCtxRef = useRef<HTMLDivElement>(null)
 
-  const tableRef = dialectTableRef(connType, schema, table)
+  const tableRef = dialectTableRef(connType, schema, table, ssSchema)
   const q = (n: string) => qid(connType, n)
   // ClickHouse 为 OLAP，不支持常规行级 UPDATE/DELETE/INSERT（后端 db_insert_rows/db_delete_rows 对 CH 报错）
   // → 隐藏新增行/删除行/编辑单元格保存等写操作入口，仅保留只读浏览。
-  const readOnly = connType === 'clickHouse'
+  const connExtra = (() => { try { return JSON.parse(envConn?.extraJson ?? '{}') } catch { return {} } })()
+  const readOnly = connType === 'clickHouse' || !!envConn?.readOnly || !!connExtra.sqliteReadonly || !!connExtra.sqliteImmutable || connExtra.duckAccessMode === 'READ_ONLY'
 
   function buildWhereClause(): string {
     const parts: string[] = []
@@ -194,6 +227,9 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
   }, [connectionId, tableRef, JSON.stringify(filters), appliedWhere])
 
   const fetchData = useCallback(async () => {
+    if (draftBusy.current || pasteBusy.current || pasteEditsRef.current.length) { toast.warning('请先保存或撤销粘贴修改，再刷新或切换数据'); return }
+    const epoch = ++dataEpoch.current
+    const owner = contextRef.current
     setLoading(true)
     setError('')
     try {
@@ -212,24 +248,30 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
       // 空表时后端无法从行推断列名 → 回退用 table_columns 获取列，保证表头始终可见
       if (cols.length === 0) {
         try {
-          const meta = await invoke<{ name: string }[]>('table_columns', { id: connectionId, schema, table })
+          const meta = await invoke<{ name: string }[]>('table_columns', { id: connectionId, schema, table, ...(ssSchema ? { ssSchema } : {}) })
           if (meta.length) cols = meta.map(c => c.name)
         } catch { /* 忽略，保持空 */ }
       }
+      if (!mountedRef.current || epoch !== dataEpoch.current || owner !== contextRef.current) return
+      loadedOwner.current=owner
       setColumns(cols)
       setRows(result.rows)
       setExecMs(result.executionTimeMs)
       // 数据已刷新，旧的行索引全部失效：清空选中/编辑/右键/详情状态，防止误操作错行
       setSelectedRows(new Set())
       setCellSel(null)
+      setSelectedColumns([]); setActiveCell(null)
       setEditCell(null); setRowCtx(null); setDetailRow(null)
     } catch (e) {
-      setError(String(e))
+      if(mountedRef.current&&epoch===dataEpoch.current&&owner===contextRef.current)setError(String(e))
     } finally {
-      setLoading(false)
+      if (mountedRef.current&&epoch===dataEpoch.current&&owner===contextRef.current) setLoading(false)
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectionId, tableRef, page, pageSize, sortCol, sortDir, JSON.stringify(filters), appliedWhere])
+
+  const latestReload = useRef({fetchData,fetchCount})
+  latestReload.current={fetchData,fetchCount}
 
   useEffect(() => {
     fetchCount()
@@ -253,12 +295,14 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
     setSortCol(null)
     setSortDir('asc')
     setPage(0)
-  }, [connectionId, schema, table])
+  }, [connectionId, schema, table, ssSchema])
 
   // 列类型 / 主键信息（用于 Navicat 式双行表头：列名 + 类型）
   // 拉取列元数据（类型 / 主键 / 注释），各方言走不同数据字典
   useEffect(() => {
     let alive = true
+    setColMeta({})
+    metadataOwner.current=JSON.stringify([connectionId,schema,table,ssSchema])
     ;(async () => {
       try {
         const { invoke } = await import('@tauri-apps/api/core')
@@ -314,7 +358,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
             id: connectionId,
             sql: `SELECT c.column_name, c.data_type, `
               + `CASE WHEN kcu.column_name IS NOT NULL THEN 'PRI' ELSE '' END, `
-              + `pgd.description, c.is_nullable, c.column_default `
+              + `pgd.description, c.is_nullable, c.column_default, c.is_generated, c.is_identity `
               + `FROM information_schema.columns c `
               + `LEFT JOIN information_schema.table_constraints tc `
               +   `ON tc.table_schema=c.table_schema AND tc.table_name=c.table_name AND tc.constraint_type='PRIMARY KEY' `
@@ -331,7 +375,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
           res.rows.forEach(r => {
             map[String(r[0] ?? '')] = {
               type: String(r[1] ?? ''), key: String(r[2] ?? ''), comment: String(r[3] ?? ''),
-              nullable: String(r[4] ?? ''), def: r[5] ?? null, extra: '',
+              nullable: String(r[4] ?? ''), def: r[5] ?? null, extra: `${r[6] === 'ALWAYS' ? 'GENERATED' : ''} ${r[7] === 'YES' ? 'IDENTITY' : ''}`,
             }
           })
           setColMeta(map)
@@ -377,20 +421,21 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
           setColMeta(map)
         } else if (connType === 'sqlServer') {
           // SQL Server：INFORMATION_SCHEMA.COLUMNS + key_column_usage
-          const schemaName = schema || 'dbo'
+          const schemaName = ssSchema || 'dbo'
+          const db = schema ? `${q(schema)}.` : ''
           const res = await invoke<Rows>('execute_query', {
             id: connectionId,
             sql: `SELECT c.COLUMN_NAME, c.DATA_TYPE, `
               + `CASE WHEN kcu.COLUMN_NAME IS NOT NULL THEN 'PRI' ELSE '' END, `
               + `CAST(ep.value AS NVARCHAR(MAX)), c.IS_NULLABLE, c.COLUMN_DEFAULT `
-              + `FROM INFORMATION_SCHEMA.COLUMNS c `
-              + `LEFT JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc `
+              + `FROM ${db}INFORMATION_SCHEMA.COLUMNS c `
+              + `LEFT JOIN ${db}INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc `
               +   `ON tc.TABLE_SCHEMA=c.TABLE_SCHEMA AND tc.TABLE_NAME=c.TABLE_NAME AND tc.CONSTRAINT_TYPE='PRIMARY KEY' `
-              + `LEFT JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu `
-              +   `ON kcu.CONSTRAINT_NAME=tc.CONSTRAINT_NAME AND kcu.COLUMN_NAME=c.COLUMN_NAME `
-              + `LEFT JOIN sys.extended_properties ep `
-              +   `ON ep.major_id=OBJECT_ID('${esc(schemaName)}.${esc(table)}') AND ep.minor_id=c.ORDINAL_POSITION AND ep.name='MS_Description' `
-              + `WHERE c.TABLE_SCHEMA='${esc(schemaName)}' AND c.TABLE_NAME='${esc(table)}' ORDER BY c.ORDINAL_POSITION`,
+              + `LEFT JOIN ${db}INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu `
+              +   `ON kcu.CONSTRAINT_CATALOG=tc.CONSTRAINT_CATALOG AND kcu.CONSTRAINT_SCHEMA=tc.CONSTRAINT_SCHEMA AND kcu.CONSTRAINT_NAME=tc.CONSTRAINT_NAME AND kcu.TABLE_CATALOG=c.TABLE_CATALOG AND kcu.TABLE_SCHEMA=c.TABLE_SCHEMA AND kcu.TABLE_NAME=c.TABLE_NAME AND kcu.COLUMN_NAME=c.COLUMN_NAME `
+              + `LEFT JOIN ${db}sys.extended_properties ep `
+              +   `ON ep.major_id=OBJECT_ID(N'${esc(tableRef)}') AND ep.minor_id=c.ORDINAL_POSITION AND ep.name='MS_Description' `
+              + `WHERE c.TABLE_SCHEMA=N'${esc(schemaName)}' AND c.TABLE_NAME=N'${esc(table)}' ORDER BY c.ORDINAL_POSITION`,
           })
           if (!alive) return
           const map: typeof colMeta = {}
@@ -407,11 +452,11 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
           type QR2 = { columns: string[]; rows: (string | null)[][] }
           const res = await invoke<QR2>('execute_query', {
             id: connectionId,
-            sql: `PRAGMA table_info("${table.replace(/"/g, '""')}")`,
+            sql: `PRAGMA table_xinfo("${table.replace(/"/g, '""')}")`,
           })
           if (!alive) return
           const ci = (col: string) => res.columns.indexOf(col)
-          const nameI = ci('name'), typeI = ci('type'), nnI = ci('notnull'), defI = ci('dflt_value'), pkI = ci('pk')
+          const nameI = ci('name'), typeI = ci('type'), nnI = ci('notnull'), defI = ci('dflt_value'), pkI = ci('pk'), hiddenI = ci('hidden')
           const map: typeof colMeta = {}
           res.rows.forEach(r => {
             const pkVal = pkI >= 0 ? r[pkI] : null
@@ -422,7 +467,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
               comment:  '',
               nullable: nnI >= 0 && r[nnI] === '1' ? 'NO' : 'YES',
               def:      defI >= 0 ? r[defI] : null,
-              extra:    '',
+              extra:    hiddenI >= 0 && r[hiddenI] !== '0' ? 'GENERATED' : '',
             }
           })
           setColMeta(map)
@@ -430,7 +475,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
       } catch { /* 忽略 */ }
     })()
     return () => { alive = false }
-  }, [connectionId, schema, table, connType, metaTick])
+  }, [connectionId, schema, table, ssSchema, connType, metaTick])
 
   // Reset to page 0 when filters/sort/pageSize change (but not on page change itself)
   const prevFiltersRef = useRef(filters)
@@ -474,12 +519,13 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
     tableAddRow:   () => { if (visible() && columns.length) addDraftRow() },
     tableDelRow:   () => { if (visible() && selectedRows.size) askDeleteRows([...selectedRows]) },
     tableExport:   () => { if (visible()) { setExportOpen(true); setCopyOpen(false); setTblMenuOpen(false) } },
-    tableCommit:   () => { if (visible() && draftRows.length) commitDrafts() },
+    tableCommit:   () => { if (!visible()) return; if (pasteEdits.length) savePastedCells(); else if (draftRows.length) commitDrafts() },
     tableNextPage: () => { if (visible() && (page + 1) * pageSize < (totalCount ?? Infinity)) setPage(p => p + 1) },
     tablePrevPage: () => { if (visible() && page > 0) setPage(p => p - 1) },
     tableRowDetail: () => { if (visible() && selectedRows.size) setDetailRow([...selectedRows][0]) },
     tableCopyCell:  () => {
       if (!visible()) return
+      if (copyGridSelection()) return
       const tsv = cellSelToTsv()    // 选区(单个或区域)优先
       if (tsv !== null) { copyText(tsv); toast.success('已复制选中单元格'); return }
       if (activeCell) { copyText(rows[activeCell.ri]?.[activeCell.ci] ?? 'NULL'); toast.success('已复制单元格值') }
@@ -514,6 +560,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
   }, [rowCtx])
 
   function handleHeaderClick(col: string) {
+    if(committing||draftBusy.current||pasteEdits.length||pasteBusy.current){toast.warning('请先保存或撤销粘贴修改');return}
     // 三态循环：无序 → 升序 → 降序 → 无序（无序即不带 ORDER BY，按主键自然序）
     if (sortCol !== col) {
       setSortCol(col); setSortDir('asc')
@@ -611,6 +658,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
 
   // 新增行：追加一条空白草稿
   function addDraftRow() {
+    if(!navigationAllowed())return
     if (readOnly) return
     const empty: Record<string, string> = {}
     columns.forEach(c => { empty[c] = '' })
@@ -618,48 +666,53 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
     setCommitErr('')
   }
   function setDraftCell(idx: number, col: string, val: string) {
+    if(draftBusy.current||draftBlocked)return
     setDraftRows(prev => prev.map((r, i) => i === idx ? { ...r, [col]: val } : r))
   }
   function removeDraft(idx: number) {
+    if(draftBusy.current||draftBlocked)return
     setDraftRows(prev => prev.filter((_, i) => i !== idx))
   }
-  // 将单元格文本量化为 SQL 字面量：空 → 省略（用默认值）；NULL → NULL；数字 → 原样；其余 → 引号转义
-  function sqlLiteral(v: string): string {
-    if (v === 'NULL') return 'NULL'
-    // SQLite 无 BOOLEAN 类型，驱动会把 0/1 展示为 false/true；仅 SQLite 须还原为整数。
-    // 其它方言（尤其 PG 的 boolean 列）应保留 true/false 关键字，否则 1/0 触发类型错误。
-    if (isSqlite(connType)) {
-      if (v === 'true')  return '1'
-      if (v === 'false') return '0'
-    }
-    if (/^-?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(v)) return v
-    return `'${v.replace(/'/g, "''")}'`
-  }
+  function sqlLiteral(value: string | null): string { return tableDataLiteral(value,connType) }
   function isTemporalColumn(col: string): boolean {
     const type = (colMeta[col]?.type ?? '').toLowerCase()
     return /\b(date|time|timestamp|year)\b|datetime2?|datetimeoffset|smalldatetime/.test(type)
   }
   async function commitDrafts() {
-    if (readOnly) return
-    if (draftRows.length === 0) return
-    if (!(await requireProdConfirm(envConn, `向 ${schema}.${table} 新增 ${draftRows.length} 行数据`))) return
-    setCommitting(true); setCommitErr('')
+    if(readOnly||draftBusy.current||draftBlocked||!draftRows.length)return
+    if(loadedOwner.current!==contextRef.current||loading){toast.warning('请等待当前表数据加载完成');return}
+    draftBusy.current=true;setCommitting(true);setCommitErr('')
+    const owner=contextRef.current,epoch=dataEpoch.current
+    const drafts=draftRows.map(row=>({...row})),names=[...columns]
+    const current=()=>mountedRef.current&&owner===contextRef.current&&epoch===dataEpoch.current
+    let dispatched=false
     try {
-      const { invoke } = await import('@tauri-apps/api/core')
-      for (const draft of draftRows) {
-        const entries = Object.entries(draft).filter(([, v]) => v !== '')
-        if (entries.length === 0) {
-          setCommitErr('请至少填写一个字段后再提交'); setCommitting(false); return
-        }
-        const sql = `INSERT INTO ${tableRef} (${entries.map(([c]) => q(c)).join(', ')}) VALUES (${entries.map(([, v]) => sqlLiteral(v)).join(', ')})`
-        await invoke('execute_query', { id: connectionId, sql })
+      const n=await insertTableDrafts({columns:names,drafts,submit:async rows=>{
+        if(!(await requireProdConfirm(envConn,'向 '+schema+'.'+table+' 新增 '+rows.length+' 行数据')))return -1
+        if(!current())throw new Error('数据视图已变化，本次新增未提交')
+        const {invoke}=await import('@tauri-apps/api/core')
+        if(!current())throw new Error('数据视图已变化，本次新增未提交')
+        dispatched=true
+        return invoke<number>('db_insert_drafts',{id:connectionId,schema,table,rows,...(ssSchema?{ssSchema}:{})})
+      }})
+      if(n<0)return
+      if(current()){
+        setDraftRows([]);setDraftBlocked(false);draftBusy.current=false
+        toast.success('已整批提交新增数据，正在重新读取数据库结果')
+        await fetchData();fetchCount()
       }
-      const n = draftRows.length
-      setDraftRows([])
-      setPage(0); fetchCount(); fetchData()
-      toast.success(`已新增 ${n} 行数据`)
-    } catch (e) { setCommitErr(String(e)) } // 失败只在面板内提示，避免一错两处
-    finally { setCommitting(false) }
+    } catch(error) {
+      if(current()){
+        if(dispatched)setDraftBlocked(true)
+        setCommitErr(String(error)+(dispatched?'；请先核验数据库，取消草稿并刷新后再操作，禁止直接重试':''))
+      }
+    } finally {
+      draftBusy.current=false
+      if(mountedRef.current){
+        setCommitting(false)
+        if(owner!==contextRef.current){void latestReload.current.fetchData();void latestReload.current.fetchCount()}
+      }
+    }
   }
 
   // 主键列（行内编辑/删除定位行用）
@@ -670,8 +723,61 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
     : idFallback.length > 0           ? idFallback
     : columns  // 全行定位
 
+  function gridSelection(): GridSelection | null {
+    if (selectedColumns.length) return { rows: rows.map((_, ri) => ri), columns: [...selectedColumns].sort((a,b) => a-b) }
+    const sel = cellSel ?? (activeCell ? { a: activeCell, f: activeCell } : null)
+    if (!sel) return null
+    return { rows: Array.from({ length: Math.abs(sel.a.ri-sel.f.ri)+1 },(_,i)=>Math.min(sel.a.ri,sel.f.ri)+i), columns: Array.from({ length: Math.abs(sel.a.ci-sel.f.ci)+1 },(_,i)=>Math.min(sel.a.ci,sel.f.ci)+i) }
+  }
+  function gridValue(ri:number,ci:number):GridValue{const staged=pasteMap.get(`${ri}:${ci}`);return staged?staged.newValue:rows[ri]?.[ci]??null}
+  function copyGridSelection(clipboardData?: DataTransfer): boolean {
+    const selection = gridSelection(); if (!selection?.rows.length) return false
+    const values = selection.rows.map(ri=>selection.columns.map(ci=>gridValue(ri,ci)))
+    const text = encodeGridText(values)
+    if (clipboardData) { clipboardData.setData('text/plain', text); return true }
+    void copyText(text).then(ok=>{ if(ok){toast.success('已复制选区；粘贴后需保存修改')}else toast.error('复制失败，请重试') })
+    return true
+  }
+  function stageGridPaste(text: string, capturedSelection?: GridSelection|null) {
+    try {
+      if(loadedOwner.current!==contextRef.current)throw new Error('当前数据尚未加载完成，请等待刷新')
+      if(metadataOwner.current!==JSON.stringify([connectionId,schema,table,ssSchema]))throw new Error('字段元数据尚未加载完成')
+      if(readOnly) throw new Error('当前连接为只读，不能粘贴赋值')
+      if(loading||pasteBusy.current||pasteSaving||savingCell||draftRows.length||editCell) throw new Error('请先结束当前编辑、加载或新增操作')
+      if(!['mysql','mariadb','tidb','oceanBase','postgres','kingBase','openGauss','sqlite'].includes(connType)) throw new Error('当前数据库尚不支持原子批量粘贴保存，未暂存任何修改')
+      if(pasteBlocked) throw new Error('上次保存结果需要核验，请撤销暂存并刷新后重新操作')
+      const selection=capturedSelection===undefined?gridSelection():capturedSelection;if(!selection)throw new Error('请先选择目标单元格或列')
+      const values=parseGridText(text)
+      const meta=Object.fromEntries(Object.entries(colMeta).map(([name,m])=>[name,{nullable:m.nullable==='YES',editable:editableGridExtra(m.extra)}]))
+      const planned=planGridPaste({rows,columns,keys:explicitPk,meta,selection,values})
+      const merged=validateGridBudget(mergeGridEdits(pasteEditsRef.current,planned));if(merged.length>10000)throw new Error('累计暂存超过 10000 个单元格，请先保存');pasteEditsRef.current=merged;setPasteEdits(merged);toast.success('已暂存粘贴，点击「保存修改」后一次性提交')
+    }catch(error){toast.warning(String(error instanceof Error?error.message:error))}
+  }
+  function selectColumn(e: React.MouseEvent, ci: number) {
+    e.preventDefault();e.stopPropagation();tableWrapRef.current?.focus();setSelectedRows(new Set());setCellSel(null);setActiveCell(null)
+    if(e.shiftKey&&columnAnchor.current!==null){const lo=Math.min(ci,columnAnchor.current),hi=Math.max(ci,columnAnchor.current);setSelectedColumns(Array.from({length:hi-lo+1},(_,i)=>lo+i))}
+    else if(e.metaKey||e.ctrlKey){setSelectedColumns(prev=>prev.includes(ci)?prev.filter(c=>c!==ci):[...prev,ci]);columnAnchor.current=ci}
+    else {setSelectedColumns([ci]);columnAnchor.current=ci}
+  }
+  async function savePastedCells() {
+    if(pasteBusy.current||!pasteEdits.length||pasteBlocked||readOnly)return
+    pasteBusy.current=true;setPasteSaving(true)
+    const owner=contextRef.current,epoch=dataEpoch.current,edits=pasteEdits.map(e=>({...e,pkValues:[...e.pkValues]}));let dispatched=false
+    try{
+      if(!(await requireProdConfirm(envConn,`保存 ${schema}.${table} 的 ${edits.length} 项粘贴修改`)))return
+      if(owner!==contextRef.current||epoch!==dataEpoch.current)throw new Error('数据视图已变化，未提交修改')
+      const {invoke}=await import('@tauri-apps/api/core')
+      if(owner!==contextRef.current||epoch!==dataEpoch.current)throw new Error('数据视图已变化，未提交修改')
+      dispatched=true
+      await invoke('update_cells',{id:connectionId,schema,table,changes:groupGridEdits(edits,columns,explicitPk)})
+      if(mountedRef.current&&owner===contextRef.current){setPasteEdits([]);pasteEditsRef.current=[];pasteBusy.current=false;toast.success('已保存修改，正在重新读取数据库结果');await fetchData();fetchCount()}
+    }catch(error){if(mountedRef.current&&owner===contextRef.current){if(dispatched)setPasteBlocked(true);toast.error(`保存失败：${String(error)}${dispatched?'；请核验数据库后撤销暂存并刷新，禁止直接重试':''}`)}}
+    finally{pasteBusy.current=false;if(mountedRef.current){setPasteSaving(false);if(owner!==contextRef.current){void latestReload.current.fetchData();void latestReload.current.fetchCount()}}}
+  }
+
   function startEdit(ri: number, ci: number) {
-    if (readOnly) return
+    if (readOnly||draftBusy.current||committing||loading) return
+    if(pasteEdits.length){toast.warning('请先保存或撤销粘贴修改');return}
     if (columns.length === 0) { toast.warning('无法读取表结构，无法行内编辑'); return }
     clearCellDetailTimer()
     setCellDetail(null)
@@ -698,8 +804,8 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
       const { invoke } = await import('@tauri-apps/api/core')
       const pkValues = pkCols.map(pc => rows[ri][columns.indexOf(pc)])
       await invoke('update_cell', {
-        id: connectionId, schema, table, column: col,
-        newValue: next, pkColumns: pkCols, pkValues,
+        id: connectionId, schema, table, ...(ssSchema ? { ssSchema } : {}), column: col,
+        newValue: next, pkColumns: pkCols, pkValues, expectedValues: [orig],
       })
       setRows(prev => prev.map((r, i) => i === ri ? r.map((v, j) => j === ci ? next : v) : r))
       setEditCell(null)
@@ -708,38 +814,36 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
     finally { cellBusyRef.current = false; setSavingCell(false) }
   }
 
-  // 行主键 WHERE 条件
-  function pkWhere(ri: number): string {
-    return pkCols.map(pc => {
-      const v = rows[ri][columns.indexOf(pc)]
-      return v === null ? `${q(pc)} IS NULL` : `${q(pc)} = ${sqlLiteral(v)}`
-    }).join(' AND ')
-  }
   function askDeleteRows(ris: number[]) {
+    if(!navigationAllowed())return
     if (readOnly) return
     if (columns.length === 0) return
     if (ris.length === 0) return
-    setDelRows(ris)
+    setDelRows({ connectionId, schema, table, ssSchema, columns: [...columns], pkCols: [...pkCols], rows: ris.map(ri => [...rows[ri]]) })
   }
   async function confirmDeleteRows() {
-    if (!delRows || delRows.length === 0) return
+    if (deleteBusyRef.current || !delRows || delRows.rows.length === 0) return
+    deleteBusyRef.current = true
     setDeleting(true)
     try {
       const { invoke } = await import('@tauri-apps/api/core')
-      for (const ri of delRows) {
-        // Oracle 不支持 DELETE ... LIMIT（rownum 子查询写法过于复杂，主键 WHERE 已唯一定位一行）
-        // 只有 MySQL 系支持 DELETE ... LIMIT 1；Oracle/PG/SQLite 等直接用主键 WHERE 定位（已唯一）
-        const delSql = isMysqlFamily(connType)
-          ? `DELETE FROM ${tableRef} WHERE ${pkWhere(ri)} LIMIT 1`
-          : `DELETE FROM ${tableRef} WHERE ${pkWhere(ri)}`
-        await invoke('execute_query', { id: connectionId, sql: delSql })
-      }
-      const n = delRows.length
+      await invoke('db_delete_rows', { id: delRows.connectionId, schema: delRows.schema, table: delRows.table, ...(delRows.ssSchema ? { ssSchema: delRows.ssSchema } : {}), pkColumns: delRows.pkCols,
+        pkValuesList: delRows.rows.map(row => delRows.pkCols.map(pc => row[delRows.columns.indexOf(pc)])),
+        baseline: { columns: delRows.columns, rows: delRows.rows },
+      })
+      const n = delRows.rows.length
       setDelRows(null); setSelectedRows(new Set())
       fetchCount(); fetchData()
       toast.success(`已删除 ${n} 行`)
-    } catch (e) { toast.error(`删除失败：${String(e)}`) }
-    finally { setDeleting(false) }
+    } catch (e) {
+      const message=String(e)
+      if(message.includes('结果未知')||message.includes('提交未获确认')){
+        setDelRows(null);setSelectedRows(new Set())
+        toast.error(`删除结果未确认，正在刷新数据核对；请勿重试：${message}`)
+        void fetchCount();void fetchData()
+      }else toast.error(`删除失败：${message}`)
+    }
+    finally { deleteBusyRef.current = false; setDeleting(false) }
   }
 
   // 复制行为 INSERT 语句（支持多行）
@@ -787,13 +891,15 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
   // 单元格置 NULL（按主键定位）
   async function setCellNull(ri: number, ci: number) {
     if (readOnly) return
+    if(committing||draftBusy.current||pasteEdits.length||pasteBusy.current){toast.warning('请先保存或撤销粘贴修改');return}
     if (columns.length === 0) return
+    if(!(await requireProdConfirm(envConn, '将 '+schema+'.'+table+'.'+columns[ci]+' 置为 NULL')))return
     try {
       const { invoke } = await import('@tauri-apps/api/core')
       const pkValues = pkCols.map(pc => rows[ri][columns.indexOf(pc)])
       await invoke('update_cell', {
         id: connectionId, schema, table, column: columns[ci],
-        newValue: null, pkColumns: pkCols, pkValues,
+        newValue: null, pkColumns: pkCols, pkValues, expectedValues: [rows[ri][ci]],
       })
       setRows(prev => prev.map((r, i) => i === ri ? r.map((v, j) => j === ci ? null : v) : r))
       toast.success(`已将 ${columns[ci]} 置为 NULL`)
@@ -819,11 +925,11 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
       const esc = (s: string) => s.replace(/'/g, "''")
       const isMy = isMysqlFamily(connType)
       const isPg = ['postgres', 'kingBase', 'openGauss'].includes(connType)
-      const schemaOrDef = schema || (connType === 'duckdb' ? 'main' : connType === 'sqlServer' ? 'dbo' : 'public')
+      const schemaOrDef = connType === 'sqlServer' ? (ssSchema || 'dbo') : schema || (connType === 'duckdb' ? 'main' : 'public')
       const tableUp = table.toUpperCase(), schemaUp = schema.toUpperCase()
 
       if (tab === 'ddl') {
-        const ddl = await invoke<string>('get_table_ddl', { id: connectionId, schema, table })
+        const ddl = await invoke<string>('get_table_ddl', { id: connectionId, schema, table, ...(ssSchema ? { ssSchema } : {}) })
         setDetailDdl(ddl)
       } else if (tab === 'cols') {
         let sql: string
@@ -849,9 +955,10 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
           sql = `SELECT name, type, position, if(is_in_primary_key,'YES','NO') AS pk, default_kind, default_expression, comment `
             + `FROM system.columns WHERE database='${esc(schema)}' AND table='${esc(table)}' ORDER BY position`
         } else if (connType === 'sqlServer') {
+          const db = schema ? `${q(schema)}.` : ''
           sql = `SELECT c.COLUMN_NAME, c.DATA_TYPE, c.CHARACTER_MAXIMUM_LENGTH, c.IS_NULLABLE, c.COLUMN_DEFAULT `
-            + `FROM INFORMATION_SCHEMA.COLUMNS c `
-            + `WHERE c.TABLE_SCHEMA='${esc(schemaOrDef)}' AND c.TABLE_NAME='${esc(table)}' ORDER BY c.ORDINAL_POSITION`
+            + `FROM ${db}INFORMATION_SCHEMA.COLUMNS c `
+            + `WHERE c.TABLE_SCHEMA=N'${esc(schemaOrDef)}' AND c.TABLE_NAME=N'${esc(table)}' ORDER BY c.ORDINAL_POSITION`
         } else {
           setDetailError('该数据库类型暂不支持查看字段属性'); return
         }
@@ -862,7 +969,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
         setDetailColRows(rows.map(r => r.filter((_, i) => !skip.has(i))))
       } else {
         // 索引 SQL 统一走共享方言层 buildIndexSql（与 SchemaBrowser 一致，避免各写一份）
-        const sql = buildIndexSql(connType, schema, table)
+        const sql = buildIndexSql(connType, schema, table, ssSchema)
         if (!sql) { setDetailError('该数据库类型暂不支持查看索引'); return }
         const res = await invoke<QueryResult>('execute_query', { id: connectionId, sql })
         setDetailIdxNames(res.columns ?? []); setDetailIdxRows(res.rows ?? [])
@@ -908,6 +1015,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
     } catch (e) { toast.error(`${kind} TABLE 失败：${String(e)}`) }
   }
   async function confirmTruncate() {
+    if(!navigationAllowed())return
     if (truncInput !== table) return
     setTruncBusy(true)
     try {
@@ -928,7 +1036,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
     setTblMenuOpen(false)
     try {
       const { invoke } = await import('@tauri-apps/api/core')
-      const ddl = await invoke<string>('get_table_ddl', { id: connectionId, schema, table })
+      const ddl = await invoke<string>('get_table_ddl', { id: connectionId, schema, table, ...(ssSchema ? { ssSchema } : {}) })
       const tabId = openQueryTabAction(connectionId)
       setPendingFill(tabId, ddl)
       toast.info('DDL 已填入查询页，修改后手动执行')
@@ -959,6 +1067,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
     return new Set(order.slice(lo, hi + 1))
   }
   function handleRowClick(e: React.MouseEvent, ri: number) {
+    setSelectedColumns([])
     setCellSel(null)   // 选整行清单元格选区（互斥）
     if (draggedRef.current) { draggedRef.current = false; return }  // 拖选结束后的 click 不重置
     if (e.shiftKey && lastClickRef.current !== null) {
@@ -1004,6 +1113,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
     if (e.button !== 0) return
     const t = e.target as HTMLElement
     if (t.closest('input, button')) return        // 编辑中/按钮不拦
+    tableWrapRef.current?.focus();setSelectedColumns([])
     if (e.shiftKey && cellSel) { setCellSel({ a: cellSel.a, f: { ri, ci } }); setActiveCell({ ri, ci }); return }
     e.preventDefault()                              // 阻止浏览器原生文字选区
     cellDragRef.current = true
@@ -1011,7 +1121,8 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
     setActiveCell({ ri, ci })
     if (selectedRows.size) setSelectedRows(new Set())  // 选单元格清整行选择（互斥）
   }
-  function onCellMouseEnter(ri: number, ci: number) {
+  function onCellMouseEnter(ri: number, ci: number, buttons: number) {
+    if(!(buttons&1)){cellDragRef.current=false;return}
     if (!cellDragRef.current) return
     setCellSel(s => s ? { a: s.a, f: { ri, ci } } : { a: { ri, ci }, f: { ri, ci } })
     setActiveCell({ ri, ci })
@@ -1034,6 +1145,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
   }
   async function saveCellDetail() {
     if (!cellDetail || readOnly || savingCell) return
+    if(committing||draftBusy.current||pasteEdits.length||pasteBusy.current){toast.warning('请先保存或撤销粘贴修改');return}
     const { ri, ci } = cellDetail
     const col = columns[ci]
     const orig = rows[ri]?.[ci] ?? null
@@ -1044,7 +1156,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
       const { invoke } = await import('@tauri-apps/api/core')
       if (!(await requireProdConfirm(envConn, `修改 ${schema}.${table} 的单元格`))) return
       const pkValues = pkCols.map(pc => rows[ri][columns.indexOf(pc)])
-      await invoke('update_cell', { id: connectionId, schema, table, column: col, newValue: next, pkColumns: pkCols, pkValues })
+      await invoke('update_cell', { id: connectionId, schema, table, ...(ssSchema ? { ssSchema } : {}), column: col, newValue: next, pkColumns: pkCols, pkValues, expectedValues: [orig] })
       setRows(prev => prev.map((r, i) => i === ri ? r.map((v, j) => j === ci ? next : v) : r))
       setCellDetailEditing(false)
       toast.success('已更新单元格')
@@ -1086,7 +1198,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'a' || e.shiftKey || e.altKey) return
-      if (!tableWrapRef.current?.offsetParent) return     // 仅当前可见的表格响应
+      if (!active||!tableWrapRef.current?.offsetParent||!tableWrapRef.current.contains(document.activeElement)) return
       const ae = document.activeElement as HTMLElement | null
       if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable || ae.classList.contains('cm-content'))) return
       e.preventDefault()
@@ -1094,7 +1206,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [selectAllCells])
+  }, [selectAllCells, active])
   // 选中区域 → TSV（可粘进 Excel）
   const cellSelToTsv = useCallback((): string | null => {
     if (!cellSel) return null
@@ -1212,17 +1324,22 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
                 )}
               </div>
             )}
+            {pasteEdits.length > 0 && <>
+              <span className="tb-draft-hint">{pasteEdits.length} 项粘贴待保存{pasteBlocked?' · 需核验后刷新':''}</span>
+              <button className="tb-text-btn tb-text-btn--primary" disabled={pasteSaving||pasteBlocked} onClick={savePastedCells}>{pasteSaving?'保存中…':'保存修改'}</button>
+              <button className="tb-text-btn" disabled={pasteSaving} onClick={()=>{pasteEditsRef.current=[];setPasteEdits([]);setPasteBlocked(false)}}>撤销粘贴</button>
+            </>}
             {/* 新增行 / 提交 / 取消（ClickHouse 只读：隐藏写操作，仅保留复制） */}
             {!readOnly && draftRows.length > 0 ? (
               <>
                 <span className="tb-draft-hint">{draftRows.length} 行待提交</span>
-                <button className="tb-icon-btn tb-icon-btn--primary" disabled={committing}
+                <button className="tb-icon-btn tb-icon-btn--primary" disabled={committing||draftBlocked}
                   data-tip="提交新增" data-shortcut={sc('tableCommit')}
                   onClick={(e) => { e.stopPropagation(); commitDrafts() }}>
                   {committing ? <Loader2 size={14} className="spin" /> : <Save size={14} />}
                 </button>
                 <button className="tb-icon-btn" disabled={committing} data-tip="取消"
-                  onClick={(e) => { e.stopPropagation(); setDraftRows([]); setCommitErr('') }}>
+                  onClick={(e) => { e.stopPropagation(); setDraftRows([]); setCommitErr('');setDraftBlocked(false) }}>
                   <X size={14} />
                 </button>
               </>
@@ -1393,7 +1510,28 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
         )}
 
         {/* Table area */}
-        <div className="tb-table-wrap" ref={tableWrapRef}>
+        <div className="tb-table-wrap" ref={tableWrapRef} tabIndex={0}
+          aria-label="数据网格：点击选格，Shift 点击扩选，粘贴后保存修改"
+          onCopy={e=>{
+            if(!active||(e.target as HTMLElement).closest('input,textarea,[contenteditable]'))return
+            if(copyGridSelection(e.clipboardData)){e.preventDefault();e.stopPropagation()}
+          }}
+          onPaste={e=>{
+            if(!active||(e.target as HTMLElement).closest('input,textarea,[contenteditable]'))return
+            e.preventDefault();e.stopPropagation()
+            if(!Array.from(e.clipboardData.types).includes('text/plain')){toast.warning('剪贴板不含纯文本，未修改任何单元格');return}
+            stageGridPaste(e.clipboardData.getData('text/plain'))
+          }}
+          onKeyDownCapture={e=>{
+            if(!active||(e.target as HTMLElement).closest('input,textarea,[contenteditable]'))return
+            if(!(e.metaKey||e.ctrlKey)||e.altKey)return
+            const key=e.key.toLowerCase()
+            if(key==='c'){e.preventDefault();e.stopPropagation();copyGridSelection()}
+            if(key==='v'&&'__TAURI_INTERNALS__' in window){
+              e.preventDefault();e.stopPropagation();const owner=contextRef.current,epoch=dataEpoch.current,selection=gridSelection()
+              void import('@tauri-apps/plugin-clipboard-manager').then(m=>m.readText()).then(text=>{if(owner===contextRef.current&&epoch===dataEpoch.current&&mountedRef.current){if(text===null){toast.warning('剪贴板不含文本，未修改任何单元格');return}stageGridPaste(text,selection)}}).catch(error=>toast.error('读取剪贴板失败：'+String(error)))
+            }
+          }}>
           {loading && (
             <div className="tb-loading-overlay">
               <Loader2 size={20} className="spin" />
@@ -1416,11 +1554,11 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
                 <tr>
                   <th className="tb-th tb-th--rownum" />
                   {draftRows.length > 0 && <th className="tb-th tb-th--ops" />}
-                  {columns.map((col) => {
+                  {columns.map((col, ci) => {
                     const hasFilter = !!filters[col]?.value.trim()
                     const isSorted  = sortCol === col
                     return (
-                      <th key={col} className="tb-th"
+                      <th key={col} className={'tb-th'+(selectedColumns.includes(ci)?' tb-td--cellsel':'')}
                         style={{ width: colWidths.get(col) ?? TB_DEFAULT_COL_WIDTH, minWidth: colWidths.get(col) ?? TB_DEFAULT_COL_WIDTH }}
                         data-tip={(() => {
                           const m = colMeta[col]
@@ -1433,9 +1571,10 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
                           return lines.join('\n')
                         })()}>
                         <div className="tb-th-inner">
+                          <button className="tb-icon-btn" style={{padding:2}} aria-label={'选择 '+col+' 列'} title="选择当前页整列；Ctrl/Cmd 多选，Shift 连选" onClick={e=>selectColumn(e,ci)}><Table2 size={11}/></button>
                           <button
                             className="tb-th-label"
-                            onClick={(e) => { e.stopPropagation(); handleHeaderClick(col) }}
+                            onClick={(e) => { e.stopPropagation(); if(e.shiftKey||e.metaKey||e.ctrlKey)selectColumn(e,ci);else handleHeaderClick(col) }}
                           >
                             {colMeta[col]?.key === 'PRI' && <span className="tb-th-pk" data-tip="主键">🔑</span>}
                             <span className="tb-th-name-text">{col}</span>
@@ -1495,7 +1634,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
                 {draftRows.map((draft, di) => (
                   <tr key={`draft-${di}`} className="tb-tr tb-tr--draft">
                     <td className="tb-td tb-td--ops">
-                      <button className="tb-draft-del" data-tip="移除此行" onClick={() => removeDraft(di)}>
+                      <button className="tb-draft-del" disabled={committing||draftBlocked} data-tip="移除此行" onClick={() => removeDraft(di)}>
                         <Trash2 size={11} />
                       </button>
                     </td>
@@ -1503,8 +1642,8 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
                       <td key={ci} className="tb-td tb-td--edit">
                         <input
                           className="tb-cell-input"
-                          value={draft[col] ?? ''}
-                          placeholder="NULL / 默认"
+                          value={draft[col] ?? ''} disabled={committing||draftBlocked}
+                          placeholder="留空用默认值；NULL 按文字"
                           autoComplete="off" spellCheck={false}
                           onChange={(e) => setDraftCell(di, col, e.target.value)}
                         />
@@ -1522,14 +1661,16 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
 	                      onMouseEnter={() => onRowMouseEnter(ri)}
 	                      onContextMenu={(e) => openRowContext(e, ri, 0)} />
                     {draftRows.length > 0 && <td className="tb-td tb-td--ops" />}
-                    {row.map((cell, ci) => {
+                    {row.map((originalCell, ci) => {
+                      const staged = pasteMap.get(`${ri}:${ci}`)
+                      const cell = staged ? staged.newValue : originalCell
                       const isEditing = editCell?.ri === ri && editCell?.ci === ci
                       return (
                         <td
-                          key={ci}
+                          key={ci} style={staged?{boxShadow:'inset 0 -2px 0 var(--accent)'}:undefined} title={staged?'已暂存，保存修改后提交':undefined}
 	                          className={`tb-td ${cell === null ? 'tb-td--null' : ''}${isEditing ? ' tb-td--editing' : ''}${activeCell?.ri === ri && activeCell?.ci === ci ? ' tb-td--active' : ''}${cellInSel(ri, ci) ? ' tb-td--cellsel' : ''}`}
 	                          onMouseDown={(e) => onCellMouseDown(e, ri, ci)}
-	                          onMouseEnter={() => onCellMouseEnter(ri, ci)}
+	                          onMouseEnter={e => onCellMouseEnter(ri, ci, e.buttons)}
 	                          onClick={(e) => { if (!isEditing) openCellDetailIfTruncated(e, ri, ci) }}
                           onDoubleClick={() => {
                             clearCellDetailTimer()
@@ -1712,14 +1853,14 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
         {delRows && (
           <div className="tb-confirm-overlay">
             <div className="tb-confirm" onClick={(e) => e.stopPropagation()}>
-              <div className="tb-confirm__title">删除 {delRows.length} 行？</div>
+              <div className="tb-confirm__title">删除 {delRows.rows.length} 行？</div>
               <div className="tb-confirm__msg">
                 将按主键删除以下行，无法恢复：<br />
                 <code>
-                  {delRows.slice(0, 5).map(ri =>
-                    pkCols.map(pc => `${pc}=${rows[ri]?.[columns.indexOf(pc)] ?? 'NULL'}`).join(', ')
+                  {delRows.rows.slice(0, 5).map(row =>
+                    delRows.pkCols.map(pc => `${pc}=${row[delRows.columns.indexOf(pc)] ?? 'NULL'}`).join(', ')
                   ).join('；')}
-                  {delRows.length > 5 && ` …等 ${delRows.length} 行`}
+                  {delRows.rows.length > 5 && ` …等 ${delRows.rows.length} 行`}
                 </code>
               </div>
               <div className="tb-confirm__actions">
@@ -1861,7 +2002,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, on
   const tableModals = (
     <>
       {editStructOpen && (
-        <CreateTableWizard connectionId={connectionId} connType={connType as ConnType} schema={schema} editTable={table}
+        <CreateTableWizard connectionId={connectionId} connType={connType as ConnType} schema={schema} ssSchema={ssSchema} editTable={table}
           onClose={() => setEditStructOpen(false)}
           onDone={() => { setMetaTick(t => t + 1); setPage(0); fetchCount(); fetchData() }} />
       )}

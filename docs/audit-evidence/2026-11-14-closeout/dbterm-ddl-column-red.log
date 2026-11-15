@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/Users/Nico/workSpace/claude/DBterm/scripts/acceptance/sqlserver-ddl-columns.py", line 10, in <module>
+    assert not missing, f'column DDL loses source metadata: {missing}'
+           ^^^^^^^^^^^
+AssertionError: column DDL loses source metadata: ['c.collation_name', 'c.is_computed', 'cc.definition', 'cc.is_persisted', 'dc.name', 'tp.is_user_defined', 'SCHEMA_NAME(tp.schema_id)', 'ic.is_not_for_replication']

@@ -1,0 +1,53 @@
+warning: use of deprecated method `futures_channel::mpsc::UnboundedReceiver::<T>::try_next`: please use `try_recv` instead
+   --> vendor/sqlx-postgres/src/listener.rs:335:56
+    |
+335 |         if let Ok(Some(notification)) = self.buffer_rx.try_next() {
+    |                                                        ^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: variant `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/mod.rs:78:5
+   |
+70 | pub enum FrontendMessageFormat {
+   |          --------------------- variant in this enum
+...
+78 |     Flush = b'H',
+   |     ^^^^^
+   |
+   = note: `FrontendMessageFormat` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/flush.rs:11:12
+   |
+11 | pub struct Flush;
+   |            ^^^^^
+
+warning: `sqlx-postgres` (lib) generated 3 warnings
+   Compiling app v0.1.23 (/Users/Nico/workSpace/claude/DBterm/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.46s
+     Running unittests src/lib.rs (target/debug/deps/app_lib-bccc94f7de71602a)
+
+running 5 tests
+test commands::sqlserver::ddl_columns::tests::computed_expression_is_preserved_instead_of_materialized_as_ordinary_column ... ok
+test commands::sqlserver::ddl_columns::tests::collation_named_default_and_unicode_text_are_preserved ... ok
+test commands::sqlserver::ddl_columns::tests::identity_replication_and_sparse_rowguid_attributes_are_not_invented_or_lost ... ok
+test commands::sqlserver::ddl_columns::tests::user_type_keeps_schema_and_case_and_does_not_append_underlying_length ... ok
+test commands::sqlserver::ddl_columns::tests::nonpersisted_computed_inferred_nullability_does_not_add_invalid_not_null ... FAILED
+
+failures:
+
+---- commands::sqlserver::ddl_columns::tests::nonpersisted_computed_inferred_nullability_does_not_add_invalid_not_null stdout ----
+
+thread 'commands::sqlserver::ddl_columns::tests::nonpersisted_computed_inferred_nullability_does_not_add_invalid_not_null' (453102) panicked at src/commands/sqlserver/ddl_columns.rs:103:31:
+called `Result::unwrap()` on an `Err` value: "计算列 v]中文 的持久化/非空元数据不一致"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    commands::sqlserver::ddl_columns::tests::nonpersisted_computed_inferred_nullability_does_not_add_invalid_not_null
+
+test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 470 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

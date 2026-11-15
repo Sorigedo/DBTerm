@@ -53,10 +53,17 @@ async fn raw_query(
         req = req.query(&[(format!("param_{k}"), *v)]);
     }
 
-    let resp = req.body(sql.to_string()).send().await
+    let mut resp = req.body(sql.to_string()).send().await
         .map_err(|e| format!("ClickHouse 请求失败: {e}"))?;
     let status = resp.status();
-    let text = resp.text().await.map_err(|e| format!("读取 ClickHouse 响应失败: {e}"))?;
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("读取 ClickHouse 响应失败: {e}"))? {
+        if body.len().saturating_add(chunk.len()) > super::query_result_budget::MAX_RESULT_BYTES {
+            return Err("ClickHouse 响应超过 32 MiB 内存安全上限，未返回部分结果。请缩小查询范围或使用流式导出。".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8(body).map_err(|e| format!("ClickHouse 响应不是 UTF-8: {e}"))?;
     if !status.is_success() {
         // 401/403 给友好提示，其余原样透出服务器错误
         if status.as_u16() == 401 || status.as_u16() == 403 {
@@ -88,11 +95,20 @@ pub async fn query(config: &ConnConfig, password: Option<&str>, sql: &str) -> Re
     let columns: Vec<String> = v["meta"].as_array()
         .map(|m| m.iter().filter_map(|c| c["name"].as_str().map(String::from)).collect())
         .unwrap_or_default();
-    let rows: Vec<Vec<Option<String>>> = v["data"].as_array()
-        .map(|arr| arr.iter()
-            .map(|row| columns.iter().map(|c| cell_to_string(&row[c.as_str()])).collect())
-            .collect())
-        .unwrap_or_default();
+    let mut rows = Vec::new();
+    let mut budget = super::query_result_budget::ResultBudget::default();
+    if let Some(data) = v["data"].as_array() {
+        for raw in data {
+            budget.start_row()?;
+            let mut row = Vec::new();
+            for column in &columns {
+                let cell = cell_to_string(&raw[column.as_str()]);
+                budget.cell(cell.as_deref())?;
+                row.push(cell);
+            }
+            rows.push(row);
+        }
+    }
 
     Ok(QueryResult {
         rows_affected: if columns.is_empty() { 0 } else { rows.len() as u64 },

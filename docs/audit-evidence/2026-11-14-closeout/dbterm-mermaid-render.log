@@ -1,0 +1,1 @@
+PASS production Markdown/Mermaid rendering keeps flow, sequence, class, ER, state and KaTeX diagrams plus invalid-source fallback; raw HTML and javascript links stay inactive.

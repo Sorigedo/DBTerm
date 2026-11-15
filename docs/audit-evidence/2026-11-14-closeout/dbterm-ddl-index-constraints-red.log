@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/Users/Nico/workSpace/claude/DBterm/scripts/acceptance/sqlserver-ddl-constraints.py", line 4, in <module>
+    assert 'ddl_constraints::read_constraints' in source, 'table scripting omits foreign keys and check constraints'
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: table scripting omits foreign keys and check constraints

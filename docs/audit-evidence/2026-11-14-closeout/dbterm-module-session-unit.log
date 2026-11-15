@@ -1,0 +1,40 @@
+warning: use of deprecated method `futures_channel::mpsc::UnboundedReceiver::<T>::try_next`: please use `try_recv` instead
+   --> vendor/sqlx-postgres/src/listener.rs:335:56
+    |
+335 |         if let Ok(Some(notification)) = self.buffer_rx.try_next() {
+    |                                                        ^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: variant `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/mod.rs:78:5
+   |
+70 | pub enum FrontendMessageFormat {
+   |          --------------------- variant in this enum
+...
+78 |     Flush = b'H',
+   |     ^^^^^
+   |
+   = note: `FrontendMessageFormat` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/flush.rs:11:12
+   |
+11 | pub struct Flush;
+   |            ^^^^^
+
+warning: `sqlx-postgres` (lib) generated 3 warnings
+   Compiling app v0.1.23 (/Users/Nico/workSpace/claude/DBterm/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.60s
+     Running unittests src/lib.rs (target/debug/deps/app_lib-bccc94f7de71602a)
+
+running 5 tests
+test commands::sqlserver::ddl_script::module_tests::table_archive_without_module_flags_gets_no_invented_session_settings ... ok
+test commands::sqlserver::ddl_script::module_tests::module_archive_keeps_all_flag_combinations_and_definition_bytes ... ok
+test commands::sqlserver::ddl_script::tests::cyclic_foreign_keys_can_follow_both_table_definitions_and_data ... ok
+test commands::sqlserver::ddl_script::tests::phased_script_preserves_sql_body_with_fake_statement_tokens ... ok
+test commands::sqlserver::ddl_script::archive_tests::zip_orders_tables_then_indexes_then_cyclic_foreign_keys_without_sql_splitting ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 484 filtered out; finished in 0.00s
+

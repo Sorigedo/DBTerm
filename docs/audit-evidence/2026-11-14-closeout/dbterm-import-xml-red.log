@@ -1,0 +1,58 @@
+warning: use of deprecated method `futures_channel::mpsc::UnboundedReceiver::<T>::try_next`: please use `try_recv` instead
+   --> vendor/sqlx-postgres/src/listener.rs:335:56
+    |
+335 |         if let Ok(Some(notification)) = self.buffer_rx.try_next() {
+    |                                                        ^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: variant `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/mod.rs:78:5
+   |
+70 | pub enum FrontendMessageFormat {
+   |          --------------------- variant in this enum
+...
+78 |     Flush = b'H',
+   |     ^^^^^
+   |
+   = note: `FrontendMessageFormat` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/flush.rs:11:12
+   |
+11 | pub struct Flush;
+   |            ^^^^^
+
+warning: `sqlx-postgres` (lib) generated 3 warnings
+   Compiling app v0.1.23 (/Users/Nico/workSpace/claude/DBterm/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.25s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/app_lib-bccc94f7de71602a)
+
+running 2 tests
+test commands::import_xml::tests::damaged_or_ambiguous_xml_never_returns_partial_records ... FAILED
+test commands::import_xml::tests::xml_values_keep_entities_cdata_empty_text_and_explicit_null ... FAILED
+
+failures:
+
+---- commands::import_xml::tests::damaged_or_ambiguous_xml_never_returns_partial_records stdout ----
+
+thread 'commands::import_xml::tests::damaged_or_ambiguous_xml_never_returns_partial_records' (638929) panicked at src/commands/import_xml.rs:40:2:
+invalid XML silently accepted: <t><row><id>1</id></row><row><id>2</id>
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- commands::import_xml::tests::xml_values_keep_entities_cdata_empty_text_and_explicit_null stdout ----
+
+thread 'commands::import_xml::tests::xml_values_keep_entities_cdata_empty_text_and_explicit_null' (638930) panicked at src/commands/import_xml.rs:36:2:
+assertion `left == right` failed
+  left: [[Some("1"), Some("&#x4E2D;&#25991;<![CDATA[<raw>&]]>&lt;")], [Some("2"), Some("")], [Some("3"), None], [Some("4"), None]]
+ right: [[Some("1"), Some("中文<raw>&&lt;")], [Some("2"), Some("")], [Some("3"), None], [Some("4"), Some("NULL")]]
+
+
+failures:
+    commands::import_xml::tests::damaged_or_ambiguous_xml_never_returns_partial_records
+    commands::import_xml::tests::xml_values_keep_entities_cdata_empty_text_and_explicit_null
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 512 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

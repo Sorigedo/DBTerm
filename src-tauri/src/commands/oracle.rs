@@ -189,7 +189,7 @@ const SQLT_CHR:        Ub2 = 1;
 // 查询每列最大缓冲区（4K）；DDL/CLOB 使用更大缓冲
 const QUERY_BUF_SIZE: usize = 4096;
 const DDL_BUF_SIZE:   usize = 65536;
-const MAX_FETCH_ROWS: usize = 50_000;
+
 
 // ── OCI 函数指针类型 ───────────────────────────────────────────────────────────
 
@@ -592,33 +592,38 @@ impl OciHandles {
         }
 
         // Fetch 循环
-        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
-        loop {
-            if rows.len() >= MAX_FETCH_ROWS { break; }
-            let rc = unsafe {
-                (self.oci.fetch2)(stmthp, self.errhp, 1, OCI_FETCH_NEXT, 0, OCI_DEFAULT)
-            };
-            if rc == OCI_NO_DATA { break; }
-            if let Err(e) = self.oci.ok(rc, self.errhp, "OCIStmtFetch2") {
-                unsafe { (self.oci.stmt_rel)(stmthp, self.errhp, std::ptr::null(), 0, OCI_DEFAULT); }
-                return Err(e);
-            }
-            let mut row = Vec::with_capacity(ncols);
-            for i in 0..ncols {
-                let ind = unsafe { *ind_ptr.add(i) };
-                if ind == -1 {
-                    row.push(None);
-                } else {
-                    let len = unsafe { *rlen_ptr.add(i) } as usize;
-                    let s = String::from_utf8_lossy(&buffers[i][..len]).to_string();
-                    row.push(Some(s));
+        let decoded = (|| -> Result<Vec<Vec<Option<String>>>, String> {
+            let mut budget = super::query_result_budget::ResultBudget::default();
+            let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+            loop {
+                let rc = unsafe {
+                    (self.oci.fetch2)(stmthp, self.errhp, 1, OCI_FETCH_NEXT, 0, OCI_DEFAULT)
+                };
+                if rc == OCI_NO_DATA { break; }
+                if let Err(e) = self.oci.ok(rc, self.errhp, "OCIStmtFetch2") {
+                    return Err(e);
                 }
+                budget.start_row()?;
+                let mut row = Vec::with_capacity(ncols);
+                for i in 0..ncols {
+                    let ind = unsafe { *ind_ptr.add(i) };
+                    if ind == -1 {
+                        budget.cell(None)?;
+                        row.push(None);
+                    } else {
+                        let len = unsafe { *rlen_ptr.add(i) } as usize;
+                        let s = String::from_utf8_lossy(&buffers[i][..len]).to_string();
+                        budget.cell(Some(&s))?;
+                        row.push(Some(s));
+                    }
+                }
+                rows.push(row);
             }
-            rows.push(row);
-        }
 
+            Ok(rows)
+        })();
         unsafe { (self.oci.stmt_rel)(stmthp, self.errhp, std::ptr::null(), 0, OCI_DEFAULT); }
-        Ok((col_names, rows))
+        Ok((col_names, decoded?))
     }
 
     fn stream_query_rows_impl<F>(&self, sql: &str, buf_size: usize, mut on_item: F) -> Result<u64, String>
@@ -766,13 +771,27 @@ impl OciHandles {
     }
 
     /// 显式提交事务
-    fn commit_tx(&self) {
-        unsafe { (self.oci.trans_commit)(self.svchp, self.errhp, OCI_DEFAULT); }
+    fn commit_tx(&self) -> Result<(), String> {
+        self.checked_commit_tx().map(|_| ())
+            .map_err(|e| format!("提交失败，提交结果未知；请核实数据库状态，勿重复提交: {e}"))
     }
 
     /// 显式回滚事务
-    fn rollback_tx(&self) {
-        unsafe { (self.oci.trans_rollback)(self.svchp, self.errhp, OCI_DEFAULT); }
+    fn rollback_tx(&self) -> Result<(), String> {
+        self.checked_rollback_tx().map(|_| ())
+            .map_err(|e| format!("回滚失败，事务结果未知: {e}"))
+    }
+
+    fn checked_commit_tx(&self) -> Result<u64, String> {
+        let rc = unsafe { (self.oci.trans_commit)(self.svchp, self.errhp, OCI_DEFAULT) };
+        self.oci.ok(rc, self.errhp, "OCITransCommit")?;
+        Ok(0)
+    }
+
+    fn checked_rollback_tx(&self) -> Result<u64, String> {
+        let rc = unsafe { (self.oci.trans_rollback)(self.svchp, self.errhp, OCI_DEFAULT) };
+        self.oci.ok(rc, self.errhp, "OCITransRollback")?;
+        Ok(0)
     }
 
     fn execute_stmt_internal(&self, sql: &str, commit: bool) -> Result<u64, String> {
@@ -805,7 +824,7 @@ impl OciHandles {
         self.oci.ok(exec_rc, self.errhp, "OCIStmtExecute")?;
 
         if commit {
-            unsafe { (self.oci.trans_commit)(self.svchp, self.errhp, OCI_DEFAULT); }
+            self.commit_tx()?;
         }
         Ok(row_count)
     }
@@ -829,11 +848,21 @@ pub async fn oracle_begin_tx(
     password: Option<String>,
     registry: &DriverRegistry,
     pool: &OracleTxPool,
+    schema: Option<String>,
 ) -> Result<(), String> {
+    let schema_sql = schema.as_deref().map(selected_schema_sql).transpose()?;
     let oci_path = get_oci_path(registry).await?;
     let pass = password.unwrap_or_default();
     let handles = tokio::task::spawn_blocking(move || {
-        connect_with_config(&config, &pass, &oci_path)
+        let handles = connect_with_config(&config, &pass, &oci_path)?;
+        if let Some(schema_sql) = schema_sql {
+            handles.execute_in_tx(&schema_sql).map_err(|e| format!("选择事务 schema 失败: {e}"))?;
+        }
+        if config.read_only == Some(true) {
+            handles.execute_in_tx("SET TRANSACTION READ ONLY")
+                .map_err(|e| format!("设置事务只读模式失败: {e}"))?;
+        }
+        Ok::<_, String>(handles)
     }).await.map_err(|e| format!("任务失败: {e}"))??;
     let arc = std::sync::Arc::new(std::sync::Mutex::new(handles));
     pool.0.lock().map_err(|e| e.to_string())?.insert(conn_id, arc);
@@ -880,8 +909,7 @@ pub async fn oracle_commit_tx(conn_id: &str, pool: &OracleTxPool) -> Result<(), 
     };
     tokio::task::spawn_blocking(move || {
         let h = arc.lock().map_err(|e| e.to_string())?;
-        h.commit_tx();
-        Ok(())
+        h.commit_tx()
     }).await.map_err(|e| format!("任务失败: {e}"))?
 }
 
@@ -893,8 +921,7 @@ pub async fn oracle_rollback_tx(conn_id: &str, pool: &OracleTxPool) -> Result<()
     };
     tokio::task::spawn_blocking(move || {
         let h = arc.lock().map_err(|e| e.to_string())?;
-        h.rollback_tx();
-        Ok(())
+        h.rollback_tx()
     }).await.map_err(|e| format!("任务失败: {e}"))?
 }
 
@@ -913,6 +940,7 @@ async fn get_oci_path(registry: &DriverRegistry) -> Result<PathBuf, String> {
 }
 
 fn connect_with_config(config: &ConnConfig, password: &str, oci_path: &Path) -> Result<OciHandles, String> {
+    ensure_oracle_config(config)?;
     let host = config.host.as_deref().unwrap_or("127.0.0.1");
     let port = config.port.unwrap_or(1521);
     let user = config.username.as_deref().unwrap_or("system");
@@ -987,16 +1015,72 @@ fn validate_object_ref(s: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn load_conn(id: &str, storage: &State<'_, StorageState>)
-    -> Result<(ConnConfig, Option<String>), String>
-{
+fn ensure_oracle_config(config: &ConnConfig) -> Result<(), String> {
+    if config.conn_type != crate::models::ConnType::Oracle {
+        return Err("此操作仅支持 Oracle 连接".into());
+    }
+    Ok(())
+}
+
+fn ensure_oracle_writable(config: &ConnConfig) -> Result<(), String> {
+    ensure_oracle_config(config)?;
+    if config.read_only == Some(true) {
+        return Err("该连接为只读模式，已拒绝写入、DDL 或管理操作".into());
+    }
+    Ok(())
+}
+
+fn validate_oracle_query(config: &ConnConfig, sql: &str) -> Result<(), String> {
+    ensure_oracle_config(config)?;
+    if config.read_only != Some(true) { return Ok(()); }
+    if !is_select_sql(sql) {
+        return Err("该连接为只读模式，已拒绝非只读查询".into());
+    }
+    use sqlparser::{dialect::GenericDialect, tokenizer::{Token, Tokenizer}};
+    let tokens = Tokenizer::new(&GenericDialect {}, sql).tokenize()
+        .map_err(|_| "只读连接无法安全识别此 SQL")?;
+    let mut ended = false;
+    let mut seen = false;
+    for token in tokens {
+        if matches!(token, Token::Whitespace(_)) { continue; }
+        if token == Token::SemiColon { ended = true; continue; }
+        if ended { return Err("只读连接仅接受单条查询".into()); }
+        seen = true;
+        if let Token::Word(word) = token {
+            if word.quote_style.is_none() && ["INSERT","UPDATE","DELETE","MERGE","DROP","CREATE","ALTER","TRUNCATE","GRANT","REVOKE","CALL","EXEC","EXECUTE","INTO","SET","LOCK","COMMIT","ROLLBACK"].contains(&word.value.to_ascii_uppercase().as_str()) {
+                return Err("只读连接已拒绝写入、锁定或会话修改语句".into());
+            }
+        }
+    }
+    if !seen { return Err("只读查询不能为空".into()); }
+    Ok(())
+}
+
+fn load_oracle_config(id: &str, storage: &StorageState) -> Result<ConnConfig, String> {
     let config = storage.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .load()?
         .into_iter()
         .find(|c| c.id == id)
         .ok_or_else(|| format!("连接不存在: {id}"))?;
-    let password = crate::keychain::get_password(id).ok().flatten();
+    ensure_oracle_config(&config)?;
+    Ok(config)
+}
+
+fn load_conn(id: &str, storage: &State<'_, StorageState>)
+    -> Result<(ConnConfig, Option<String>), String>
+{
+    let config = load_oracle_config(id, storage)?;
+    let password = crate::keychain::get_password(id)?;
+    Ok((config, password))
+}
+
+fn load_write_conn(id: &str, storage: &State<'_, StorageState>)
+    -> Result<(ConnConfig, Option<String>), String>
+{
+    let config = load_oracle_config(id, storage)?;
+    ensure_oracle_writable(&config)?;
+    let password = crate::keychain::get_password(id)?;
     Ok((config, password))
 }
 
@@ -1077,12 +1161,16 @@ pub async fn oracle_execute_query(
     registry: State<'_, DriverRegistry>,
 ) -> Result<OracleExecResult, String> {
     let (config, password) = load_conn(&id, &storage)?;
+    validate_oracle_query(&config, &sql)?;
     let oci_path = get_oci_path(&*registry).await?;
     let pass = password.unwrap_or_default();
     let is_query = is_select_sql(&sql);
 
     tokio::task::spawn_blocking(move || {
         let h = connect_with_config(&config, &pass, &oci_path)?;
+        if config.read_only == Some(true) {
+            h.execute_in_tx("SET TRANSACTION READ ONLY")?;
+        }
         if is_query {
             let (columns, rows) = h.query_rows(&sql)?;
             Ok(OracleExecResult { columns, rows, affected_rows: None, is_query: true })
@@ -1118,12 +1206,39 @@ pub async fn execute_query_impl(
     password: Option<String>,
     registry: &DriverRegistry,
 ) -> Result<crate::models::QueryResult, String> {
+    execute_query_in_schema_impl(config, sql, password, registry, None).await
+}
+
+fn selected_schema_sql(schema: &str) -> Result<String, String> {
+    if schema.is_empty() || schema.len() > 128 || schema.chars().any(char::is_control) {
+        return Err("查询 schema 标识符无效".into());
+    }
+    Ok(format!("ALTER SESSION SET CURRENT_SCHEMA = \"{}\"", schema.replace('"', "\"\"")))
+}
+
+/// schema 与 service/SID 相互独立，仅在执行原始 SQL 的同一专用会话中设置。
+pub async fn execute_query_in_schema_impl(
+    config: ConnConfig,
+    sql: String,
+    password: Option<String>,
+    registry: &DriverRegistry,
+    schema: Option<String>,
+) -> Result<crate::models::QueryResult, String> {
+    let schema_sql = schema.as_deref().map(selected_schema_sql).transpose()?;
+    validate_oracle_query(&config, &sql)?;
     let oci_path = get_oci_path(registry).await?;
     let pass = password.unwrap_or_default();
     let is_query = is_select_sql(&sql);
     let start = std::time::Instant::now();
     tokio::task::spawn_blocking(move || {
         let h = connect_with_config(&config, &pass, &oci_path)?;
+        if let Some(schema_sql) = schema_sql {
+            // 此时尚无用户事务，不使用自动提交 DML 路径。
+            h.execute_in_tx(&schema_sql).map_err(|e| format!("选择查询 schema 失败: {e}"))?;
+        }
+        if config.read_only == Some(true) {
+            h.execute_in_tx("SET TRANSACTION READ ONLY")?;
+        }
         if is_query {
             let (columns, rows) = h.query_rows(&sql)?;
             Ok(crate::models::QueryResult {
@@ -1144,20 +1259,25 @@ pub async fn execute_query_impl(
     }).await.map_err(|e| format!("任务执行失败: {e}"))?
 }
 
-pub async fn stream_query_rows<F>(
-    config: ConnConfig,
-    sql: String,
-    password: Option<String>,
-    registry: &DriverRegistry,
-    on_item: F,
+pub async fn stream_query_rows_in_schema<F>(
+    config: ConnConfig, sql: String, password: Option<String>, registry: &DriverRegistry,
+    schema: Option<String>, on_item: F,
 ) -> Result<u64, String>
 where
     F: FnMut(&[String], Option<&[Option<String>]>) -> Result<(), String>,
 {
+    let schema_sql = schema.as_deref().map(selected_schema_sql).transpose()?;
+    validate_oracle_query(&config, &sql)?;
     let oci_path = get_oci_path(registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::block_in_place(move || {
         let h = connect_with_config(&config, &pass, &oci_path)?;
+        if let Some(schema_sql) = schema_sql {
+            h.execute_in_tx(&schema_sql).map_err(|e| format!("选择导出 schema 失败: {e}"))?;
+        }
+        if config.read_only == Some(true) {
+            h.execute_in_tx("SET TRANSACTION READ ONLY").map_err(|e| format!("设置导出只读事务失败: {e}"))?;
+        }
         h.stream_query_rows_impl(&sql, QUERY_BUF_SIZE, on_item)
     })
 }
@@ -1190,6 +1310,22 @@ pub async fn list_routines_impl(
     }).await.map_err(|e| format!("任务执行失败: {e}"))?
 }
 
+fn execute_single_row_update(
+    sql: &str, mut execute: impl FnMut(&str) -> Result<u64, String>,
+) -> Result<(), String> {
+    let result = execute(sql).and_then(|count| {
+        if count == 1 { Ok(()) } else { Err(format!("预期影响 1 行，实际影响 {count} 行")) }
+    });
+    if let Err(error) = result {
+        return match execute("ROLLBACK") {
+            Ok(_) => Err(format!("{error}；已回滚")),
+            Err(rollback) => Err(format!("{error}；回滚失败，事务结果未知: {rollback}")),
+        };
+    }
+    execute("COMMIT").map(|_| ())
+        .map_err(|e| format!("提交失败，提交结果未知；请核实数据库状态，勿重复提交: {e}"))
+}
+
 /// 行内编辑 UPDATE（Oracle 不支持参数绑定简单方式，改为字面量 SQL）
 pub async fn update_cell_impl(
     config: ConnConfig,
@@ -1199,34 +1335,40 @@ pub async fn update_cell_impl(
     new_value: Option<String>,
     pk_columns: Vec<String>,
     pk_values: Vec<Option<String>>,
+    expected_value: Option<String>,
     password: Option<String>,
     registry: &DriverRegistry,
 ) -> Result<(), String> {
+    super::db_extra::validate_native_insert_rows(&pk_columns, std::slice::from_ref(&pk_values))?;
+    ensure_oracle_writable(&config)?;
     let oci_path = get_oci_path(registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
         let h = connect_with_config(&config, &pass, &oci_path)?;
         let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
         let target = if schema.is_empty() { q(&table) } else { format!("{}.{}", q(&schema), q(&table)) };
+        h.execute_in_tx(&format!("LOCK TABLE {target} IN ROW EXCLUSIVE MODE"))?;
+        let owner=if schema.is_empty(){"USER".to_string()}else{escape_str(&schema)};
+        for checked in std::iter::once(&column).chain(pk_columns.iter()){
+          let (_,kinds)=h.query_rows(&format!("SELECT DATA_TYPE FROM ALL_TAB_COLUMNS WHERE OWNER={owner} AND TABLE_NAME={} AND COLUMN_NAME={}",escape_str(&table),escape_str(checked)))?;
+          if !kinds.first().and_then(|r|r.first()).and_then(|v|v.as_deref()).is_some_and(|kind|matches!(kind,"VARCHAR2"|"CHAR"|"NUMBER")){return Err("字段或定位键尚不能恢复精确并发基线，请使用显式 SQL".into());}
+        }
         let set_part = match &new_value {
             Some(v) => format!("{} = {}", q(&column), escape_str(v)),
             None    => format!("{} = NULL", q(&column)),
         };
-        let where_parts: Vec<String> = pk_columns.iter().zip(pk_values.iter())
+        let mut where_parts: Vec<String> = pk_columns.iter().zip(pk_values.iter())
             .map(|(c, v)| match v {
-                Some(v) => format!("{} = {}", q(c), escape_str(v)),
+                Some(v) => format!("UTL_RAW.CAST_TO_RAW({}) = UTL_RAW.CAST_TO_RAW({})", q(c), escape_str(v)),
                 None    => format!("{} IS NULL", q(c)),
             }).collect();
+        where_parts.push(match &expected_value { Some(value)=>format!("UTL_RAW.CAST_TO_RAW({}) = UTL_RAW.CAST_TO_RAW({})",q(&column),escape_str(value)),None=>format!("{} IS NULL",q(&column)) });
         let sql = format!("UPDATE {target} SET {set_part} WHERE {}", where_parts.join(" AND "));
-        let n = h.execute_dml(&sql)?;
-        if n != 1 {
-            return Err(if n == 0 {
-                "未找到匹配行（或值未变化），已回滚".into()
-            } else {
-                format!("预期影响 1 行，实际影响 {n} 行")
-            });
-        }
-        Ok(())
+        execute_single_row_update(&sql, |statement| match statement {
+            "COMMIT" => h.checked_commit_tx(),
+            "ROLLBACK" => h.checked_rollback_tx(),
+            _ => h.execute_in_tx(statement),
+        })
     }).await.map_err(|e| format!("任务执行失败: {e}"))?
 }
 
@@ -1713,7 +1855,7 @@ pub async fn oracle_update_cell(
     storage: State<'_, StorageState>,
     registry: State<'_, DriverRegistry>,
 ) -> Result<String, String> {
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = load_write_conn(&id, &storage)?;
     let oci_path = get_oci_path(&*registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
@@ -1725,12 +1867,37 @@ pub async fn oracle_update_cell(
             oracle_literal(&value),
             escape_str(&row_id),
         );
-        let n = h.execute_dml(&sql)?;
-        Ok(format!("已更新 {n} 行"))
+        execute_single_row_update(&sql, |statement| match statement {
+            "COMMIT" => h.checked_commit_tx(),
+            "ROLLBACK" => h.checked_rollback_tx(),
+            _ => h.execute_in_tx(statement),
+        })?;
+        Ok("已更新 1 行".into())
     }).await.map_err(|e| format!("任务执行失败: {e}"))?
 }
 
 /// 供 db_extra::db_insert_rows 路由调用
+fn draft_insert_target(schema:&str,table:&str)->String{if schema.is_empty(){quote_ident(table)}else{format!("{}.{}",quote_ident(schema),quote_ident(table))}}
+#[cfg(test)]
+mod draft_target_tests{
+    #[test]fn empty_schema_uses_unqualified_table(){assert_eq!(super::draft_insert_target("","T"),"\"T\"");assert_eq!(super::draft_insert_target("OWNER","T"),"\"OWNER\".\"T\"");}
+}
+pub(crate) async fn insert_drafts_impl(config:ConnConfig,password:Option<String>,schema:String,table:String,rows:Vec<super::db_extra::InsertDraft>,registry:&DriverRegistry)->Result<u64,String>{
+    ensure_oracle_writable(&config)?;
+    if rows.iter().flat_map(|r|&r.values).flatten().any(|s|s.is_empty()){return Err("Oracle 将空字符串存为 NULL；为避免悄悄改变值，请明确使用 NULL 或省略字段".into());}
+    let oci_path=get_oci_path(registry).await?;
+    tokio::task::spawn_blocking(move||{
+        let h=connect_with_config(&config,&password.unwrap_or_default(),&oci_path)?;
+        let statements=rows.iter().map(|row|{
+            let columns=row.columns.iter().map(|c|quote_ident(c)).collect::<Vec<_>>().join(",");
+            let values=row.values.iter().map(oracle_literal).collect::<Vec<_>>().join(",");
+            let target=draft_insert_target(&schema,&table);
+            format!("INSERT INTO {target} ({columns}) VALUES ({values})")
+        });
+        super::db_extra::run_atomic_native_batch("BEGIN",statements,|sql|match sql{"BEGIN"=>Ok(0),"COMMIT"=>h.checked_commit_tx(),"ROLLBACK"=>h.checked_rollback_tx(),_=>h.execute_in_tx(sql)})
+    }).await.map_err(|e|e.to_string())?
+}
+
 pub async fn insert_rows_impl(
     config: ConnConfig,
     password: Option<String>,
@@ -1740,21 +1907,28 @@ pub async fn insert_rows_impl(
     rows: Vec<Vec<Option<String>>>,
     registry: &DriverRegistry,
 ) -> Result<u64, String> {
+    super::db_extra::validate_native_insert_rows(&columns, &rows)?;
+    if rows.is_empty() { return Ok(0); }
+    ensure_oracle_writable(&config)?;
     let oci_path = get_oci_path(registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
         let h = connect_with_config(&config, &pass, &oci_path)?;
         let col_list = columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(",");
-        let mut total: u64 = 0;
-        for row in &rows {
+        let statements = rows.iter().map(|row| {
             let val_list = row.iter().map(oracle_literal).collect::<Vec<_>>().join(",");
-            let sql = format!(
+            format!(
                 "INSERT INTO {}.{} ({}) VALUES ({})",
                 quote_ident(&schema), quote_ident(&table), col_list, val_list
-            );
-            total += h.execute_dml(&sql)?;
-        }
-        Ok(total)
+            )
+        });
+        // OCI starts the transaction on the first DML; this session is dedicated.
+        super::db_extra::run_atomic_native_batch("BEGIN", statements, |sql| match sql {
+            "BEGIN" => Ok(0),
+            "COMMIT" => h.checked_commit_tx(),
+            "ROLLBACK" => h.checked_rollback_tx(),
+            _ => h.execute_in_tx(sql),
+        })
     }).await.map_err(|e| format!("任务执行失败: {e}"))?
 }
 
@@ -1766,30 +1940,26 @@ pub async fn delete_rows_impl(
     table: String,
     pk_columns: Vec<String>,
     pk_values_list: Vec<Vec<Option<String>>>,
+    baseline: Option<super::db_extra::DeleteBaseline>,
     registry: &DriverRegistry,
 ) -> Result<u64, String> {
+    super::db_extra::validate_native_insert_rows(&pk_columns, &pk_values_list)?;
+    if pk_values_list.is_empty() { return Ok(0); }
+    ensure_oracle_writable(&config)?;
     let oci_path = get_oci_path(registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
         let h = connect_with_config(&config, &pass, &oci_path)?;
-        let mut total: u64 = 0;
-        for pk_values in &pk_values_list {
-            let where_clause = pk_columns.iter().zip(pk_values.iter())
-                .map(|(col, val)| {
-                    let lhs = quote_ident(col);
-                    match val {
-                        None => format!("{lhs} IS NULL"),
-                        Some(v) => format!("{lhs} = {}", escape_str(v)),
-                    }
-                })
-                .collect::<Vec<_>>().join(" AND ");
-            let sql = format!(
-                "DELETE FROM {}.{} WHERE {where_clause}",
-                quote_ident(&schema), quote_ident(&table)
-            );
-            total += h.execute_dml(&sql)?;
-        }
-        Ok(total)
+        let base=baseline.ok_or("缺少删除原始行基线，请刷新后重试")?;
+        let target=if schema.is_empty(){quote_ident(&table)}else{format!("{}.{}",quote_ident(&schema),quote_ident(&table))};
+        h.execute_in_tx(&format!("LOCK TABLE {target} IN ROW EXCLUSIVE MODE"))?;
+        let action=(||->Result<u64,String>{
+         let owner=if schema.is_empty(){"USER".to_string()}else{escape_str(&schema)};
+         for name in &base.columns{let(_,types)=h.query_rows(&format!("SELECT DATA_TYPE FROM ALL_TAB_COLUMNS WHERE OWNER={owner} AND TABLE_NAME={} AND COLUMN_NAME={}",escape_str(&table),escape_str(name)))?;if !types.first().and_then(|r|r.first()).and_then(|v|v.as_deref()).is_some_and(|t|matches!(t,"VARCHAR2"|"CHAR"|"NUMBER")){return Err("此字段类型不能恢复精确删除基线，请使用显式 SQL".into());}}
+         let columns=base.columns.iter().map(|n|quote_ident(n)).collect::<Vec<_>>().join(",");let mut total=0;
+         for(i,pk)in pk_values_list.iter().enumerate(){let pred=pk_columns.iter().zip(pk).map(|(n,v)|match v{None=>format!("{} IS NULL",quote_ident(n)),Some(v)=>format!("{}={}",quote_ident(n),escape_str(v))}).collect::<Vec<_>>().join(" AND ");let nulls=base.columns.iter().zip(&base.rows[i]).map(|(n,v)|format!("{} IS {}NULL",quote_ident(n),if v.is_some(){"NOT "}else{""})).collect::<Vec<_>>().join(" AND ");let pred=format!("({pred}) AND ({nulls})");let(_,rows)=h.query_rows(&format!("SELECT {columns} FROM {target} WHERE {pred} AND ROWNUM<=2 FOR UPDATE"))?;if rows.len()!=1||rows[0]!=base.rows[i]{return Err("选中行已变化或定位不唯一，整批删除已回滚".into());}let count=h.execute_in_tx(&format!("DELETE FROM {target} WHERE {pred}"))?;if count!=1{return Err("删除影响行数异常".into());}total+=count;}Ok(total)
+        })();
+        match action{Ok(n)=>{h.checked_commit_tx().map_err(|e|format!("删除提交结果未确认，勿重试:{e}"))?;Ok(n)},Err(e)=>{h.checked_rollback_tx().map_err(|r|format!("{e};回滚未确认:{r}"))?;Err(e)}}
     }).await.map_err(|e| format!("任务执行失败: {e}"))?
 }
 
@@ -1803,7 +1973,7 @@ pub async fn oracle_delete_rows(
     registry: State<'_, DriverRegistry>,
 ) -> Result<u64, String> {
     if row_ids.is_empty() { return Ok(0); }
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = load_write_conn(&id, &storage)?;
     let oci_path = get_oci_path(&*registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
@@ -1828,7 +1998,7 @@ pub async fn oracle_insert_rows(
     registry: State<'_, DriverRegistry>,
 ) -> Result<String, String> {
     if columns.is_empty() { return Err("列名不能为空".to_string()); }
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = load_write_conn(&id, &storage)?;
     let oci_path = get_oci_path(&*registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
@@ -1852,7 +2022,7 @@ pub async fn oracle_drop_table(
     storage: State<'_, StorageState>,
     registry: State<'_, DriverRegistry>,
 ) -> Result<String, String> {
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = load_write_conn(&id, &storage)?;
     let oci_path = get_oci_path(&*registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
@@ -1871,7 +2041,7 @@ pub async fn oracle_truncate_table(
     storage: State<'_, StorageState>,
     registry: State<'_, DriverRegistry>,
 ) -> Result<String, String> {
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = load_write_conn(&id, &storage)?;
     let oci_path = get_oci_path(&*registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
@@ -1891,7 +2061,7 @@ pub async fn oracle_rename_table(
     storage: State<'_, StorageState>,
     registry: State<'_, DriverRegistry>,
 ) -> Result<String, String> {
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = load_write_conn(&id, &storage)?;
     let oci_path = get_oci_path(&*registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
@@ -1915,7 +2085,7 @@ pub async fn oracle_drop_routine(
     storage: State<'_, StorageState>,
     registry: State<'_, DriverRegistry>,
 ) -> Result<String, String> {
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = load_write_conn(&id, &storage)?;
     let oci_path = get_oci_path(&*registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
@@ -2014,7 +2184,7 @@ pub async fn oracle_kill_session(
 ) -> Result<String, String> {
     validate_numeric_id(&sid, "SID")?;
     validate_numeric_id(&serial, "SERIAL#")?;
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = load_write_conn(&id, &storage)?;
     let oci_path = get_oci_path(&*registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
@@ -2217,7 +2387,7 @@ pub async fn oracle_create_user(
     registry: State<'_, DriverRegistry>,
 ) -> Result<String, String> {
     validate_ident(&username)?;
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = load_write_conn(&id, &storage)?;
     let oci_path = get_oci_path(&*registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
@@ -2251,7 +2421,7 @@ pub async fn oracle_drop_user(
     registry: State<'_, DriverRegistry>,
 ) -> Result<String, String> {
     validate_ident(&username)?;
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = load_write_conn(&id, &storage)?;
     let oci_path = get_oci_path(&*registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
@@ -2272,7 +2442,7 @@ pub async fn oracle_set_user_lock(
     registry: State<'_, DriverRegistry>,
 ) -> Result<String, String> {
     validate_ident(&username)?;
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = load_write_conn(&id, &storage)?;
     let oci_path = get_oci_path(&*registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
@@ -2294,7 +2464,7 @@ pub async fn oracle_change_password(
     registry: State<'_, DriverRegistry>,
 ) -> Result<String, String> {
     validate_ident(&username)?;
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = load_write_conn(&id, &storage)?;
     let oci_path = get_oci_path(&*registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
@@ -2354,7 +2524,7 @@ pub async fn oracle_grant_privilege(
     if let Some(ref obj) = object {
         if !obj.is_empty() { validate_object_ref(obj)?; }
     }
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = load_write_conn(&id, &storage)?;
     let oci_path = get_oci_path(&*registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
@@ -2394,7 +2564,7 @@ pub async fn oracle_revoke_privilege(
     if let Some(ref obj) = object {
         if !obj.is_empty() { validate_object_ref(obj)?; }
     }
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = load_write_conn(&id, &storage)?;
     let oci_path = get_oci_path(&*registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
@@ -2501,7 +2671,7 @@ pub async fn oracle_drop_partition(
     storage: State<'_, StorageState>,
     registry: State<'_, DriverRegistry>,
 ) -> Result<String, String> {
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = load_write_conn(&id, &storage)?;
     let oci_path = get_oci_path(&*registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
@@ -2524,7 +2694,7 @@ pub async fn oracle_truncate_partition(
     storage: State<'_, StorageState>,
     registry: State<'_, DriverRegistry>,
 ) -> Result<String, String> {
-    let (config, password) = load_conn(&id, &storage)?;
+    let (config, password) = load_write_conn(&id, &storage)?;
     let oci_path = get_oci_path(&*registry).await?;
     let pass = password.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
@@ -2727,6 +2897,7 @@ pub async fn oracle_explain_plan_impl(
     password: Option<String>,
     registry: &DriverRegistry,
 ) -> Result<Vec<String>, String> {
+    ensure_oracle_writable(&config)?;
     let oci_path = get_oci_path(registry).await?;
     let pass = password.unwrap_or_default();
     // 生成唯一 STATEMENT_ID，防止并发时读到其他会话的计划
@@ -2748,9 +2919,9 @@ pub async fn oracle_explain_plan_impl(
         let (_, rows) = h.query_rows(&display_sql)
             .map_err(|e| format!("DBMS_XPLAN.DISPLAY 失败: {e}"))?;
         // DELETE 是 DML，必须用 execute_dml 才会 commit，否则连接复用时行会积累
-        let _ = h.execute_dml(&format!(
+        h.execute_dml(&format!(
             "DELETE FROM PLAN_TABLE WHERE STATEMENT_ID = '{}'", stmt_id_esc
-        ));
+        ))?;
         Ok(rows.into_iter()
             .flat_map(|row| row.into_iter().filter_map(|v| v))
             .collect())
@@ -2759,6 +2930,110 @@ pub async fn oracle_explain_plan_impl(
 
 #[cfg(test)]
 mod tests {
+    fn readonly_config() -> super::ConnConfig {
+        serde_json::from_value(serde_json::json!({
+            "id":"guard-only","name":"guard-only","type":"oracle","readOnly":true,
+            "useSsl":false,"createdAt":0,"updatedAt":0
+        })).unwrap()
+    }
+
+    #[test]
+    fn oracle_readonly_query_policy_keeps_literals_and_rejects_locking() {
+        let config = readonly_config();
+        for sql in ["SELECT 1 FROM DUAL", "SELECT 'DELETE; UPDATE' AS text FROM DUAL;", "WITH x AS (SELECT 1 v FROM DUAL) SELECT v FROM x"] {
+            assert!(super::validate_oracle_query(&config, sql).is_ok(), "{sql}");
+        }
+        for sql in ["SELECT * FROM target FOR UPDATE", "SELECT 1 FROM DUAL; COMMIT", "/* only comment */"] {
+            assert!(super::validate_oracle_query(&config, sql).is_err(), "{sql}");
+        }
+        let mut wrong = config; wrong.conn_type = crate::models::ConnType::Mysql;
+        assert!(super::validate_oracle_query(&wrong, "SELECT 1").unwrap_err().contains("Oracle"));
+        wrong.conn_type = crate::models::ConnType::Oracle; wrong.read_only = Some(false);
+        assert!(super::ensure_oracle_writable(&wrong).is_ok());
+    }
+
+    #[test]
+    fn oracle_native_mutation_commands_guard_before_driver() {
+        let source = include_str!("oracle.rs");
+        for name in ["oracle_update_cell","oracle_delete_rows","oracle_insert_rows","oracle_drop_table","oracle_truncate_table","oracle_rename_table","oracle_drop_routine","oracle_kill_session","oracle_create_user","oracle_drop_user","oracle_set_user_lock","oracle_change_password","oracle_grant_privilege","oracle_revoke_privilege","oracle_drop_partition","oracle_truncate_partition","update_cell_impl","insert_rows_impl","delete_rows_impl","oracle_explain_plan_impl"] {
+            let function = source.split(&format!("pub async fn {name}(")).nth(1).unwrap();
+            let before_driver = function.split("let oci_path =").next().unwrap();
+            assert!(before_driver.contains("ensure_oracle_writable(&config)?") || before_driver.contains("load_write_conn(&id, &storage)?"), "unguarded {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn oracle_readonly_native_queries_reject_writes_before_driver_lookup() {
+        let registry: super::DriverRegistry = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        for sql in ["DELETE FROM target", "SELECT 1 FROM DUAL; DELETE FROM target", "WITH x AS (SELECT 1 FROM DUAL) UPDATE target SET v=2", "BEGIN NULL; END;"] {
+            let error = super::execute_query_in_schema_impl(readonly_config(), sql.into(), None, &registry, None).await.unwrap_err();
+            assert!(error.contains("只读"), "expected authorization failure before native driver, got {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn oracle_readonly_insert_rejected_before_driver_lookup() {
+        let registry: super::DriverRegistry = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let error = super::insert_rows_impl(readonly_config(), None, "OWNER".into(), "TABLE".into(), vec!["V".into()], vec![vec![Some("value".into())]], &registry).await.unwrap_err();
+        assert!(error.contains("只读"), "expected authorization failure before native driver, got {error}");
+        let error = super::update_cell_impl(readonly_config(), "OWNER".into(), "TABLE".into(), "V".into(), Some("new".into()), vec!["ID".into()], vec![Some("1".into())], Some("old".into()), None, &registry).await.unwrap_err();
+        assert!(error.contains("只读"));
+        let error = super::delete_rows_impl(readonly_config(), None, "OWNER".into(), "TABLE".into(), vec!["ID".into()], vec![vec![Some("1".into())]], None, &registry).await.unwrap_err();
+        assert!(error.contains("只读"));
+        let mut wrong = readonly_config(); wrong.conn_type = crate::models::ConnType::Mysql; wrong.read_only = Some(false);
+        let error = super::execute_query_in_schema_impl(wrong, "SELECT 1".into(), None, &registry, None).await.unwrap_err();
+        assert!(error.contains("Oracle"));
+    }
+
+    #[test]
+    fn selected_oracle_schema_is_quoted_as_one_identifier() {
+        assert_eq!(super::selected_schema_sql("a\"b; DROP USER x").unwrap(), "ALTER SESSION SET CURRENT_SCHEMA = \"a\"\"b; DROP USER x\"");
+        assert_eq!(super::selected_schema_sql("业务 owner").unwrap(), "ALTER SESSION SET CURRENT_SCHEMA = \"业务 owner\"");
+        for invalid in ["", "bad\nowner", "bad\0owner"] { assert!(super::selected_schema_sql(invalid).is_err()); }
+    }
+    #[test]
+    fn oracle_single_row_orchestration_rolls_back_real_multirow_update() {
+        use sqlx::Connection;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let mut db = runtime.block_on(sqlx::SqliteConnection::connect("sqlite::memory:")).unwrap();
+        runtime.block_on(sqlx::query("CREATE TABLE target(v INT)").execute(&mut db)).unwrap();
+        runtime.block_on(sqlx::query("INSERT INTO target VALUES(1),(2)").execute(&mut db)).unwrap();
+        runtime.block_on(sqlx::query("BEGIN").execute(&mut db)).unwrap();
+        let result = super::execute_single_row_update("UPDATE target SET v=99", |sql| {
+            runtime.block_on(sqlx::query(sql).execute(&mut db)).map(|r| r.rows_affected()).map_err(|e| e.to_string())
+        });
+        assert!(result.unwrap_err().contains("已回滚"));
+        let total: i64 = runtime.block_on(sqlx::query_scalar("SELECT SUM(v) FROM target").fetch_one(&mut db)).unwrap();
+        assert_eq!(total, 3);
+    }
+
+    #[tokio::test]
+    async fn oracle_delete_malformed_keys_rejected_before_native_driver() {
+        let config: crate::models::ConnConfig = serde_json::from_value(serde_json::json!({
+            "id":"never-connect","name":"test","type":"oracle",
+            "useSsl":false,"createdAt":0,"updatedAt":0
+        })).unwrap();
+        let registry: super::DriverRegistry = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let error = super::delete_rows_impl(config, None, "SCHEMA".into(), "TABLE".into(), vec!["ID".into()], vec![vec![]], None, &registry).await.unwrap_err();
+        assert!(error.contains("第 1 行"));
+    }
+    #[test]
+    fn oracle_single_row_update_checks_before_commit_and_checks_rollback() {
+        let mut calls = Vec::new();
+        let error = super::execute_single_row_update("UPDATE target", |sql| {
+            calls.push(sql.to_string());
+            match sql { "UPDATE target" => Ok(2), "ROLLBACK" => Err("rollback lost".into()), _ => Ok(0) }
+        }).unwrap_err();
+        assert_eq!(calls, ["UPDATE target", "ROLLBACK"]);
+        assert!(error.contains("2") && error.contains("rollback lost") && error.contains("未知"));
+        let mut calls = Vec::new();
+        let error = super::execute_single_row_update("UPDATE target", |sql| {
+            calls.push(sql.to_string());
+            if sql == "COMMIT" { Err("commit lost".into()) } else { Ok(1) }
+        }).unwrap_err();
+        assert_eq!(calls, ["UPDATE target", "COMMIT"]);
+        assert!(error.contains("未知"));
+    }
     use super::*;
 
     #[test]

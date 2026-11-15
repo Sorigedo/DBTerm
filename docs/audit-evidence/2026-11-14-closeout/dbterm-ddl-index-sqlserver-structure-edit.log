@@ -1,0 +1,1 @@
+PASS actual SQL Server structure editor rename: selected database/schema, quoted identifiers and no unrelated attribute rewrite; no service execution.

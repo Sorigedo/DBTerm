@@ -43,6 +43,12 @@ pub fn init_logging(config: LoggingConfig) -> Result<(), String> {
     std::fs::create_dir_all(&config.log_dir)
         .map_err(|e| format!("创建日志目录失败: {}", e))?;
 
+    // Install the `log` bridge before the subscriber, but only after all
+    // fallible filesystem preparation. This prevents a failed setup from
+    // leaving a process with a global logger and no subscriber.
+    tracing_log::LogTracer::init()
+        .map_err(|e| format!("初始化 log 桥接失败: {}", e))?;
+
     // 按天轮转的文件追加器
     let file_appender = rolling::daily(&config.log_dir, "dbterm.log");
 
@@ -89,10 +95,6 @@ pub fn init_logging(config: LoggingConfig) -> Result<(), String> {
         subscriber.try_init()
             .map_err(|e| format!("初始化 tracing 订阅器失败: {e}"))?;
     }
-
-    // 桥接 log crate 到 tracing
-    tracing_log::LogTracer::init()
-        .map_err(|e| format!("初始化 log 桥接失败: {}", e))?;
 
     Ok(())
 }

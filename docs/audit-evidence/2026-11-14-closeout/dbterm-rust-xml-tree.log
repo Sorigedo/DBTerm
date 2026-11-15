@@ -1,0 +1,4 @@
+error: specification `quick-xml` is ambiguous
+help: re-run this command with one of the following specifications
+  quick-xml@0.31.0
+  quick-xml@0.39.4

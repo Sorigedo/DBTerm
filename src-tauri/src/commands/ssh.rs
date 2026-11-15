@@ -1,17 +1,79 @@
-use tauri::{Manager, State};
-use tokio::sync::mpsc;
 use crate::{
     keychain,
     models::{ConnConfig, DiskEntry, FileEntry, ProcessInfo, ServerPerf},
-    ssh::{safe_lock, SshCmd, SshHandle, SshState},
+    ssh::{SshCmd, SshHandle, SshState, safe_lock},
     storage::StorageState,
 };
+use tauri::{Manager, State};
+use tokio::sync::mpsc;
+
+// exec_command caps collected output at 32 MiB; Base64 expands by 4/3.
+const REMOTE_DOWNLOAD_MAX_BYTES: u64 = 24 * 1024 * 1024;
+
+/// Publish a fallback download without truncating an existing local file.
+/// The staging file is a sibling so the final rename is atomic on Unix/macOS.
+/// Existing symlinks and non-regular files are rejected before publication.
+async fn publish_download_bytes(target: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = target.parent().ok_or("下载目标没有父目录")?;
+    let name = target
+        .file_name()
+        .ok_or("下载目标文件名为空")?
+        .to_string_lossy();
+    let staging = parent.join(format!(
+        ".dbterm-download-{}-{}",
+        name,
+        uuid::Uuid::new_v4()
+    ));
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)
+            .await
+            .map_err(|e| format!("创建下载临时文件失败: {e}"))?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, bytes)
+            .await
+            .map_err(|e| format!("写入下载临时文件失败: {e}"))?;
+        tokio::io::AsyncWriteExt::flush(&mut file)
+            .await
+            .map_err(|e| format!("刷新下载临时文件失败: {e}"))?;
+        file.sync_all()
+            .await
+            .map_err(|e| format!("刷盘下载临时文件失败: {e}"))?;
+        drop(file);
+
+        match tokio::fs::symlink_metadata(target).await {
+            Ok(meta) if !meta.file_type().is_file() => {
+                return Err("本地目标不是普通文件，已拒绝覆盖".to_string());
+            }
+            Ok(meta) => {
+                tokio::fs::set_permissions(&staging, meta.permissions())
+                    .await
+                    .map_err(|e| format!("保留原文件权限失败，原文件未修改: {e}"))?;
+            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(format!("检查本地目标失败，原文件未修改: {e}"));
+            }
+            _ => {}
+        }
+        tokio::fs::rename(&staging, target)
+            .await
+            .map_err(|e| format!("发布下载失败，原文件未修改: {e}"))
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&staging).await;
+    }
+    result
+}
 
 fn local_file_entry(path: std::path::PathBuf, meta: std::fs::Metadata) -> FileEntry {
-    let name = path.file_name()
+    let name = path
+        .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned());
-    let modified = meta.modified()
+    let modified = meta
+        .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .and_then(|d| chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, 0))
@@ -24,26 +86,41 @@ fn local_file_entry(path: std::path::PathBuf, meta: std::fs::Metadata) -> FileEn
         is_dir: meta.is_dir(),
         size: if meta.is_file() { meta.len() } else { 0 },
         modified,
-        permissions: if meta.is_dir() { "drwxr-xr-x" } else { "-rw-r--r--" }.to_string(),
+        permissions: if meta.is_dir() {
+            "drwxr-xr-x"
+        } else {
+            "-rw-r--r--"
+        }
+        .to_string(),
     }
 }
 
 /// 列出本地目录（SSH 文件管理全功能窗口左侧使用）
 #[tauri::command]
 pub async fn list_local_files(path: String) -> Result<Vec<FileEntry>, String> {
-    let p = std::path::PathBuf::from(if path.trim().is_empty() { "." } else { path.trim() });
+    let p = std::path::PathBuf::from(if path.trim().is_empty() {
+        "."
+    } else {
+        path.trim()
+    });
     if !p.is_absolute() {
         return Err("本地路径必须是绝对路径".to_string());
     }
-    let meta = tokio::fs::metadata(&p).await
+    let meta = tokio::fs::metadata(&p)
+        .await
         .map_err(|e| format!("读取本地路径失败: {e}"))?;
     if !meta.is_dir() {
         return Err("本地路径不是文件夹".to_string());
     }
-    let mut rd = tokio::fs::read_dir(&p).await
+    let mut rd = tokio::fs::read_dir(&p)
+        .await
         .map_err(|e| format!("读取本地目录失败: {e}"))?;
     let mut entries = Vec::new();
-    while let Some(ent) = rd.next_entry().await.map_err(|e| format!("读取本地目录失败: {e}"))? {
+    while let Some(ent) = rd
+        .next_entry()
+        .await
+        .map_err(|e| format!("读取本地目录失败: {e}"))?
+    {
         let path = ent.path();
         let meta = match ent.metadata().await {
             Ok(m) => m,
@@ -51,14 +128,19 @@ pub async fn list_local_files(path: String) -> Result<Vec<FileEntry>, String> {
         };
         entries.push(local_file_entry(path, meta));
     }
-    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
     Ok(entries)
 }
 
 /// 本地文件管理起始目录
 #[tauri::command]
 pub fn get_local_start_path(app: tauri::AppHandle) -> Result<String, String> {
-    app.path().download_dir()
+    app.path()
+        .download_dir()
         .or_else(|_| app.path().home_dir())
         .map(|p| p.to_string_lossy().into_owned())
         .map_err(|e| format!("无法获取本地目录: {e}"))
@@ -76,13 +158,16 @@ fn require_absolute_local_path(path: &str) -> Result<std::path::PathBuf, String>
 #[tauri::command]
 pub async fn delete_local_file(path: String) -> Result<(), String> {
     let p = require_absolute_local_path(&path)?;
-    let meta = tokio::fs::metadata(&p).await
+    let meta = tokio::fs::metadata(&p)
+        .await
         .map_err(|e| format!("读取本地路径失败: {e}"))?;
     if meta.is_dir() {
-        tokio::fs::remove_dir_all(&p).await
+        tokio::fs::remove_dir_all(&p)
+            .await
             .map_err(|e| format!("删除本地文件夹失败: {e}"))?;
     } else {
-        tokio::fs::remove_file(&p).await
+        tokio::fs::remove_file(&p)
+            .await
             .map_err(|e| format!("删除本地文件失败: {e}"))?;
     }
     Ok(())
@@ -93,7 +178,8 @@ pub async fn delete_local_file(path: String) -> Result<(), String> {
 pub async fn rename_local_file(from: String, to: String) -> Result<(), String> {
     let from_path = require_absolute_local_path(&from)?;
     let to_path = require_absolute_local_path(&to)?;
-    tokio::fs::rename(&from_path, &to_path).await
+    tokio::fs::rename(&from_path, &to_path)
+        .await
         .map_err(|e| format!("重命名本地文件失败: {e}"))?;
     Ok(())
 }
@@ -102,7 +188,8 @@ pub async fn rename_local_file(from: String, to: String) -> Result<(), String> {
 #[tauri::command]
 pub async fn create_local_dir(path: String) -> Result<(), String> {
     let p = require_absolute_local_path(&path)?;
-    tokio::fs::create_dir_all(&p).await
+    tokio::fs::create_dir_all(&p)
+        .await
         .map_err(|e| format!("创建本地文件夹失败: {e}"))?;
     Ok(())
 }
@@ -114,12 +201,16 @@ pub async fn create_local_dir(path: String) -> Result<(), String> {
 pub async fn connect_ssh(
     session_id: String,
     conn_id: String,
+    run_id: Option<String>,
     app: tauri::AppHandle,
     ssh_state: State<'_, SshState>,
     storage: State<'_, StorageState>,
 ) -> Result<String, String> {
     // 加载连接配置（按 conn_id 查找）
-    let configs = storage.lock().unwrap_or_else(std::sync::PoisonError::into_inner).load()?;
+    let configs = storage
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .load()?;
     let config: ConnConfig = configs
         .into_iter()
         .find(|c| c.id == conn_id)
@@ -129,13 +220,26 @@ pub async fn connect_ssh(
     let password = keychain::get_password(&conn_id)?;
 
     let (tx, rx) = mpsc::unbounded_channel::<SshCmd>();
-    let run_id = uuid::Uuid::new_v4().to_string();
+    // The UI chooses the run ID before invoking this command so it can reject
+    // stale events even if the old session emits before this IPC call returns.
+    let run_id = match run_id {
+        Some(value) if uuid::Uuid::parse_str(&value).is_ok() => value,
+        Some(_) => return Err("无效的 SSH 会话标识".to_string()),
+        None => uuid::Uuid::new_v4().to_string(),
+    };
 
     // 取旧句柄（同 sessionId 的重连场景），插入新句柄
     let old_tx = {
         let mut map = safe_lock(&ssh_state);
         let old = map.get(&session_id).map(|h| h.tx.clone());
-        map.insert(session_id.clone(), SshHandle { tx, run_id: run_id.clone(), conn_id: conn_id.clone() });
+        map.insert(
+            session_id.clone(),
+            SshHandle {
+                tx,
+                run_id: run_id.clone(),
+                conn_id: conn_id.clone(),
+            },
+        );
         old
     };
     if let Some(old) = old_tx {
@@ -148,9 +252,21 @@ pub async fn connect_ssh(
     let state_clone = ssh_state.inner().clone();
     let run_id_clone = run_id.clone();
     tokio::spawn(async move {
-        crate::ssh::run_session(sid_clone.clone(), run_id_clone.clone(), config, password, rx, app_clone).await;
+        crate::ssh::run_session(
+            sid_clone.clone(),
+            run_id_clone.clone(),
+            config,
+            password,
+            rx,
+            app_clone,
+        )
+        .await;
         let mut map = safe_lock(&state_clone);
-        if map.get(&sid_clone).map(|h| h.run_id == run_id_clone).unwrap_or(false) {
+        if map
+            .get(&sid_clone)
+            .map(|h| h.run_id == run_id_clone)
+            .unwrap_or(false)
+        {
             map.remove(&sid_clone);
         }
     });
@@ -165,9 +281,16 @@ pub fn write_to_ssh(
     data: Vec<u8>,
     ssh_state: State<'_, SshState>,
 ) -> Result<(), String> {
-    let map = ssh_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let handle = map.get(&id).ok_or_else(|| format!("SSH 会话不存在: {id}"))?;
-    handle.tx.send(SshCmd::Write(data)).map_err(|_| "会话已断开".to_string())
+    let map = ssh_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let handle = map
+        .get(&id)
+        .ok_or_else(|| format!("SSH 会话不存在: {id}"))?;
+    handle
+        .tx
+        .send(SshCmd::Write(data))
+        .map_err(|_| "会话已断开".to_string())
 }
 
 /// 调整 PTY 大小
@@ -178,9 +301,16 @@ pub fn resize_pty(
     rows: u32,
     ssh_state: State<'_, SshState>,
 ) -> Result<(), String> {
-    let map = ssh_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let handle = map.get(&id).ok_or_else(|| format!("SSH 会话不存在: {id}"))?;
-    handle.tx.send(SshCmd::Resize { cols, rows }).map_err(|_| "会话已断开".to_string())
+    let map = ssh_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let handle = map
+        .get(&id)
+        .ok_or_else(|| format!("SSH 会话不存在: {id}"))?;
+    handle
+        .tx
+        .send(SshCmd::Resize { cols, rows })
+        .map_err(|_| "会话已断开".to_string())
 }
 
 /// 同步全局代理设置（设置中心 → 后端；连接级未配置代理时生效）
@@ -193,30 +323,32 @@ pub fn set_global_proxy(
     password: String,
 ) -> Result<(), String> {
     crate::ssh::set_global_proxy(crate::ssh::GlobalProxy {
-        proxy_type, host, port, username, password,
+        proxy_type,
+        host,
+        port,
+        username,
+        password,
     });
     Ok(())
 }
 
 /// 应答 MFA 交互式认证提示（answers 为 null 表示用户取消）
 #[tauri::command]
-pub fn respond_ssh_mfa(
-    request_id: String,
-    answers: Option<Vec<String>>,
-) -> Result<(), String> {
+pub fn respond_ssh_mfa(request_id: String, answers: Option<Vec<String>>) -> Result<(), String> {
     crate::ssh::mfa_respond(&request_id, answers)
 }
 
 /// 主动断开 SSH 连接
 #[tauri::command]
-pub fn disconnect_ssh(
-    id: String,
-    ssh_state: State<'_, SshState>,
-) -> Result<(), String> {
+pub fn disconnect_ssh(id: String, ssh_state: State<'_, SshState>) -> Result<(), String> {
     let conn_id = {
-        let map = ssh_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = ssh_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let handle = map.get(&id);
-        if let Some(h) = handle { h.tx.send(SshCmd::Disconnect).ok(); }
+        if let Some(h) = handle {
+            h.tx.send(SshCmd::Disconnect).ok();
+        }
         handle.map(|h| h.conn_id.clone())
     };
     // 用户主动断开：一并释放该连接缓存的 SFTP 会话。
@@ -245,7 +377,10 @@ async fn load_conn(
     id: &str,
     storage: &State<'_, StorageState>,
 ) -> Result<(ConnConfig, Option<String>), String> {
-    let configs = storage.lock().unwrap_or_else(std::sync::PoisonError::into_inner).load()?;
+    let configs = storage
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .load()?;
     let config = configs
         .into_iter()
         .find(|c| c.id == id)
@@ -359,22 +494,26 @@ fn parse_perf_output(raw: &str, ip: &str) -> Result<ServerPerf, String> {
     let ps_lines   = sections.get("===PS===").cloned().unwrap_or_default();
     let disk_lines = sections.get("===DISK===").cloned().unwrap_or_default();
 
-    let hostname = sections.get("===HOST===")
+    let hostname = sections
+        .get("===HOST===")
         .and_then(|v| v.first())
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
 
-    let username = sections.get("===USER===")
+    let username = sections
+        .get("===USER===")
         .and_then(|v| v.first())
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
 
-    let os = sections.get("===OS===")
+    let os = sections
+        .get("===OS===")
         .and_then(|v| v.first())
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "Linux".into());
 
-    let uptime = sections.get("===UPTIME===")
+    let uptime = sections
+        .get("===UPTIME===")
         .and_then(|v| v.first())
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
@@ -424,31 +563,43 @@ fn parse_cpu_line(line: &str) -> Option<CpuTimes> {
 fn cpu_pct(b: &CpuTimes, a: &CpuTimes) -> f32 {
     let total = a.total().saturating_sub(b.total());
     let idle  = a.idle_total().saturating_sub(b.idle_total());
-    if total == 0 { return 0.0; }
+    if total == 0 {
+        return 0.0;
+    }
     ((1.0 - idle as f32 / total as f32) * 100.0).clamp(0.0, 100.0)
 }
 
 fn calc_cpu_usage(before: &[&str], after: &[&str]) -> (f32, Vec<f32>) {
-    let b_map: std::collections::HashMap<String, CpuTimes> = before.iter()
+    let b_map: std::collections::HashMap<String, CpuTimes> = before
+        .iter()
         .filter(|l| l.starts_with("cpu"))
         .filter_map(|l| {
             let key = l.split_whitespace().next()?.to_string();
             Some((key, parse_cpu_line(l)?))
-        }).collect();
+        })
+        .collect();
 
     let mut total = 0.0f32;
     let mut cores = Vec::new();
     let mut core_idx = 0u32;
 
     for line in after.iter().filter(|l| l.starts_with("cpu")) {
-        let key = match line.split_whitespace().next() { Some(k) => k, None => continue };
-        let a = match parse_cpu_line(line) { Some(t) => t, None => continue };
+        let key = match line.split_whitespace().next() {
+            Some(k) => k,
+            None => continue,
+        };
+        let a = match parse_cpu_line(line) {
+            Some(t) => t,
+            None => continue,
+        };
         if let Some(b) = b_map.get(key) {
             let pct = cpu_pct(b, &a);
             if key == "cpu" {
                 total = pct;
             } else if key.starts_with("cpu") && key[3..].parse::<u32>().is_ok() {
-                while cores.len() < core_idx as usize { cores.push(0.0); }
+                while cores.len() < core_idx as usize {
+                    cores.push(0.0);
+                }
                 cores.push(pct);
                 core_idx += 1;
             }
@@ -461,14 +612,19 @@ fn parse_meminfo(lines: &[&str]) -> (u64, u64, u64, u64) {
     let mut vals: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
     for line in lines {
         if let Some((key, rest)) = line.split_once(':') {
-            let kb: u64 = rest.split_whitespace().next()
-                .and_then(|s| s.parse().ok()).unwrap_or(0);
+            let kb: u64 = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             vals.insert(key.trim(), kb * 1024);
         }
     }
     let mem_total  = *vals.get("MemTotal").unwrap_or(&0);
-    let mem_avail  = *vals.get("MemAvailable")
-        .or_else(|| vals.get("MemFree")).unwrap_or(&0);
+    let mem_avail = *vals
+        .get("MemAvailable")
+        .or_else(|| vals.get("MemFree"))
+        .unwrap_or(&0);
     let mem_used   = mem_total.saturating_sub(mem_avail);
     let swap_total = *vals.get("SwapTotal").unwrap_or(&0);
     let swap_free  = *vals.get("SwapFree").unwrap_or(&0);
@@ -481,13 +637,22 @@ fn parse_net_dev(lines: &[&str]) -> (u64, u64) {
     let mut tx_total = 0u64;
     for line in lines {
         let t = line.trim();
-        if !t.contains(':') || t.starts_with("Inter") || t.starts_with("face") { continue; }
-        let after_colon = match t.split_once(':') { Some((iface, rest)) => {
-            if iface.trim() == "lo" { continue; }
+        if !t.contains(':') || t.starts_with("Inter") || t.starts_with("face") {
+            continue;
+        }
+        let after_colon = match t.split_once(':') {
+            Some((iface, rest)) => {
+                if iface.trim() == "lo" {
+                    continue;
+                }
             rest
-        }, None => continue };
-        let nums: Vec<u64> = after_colon.split_whitespace()
-            .filter_map(|s| s.parse().ok()).collect();
+            }
+            None => continue,
+        };
+        let nums: Vec<u64> = after_colon
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
         if nums.len() >= 9 {
             rx_total += nums[0];
             tx_total += nums[8];
@@ -497,11 +662,14 @@ fn parse_net_dev(lines: &[&str]) -> (u64, u64) {
 }
 
 fn parse_processes(lines: &[&str]) -> Vec<ProcessInfo> {
-    lines.iter()
+    lines
+        .iter()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 5 { return None; }
+            if parts.len() < 5 {
+                return None;
+            }
             Some(ProcessInfo {
                 pid:     parts[0].parse().ok()?,
                 name:    parts[1].to_string(),
@@ -515,14 +683,21 @@ fn parse_processes(lines: &[&str]) -> Vec<ProcessInfo> {
 
 fn parse_disks(lines: &[&str]) -> Vec<DiskEntry> {
     // df -P --block-size=1 POSIX 格式: Filesystem 1B-blocks Used Available Capacity% Mountpoint
-    lines.iter()
+    lines
+        .iter()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 6 { return None; }
+            if parts.len() < 6 {
+                return None;
+            }
             let total: u64 = parts[1].parse().ok()?;
             let used:  u64 = parts[2].parse().ok()?;
-            Some(DiskEntry { mount: parts[5].to_string(), total, used })
+            Some(DiskEntry {
+                mount: parts[5].to_string(),
+                total,
+                used,
+            })
         })
         .collect()
 }
@@ -566,7 +741,11 @@ pub async fn get_file_start_path(
     let home = crate::ssh::exec_command(&config, password.as_deref(), "echo \"$HOME\"").await?;
     let home = home.trim();
     Ok(crate::ssh::sftp::StartPath {
-        path: if home.is_empty() { "/".to_string() } else { home.to_string() },
+        path: if home.is_empty() {
+            "/".to_string()
+        } else {
+            home.to_string()
+        },
         warning: None,
     })
 }
@@ -585,7 +764,9 @@ fn parse_ls_output(raw: &str, base_path: &str) -> Vec<FileEntry> {
         // --time-style='+%Y-%m-%d %H:%M' 产生 2 个日期字段，名称在 index 7
         // 普通 ls -l 产生 3 个日期字段(月 日 时间)，名称在 index 8
         // 统一：至少 8 个字段，并根据第 5 字段格式判断偏移
-        if parts.len() < 8 { continue; }
+        if parts.len() < 8 {
+            continue;
+        }
         let perms = parts[0];
         let is_dir = perms.starts_with('d');
         let is_link = perms.starts_with('l');
@@ -595,17 +776,28 @@ fn parse_ls_output(raw: &str, base_path: &str) -> Vec<FileEntry> {
         let (date, name_start) = if parts[5].contains('-') {
             (format!("{} {}", parts[5], parts[6]), 7)
         } else {
-            (format!("{} {} {}", parts[5], parts[6], parts.get(7).unwrap_or(&"")), 8)
+            (
+                format!("{} {} {}", parts[5], parts[6], parts.get(7).unwrap_or(&"")),
+                8,
+            )
         };
-        if parts.len() <= name_start { continue; }
+        if parts.len() <= name_start {
+            continue;
+        }
         let name_part = parts[name_start..].join(" ");
         // Remove link target (name -> target)
         let name = if is_link {
-            name_part.split(" -> ").next().unwrap_or(&name_part).to_string()
+            name_part
+                .split(" -> ")
+                .next()
+                .unwrap_or(&name_part)
+                .to_string()
         } else {
             name_part.clone()
         };
-        if name == "." || name == ".." { continue; }
+        if name == "." || name == ".." {
+            continue;
+        }
         let path = format!("{}/{}", base_path.trim_end_matches('/'), name);
         entries.push(FileEntry {
             name,
@@ -689,29 +881,53 @@ pub async fn download_file(
 ) -> Result<String, String> {
     let (config, password) = load_conn(&id, &storage).await?;
     if sftp_enabled(&config) {
-        let download_dir = app.path().download_dir()
+        let download_dir = app
+            .path()
+            .download_dir()
             .map_err(|e| format!("无法获取下载目录: {e}"))?;
         let tid = transfer_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         return crate::ssh::sftp::download(
-            &config, password.as_deref(), &remote_path, &download_dir, &tid, &app,
-        ).await;
+            &config,
+            password.as_deref(),
+            &remote_path,
+            &download_dir,
+            &tid,
+            &app,
+        )
+        .await;
     }
     crate::ssh::validate_remote_path(&remote_path)?;
     let cmd = format!(r#"base64 "{}" 2>&1"#, remote_path.replace('"', "\\\""));
     let b64 = crate::ssh::exec_command(&config, password.as_deref(), &cmd).await?;
 
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let cleaned: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
-    let bytes = STANDARD.decode(&cleaned)
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let max_encoded = REMOTE_DOWNLOAD_MAX_BYTES.saturating_add(2) / 3 * 4;
+    if b64.len() as u64 > max_encoded {
+        return Err(format!(
+            "远程文件超过回退下载上限 {} MiB",
+            REMOTE_DOWNLOAD_MAX_BYTES / 1024 / 1024
+        ));
+    }
+    let bytes = STANDARD
+        .decode(
+            b64.chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>(),
+        )
         .map_err(|e| format!("base64 解码失败: {e}"))?;
 
-    let filename = remote_path.split('/').last().unwrap_or("download").to_string();
-    let download_dir = app.path().download_dir()
+    let filename = remote_path
+        .split('/')
+        .last()
+        .unwrap_or("download")
+        .to_string();
+    let download_dir = app
+        .path()
+        .download_dir()
         .map_err(|e| format!("无法获取下载目录: {e}"))?;
     let local_path = download_dir.join(&filename);
 
-    std::fs::write(&local_path, &bytes)
-        .map_err(|e| format!("写入本地文件失败: {e}"))?;
+    publish_download_bytes(&local_path, &bytes).await?;
 
     Ok(local_path.to_string_lossy().into_owned())
 }
@@ -734,12 +950,21 @@ pub async fn download_file_to(
     if !local.is_absolute() {
         return Err("本地目录必须是绝对路径".to_string());
     }
-    let meta = tokio::fs::metadata(&local).await
+    let meta = tokio::fs::metadata(&local)
+        .await
         .map_err(|e| format!("读取本地目录失败: {e}"))?;
     if !meta.is_dir() {
         return Err("目标本地路径不是文件夹".to_string());
     }
-    crate::ssh::sftp::download(&config, password.as_deref(), &remote_path, &local, &transfer_id, &app).await
+    crate::ssh::sftp::download(
+        &config,
+        password.as_deref(),
+        &remote_path,
+        &local,
+        &transfer_id,
+        &app,
+    )
+    .await
 }
 
 /// 修改远程文件权限
@@ -751,8 +976,7 @@ pub async fn chmod_file(
     storage: State<'_, StorageState>,
 ) -> Result<(), String> {
     // mode 仅允许 3-4 位八进制
-    let valid = (3..=4).contains(&mode.len())
-        && mode.chars().all(|c| ('0'..='7').contains(&c));
+    let valid = (3..=4).contains(&mode.len()) && mode.chars().all(|c| ('0'..='7').contains(&c));
     if !valid {
         return Err("权限必须是 3-4 位八进制数字，如 644 或 0755".to_string());
     }
@@ -782,15 +1006,20 @@ pub async fn upload_file(
     storage: State<'_, StorageState>,
 ) -> Result<(), String> {
     crate::ssh::validate_remote_path(&remote_path)?;
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let cleaned: String = content_base64.chars().filter(|c| !c.is_whitespace()).collect();
-    let bytes = STANDARD.decode(&cleaned).map_err(|e| format!("base64解码失败: {e}"))?;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let cleaned: String = content_base64
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let bytes = STANDARD
+        .decode(&cleaned)
+        .map_err(|e| format!("base64解码失败: {e}"))?;
 
     let (config, password) = load_conn(&id, &storage).await?;
     crate::ssh::upload_bytes(&config, password.as_deref(), &remote_path, &bytes).await
 }
 
-/// 按本地路径流式上传（SFTP 优先；回退模式整文件读入后走 exec+base64）
+/// 按本地路径流式上传（SFTP 优先；回退模式分块读取、校验后原子替换）
 #[tauri::command]
 pub async fn upload_file_path(
     id: String,
@@ -805,16 +1034,20 @@ pub async fn upload_file_path(
     if sftp_enabled(&config) {
         let tid = transfer_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         return crate::ssh::sftp::upload(
-            &config, password.as_deref(), &local, &remote_path, &tid, &app,
-        ).await;
+            &config,
+            password.as_deref(),
+            &local,
+            &remote_path,
+            &tid,
+            &app,
+        )
+        .await;
     }
     crate::ssh::validate_remote_path(&remote_path)?;
     if !local.is_absolute() {
         return Err("本地路径必须是绝对路径".to_string());
     }
-    let bytes = tokio::fs::read(&local).await
-        .map_err(|e| format!("读取本地文件失败: {e}"))?;
-    crate::ssh::upload_bytes(&config, password.as_deref(), &remote_path, &bytes).await
+    crate::ssh::upload_path(&config, password.as_deref(), &remote_path, &local).await
 }
 
 /// 递归下载远程目录到本地下载目录，返回本地路径
@@ -830,9 +1063,19 @@ pub async fn download_dir(
     if !sftp_enabled(&config) {
         return Err("该连接未启用 SFTP，无法下载目录".to_string());
     }
-    let download_dir = app.path().download_dir()
+    let download_dir = app
+        .path()
+        .download_dir()
         .map_err(|e| format!("无法获取下载目录: {e}"))?;
-    crate::ssh::sftp::download_dir(&config, password.as_deref(), &remote_path, &download_dir, &transfer_id, &app).await
+    crate::ssh::sftp::download_dir(
+        &config,
+        password.as_deref(),
+        &remote_path,
+        &download_dir,
+        &transfer_id,
+        &app,
+    )
+    .await
 }
 
 /// 递归下载远程目录到指定本地目录，返回本地路径
@@ -853,12 +1096,21 @@ pub async fn download_dir_to(
     if !local.is_absolute() {
         return Err("本地目录必须是绝对路径".to_string());
     }
-    let meta = tokio::fs::metadata(&local).await
+    let meta = tokio::fs::metadata(&local)
+        .await
         .map_err(|e| format!("读取本地目录失败: {e}"))?;
     if !meta.is_dir() {
         return Err("目标本地路径不是文件夹".to_string());
     }
-    crate::ssh::sftp::download_dir(&config, password.as_deref(), &remote_path, &local, &transfer_id, &app).await
+    crate::ssh::sftp::download_dir(
+        &config,
+        password.as_deref(),
+        &remote_path,
+        &local,
+        &transfer_id,
+        &app,
+    )
+    .await
 }
 
 /// 递归上传本地目录到远程路径下
@@ -876,7 +1128,15 @@ pub async fn upload_dir(
         return Err("该连接未启用 SFTP，无法上传目录".to_string());
     }
     let local = std::path::PathBuf::from(&local_path);
-    crate::ssh::sftp::upload_dir(&config, password.as_deref(), &local, &remote_base, &transfer_id, &app).await
+    crate::ssh::sftp::upload_dir(
+        &config,
+        password.as_deref(),
+        &local,
+        &remote_base,
+        &transfer_id,
+        &app,
+    )
+    .await
 }
 
 // ── 远程文件在线编辑 ──────────────────────────────────────
@@ -893,11 +1153,20 @@ pub async fn read_remote_file(
     crate::ssh::validate_remote_path(&path)?;
     let (config, password) = load_conn(&id, &storage).await?;
     if sftp_enabled(&config) {
-        return crate::ssh::sftp::read_text_file(&config, password.as_deref(), &path, REMOTE_EDIT_MAX_BYTES).await;
+        return crate::ssh::sftp::read_text_file(
+            &config,
+            password.as_deref(),
+            &path,
+            REMOTE_EDIT_MAX_BYTES,
+        )
+        .await;
     }
     // 回退：exec base64 解码
-    let cmd = format!(r#"wc -c < "{}" 2>/dev/null && base64 "{}" 2>&1"#,
-        path.replace('"', "\\\""), path.replace('"', "\\\""));
+    let cmd = format!(
+        r#"wc -c < "{}" 2>/dev/null && base64 "{}" 2>&1"#,
+        path.replace('"', "\\\""),
+        path.replace('"', "\\\"")
+    );
     let raw = crate::ssh::exec_command(&config, password.as_deref(), &cmd).await?;
     let mut lines = raw.lines();
     // 第一行是文件大小
@@ -906,8 +1175,13 @@ pub async fn read_remote_file(
         return Err(format!("文件过大（{} 字节），在线编辑限制 1 MB", size));
     }
     let b64: String = lines.collect::<Vec<_>>().join("");
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let bytes = STANDARD.decode(b64.chars().filter(|c| !c.is_whitespace()).collect::<String>())
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let bytes = STANDARD
+        .decode(
+            b64.chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>(),
+        )
         .map_err(|e| format!("base64 解码失败: {e}"))?;
     String::from_utf8(bytes).map_err(|_| "文件包含非 UTF-8 内容，无法在线编辑".to_string())
 }
@@ -926,19 +1200,8 @@ pub async fn write_remote_file(
     if sftp_enabled(&config) {
         return crate::ssh::sftp::write_file(&config, password.as_deref(), &path, bytes).await;
     }
-    // 回退：base64 + exec
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let b64 = STANDARD.encode(&bytes);
-    // base64 -d 是 GNU/Linux 写法；macOS/BSD 用 base64 -D（大写）
-    // python3 作为跨平台回退
-    let cmd = format!(
-        r#"printf '%s' '{}' | python3 -c "import sys,base64;sys.stdout.buffer.write(base64.b64decode(sys.stdin.read().strip()))" > "{}" 2>/dev/null || printf '%s' '{}' | base64 -d > "{}" 2>/dev/null || printf '%s' '{}' | base64 -D > "{}""#,
-        b64.replace('\'', "'\\''"), path.replace('"', "\\\""),
-        b64.replace('\'', "'\\''"), path.replace('"', "\\\""),
-        b64.replace('\'', "'\\''"), path.replace('"', "\\\""),
-    );
-    crate::ssh::exec_command(&config, password.as_deref(), &cmd).await?;
-    Ok(())
+    // Reuse verified staging and replacement; never redirect into the original.
+    crate::ssh::upload_bytes(&config, password.as_deref(), &path, &bytes).await
 }
 
 // ── SSH Config 文件导入 ───────────────────────────────────
@@ -958,7 +1221,9 @@ pub struct SshConfigHost {
 #[tauri::command]
 pub fn parse_ssh_config() -> Result<Vec<SshConfigHost>, String> {
     let path = crate::tester::expand_home("~/.ssh/config");
-    if !path.exists() { return Ok(vec![]); }
+    if !path.exists() {
+        return Ok(vec![]);
+    }
     let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
 
     let mut hosts: Vec<SshConfigHost> = Vec::new();
@@ -966,7 +1231,9 @@ pub fn parse_ssh_config() -> Result<Vec<SshConfigHost>, String> {
 
     for line in content.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
         if let Some((key, val)) = trimmed.split_once(|c: char| c.is_whitespace()) {
             let key = key.trim().to_lowercase();
             let val = val.trim().to_string();
@@ -978,16 +1245,39 @@ pub fn parse_ssh_config() -> Result<Vec<SshConfigHost>, String> {
                         }
                     }
                     cur = Some(SshConfigHost {
-                        alias: val, hostname: String::new(),
-                        user: String::new(), port: 22,
-                        identity_file: String::new(), proxy_jump: String::new(),
+                        alias: val,
+                        hostname: String::new(),
+                        user: String::new(),
+                        port: 22,
+                        identity_file: String::new(),
+                        proxy_jump: String::new(),
                     });
                 }
-                "hostname"     => { if let Some(h) = &mut cur { h.hostname = val; } }
-                "user"         => { if let Some(h) = &mut cur { h.user = val; } }
-                "port"         => { if let Some(h) = &mut cur { h.port = val.parse().unwrap_or(22); } }
-                "identityfile" => { if let Some(h) = &mut cur { h.identity_file = val; } }
-                "proxyjump"    => { if let Some(h) = &mut cur { h.proxy_jump = val; } }
+                "hostname" => {
+                    if let Some(h) = &mut cur {
+                        h.hostname = val;
+                    }
+                }
+                "user" => {
+                    if let Some(h) = &mut cur {
+                        h.user = val;
+                    }
+                }
+                "port" => {
+                    if let Some(h) = &mut cur {
+                        h.port = val.parse().unwrap_or(22);
+                    }
+                }
+                "identityfile" => {
+                    if let Some(h) = &mut cur {
+                        h.identity_file = val;
+                    }
+                }
+                "proxyjump" => {
+                    if let Some(h) = &mut cur {
+                        h.proxy_jump = val;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1109,18 +1399,14 @@ pub fn import_connections_encrypted(
             .map_err(|e| format!("连接格式错误: {e}"))?;
         parsed.push((config, pwd));
     }
-    // 第二遍：写入存储 + keychain
-    let mut count = 0;
-    for (config, pwd) in parsed {
-        let id = config.id.clone();
-        storage.lock().unwrap_or_else(std::sync::PoisonError::into_inner).upsert(config)?;
-        if let Some(p) = pwd {
-            if let Err(e) = crate::keychain::set_password(&id, &p) {
-                // keychain 写入失败时记录警告，不中断导入（连接仍可手动输入密码）
-                log::warn!("导入：连接 {id} 密码写入 keychain 失败: {e}");
-            }
-        }
-        count += 1;
-    }
+    let configs: Vec<_> = parsed.iter().map(|(config, _)| config.clone()).collect();
+    let password_updates: Vec<_> = parsed
+        .into_iter()
+        .filter_map(|(config, pwd)| pwd.map(|p| (config.id, p)))
+        .collect();
+    let count = configs.len();
+    let storage_guard = storage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let data_dir = storage_guard.data_dir();
+    crate::connection_import::apply(&data_dir, &storage_guard, configs, password_updates)?;
     Ok(count)
 }

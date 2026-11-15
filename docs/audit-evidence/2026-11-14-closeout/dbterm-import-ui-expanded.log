@@ -1,0 +1,1 @@
+PASS actual ImportDialog prevents pending closure, operation switching, and blind replay after unknown commit; simulated IPC only.

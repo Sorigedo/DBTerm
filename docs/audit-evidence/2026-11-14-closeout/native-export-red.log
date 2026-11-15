@@ -1,0 +1,12 @@
+127.0.0.1 - - [15/Nov/2026 00:20:31] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [15/Nov/2026 00:20:31] "GET /assets/index-BjXBCaoK.js HTTP/1.1" 200 -
+127.0.0.1 - - [15/Nov/2026 00:20:31] "GET /assets/index-BGMijY7Z.css HTTP/1.1" 200 -
+127.0.0.1 - - [15/Nov/2026 00:20:31] "GET /assets/index-BwEqUg7L.css HTTP/1.1" 200 -
+127.0.0.1 - - [15/Nov/2026 00:20:31] "GET /assets/jetbrains-mono-latin-400-normal-V6pRDFza.woff2 HTTP/1.1" 200 -
+{"ok": false, "checks": ["真实IPC读取完整DDL与独立MySQL客户端一致"], "error": "读取导出列类型失败: error occurred while decoding column \"Type\": mismatched types; Rust type `alloc::string::String` (as SQL type `VARCHAR`) is not compatible with SQL type `BLOB`"}
+Disposable fixture stopped; evidence at /var/folders/29/p22btbvx12n6p5bqjgkjwy800000gn/T/dbterm-native-export-o2a5nmcx
+Traceback (most recent call last):
+  File "/Users/Nico/workSpace/claude/DBterm/scripts/acceptance/native-export.py", line 110, in <module>
+    assert app.returncode==0 and receipt['ok'], (app.returncode, receipt)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (0, {'ok': False, 'checks': ['真实IPC读取完整DDL与独立MySQL客户端一致'], 'error': '读取导出列类型失败: error occurred while decoding column "Type": mismatched types; Rust type `alloc::string::String` (as SQL type `VARCHAR`) is not compatible with SQL type `BLOB`'})

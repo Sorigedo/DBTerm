@@ -1,0 +1,1 @@
+PASS actual ImportDialog uses logical quoted CSV headers and preserves comma/newline names; simulated dialog/IPC, no database writes.

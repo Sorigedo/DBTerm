@@ -580,17 +580,17 @@ export default function AssetPanel({ open, width }: Props) {
     }
   }
 
-  function handleOpenTable(connId: string, connType: ConnType, schema: string, table: string) {
+  function handleOpenTable(connId: string, connType: ConnType, schema: string, table: string, ssSchema?: string) {
     const conn = connections.find(c => c.id === connId)
     if (!conn) return
     // 打开表数据：独立的数据网格标签页（每张表一个 tab）
-    const tabId = wid(`${connId}-tabledata-${schema}-${table}`)
+    const tabId = wid(ssSchema ? `${connId}-tabledata-ss-${JSON.stringify([schema, ssSchema, table])}` : `${connId}-tabledata-${schema}-${table}`)
     const existing = tabs.find(t => t.id === tabId)
     if (existing) { setActiveTab(tabId); return }
     openTab({
       id: tabId, connectionId: connId,
       title: table, type: 'table-data',
-      meta: { schema, table, connType },
+      meta: { schema, table, connType, ...(ssSchema ? { ssSchema } : {}) },
     })
   }
 
@@ -628,7 +628,7 @@ export default function AssetPanel({ open, width }: Props) {
                 defaultSchema={c.database}
                 objectFilter={searching ? (searchQuery ?? '') : ''}
                 onMigrate={setMigratePreset}
-                onOpenTable={(schema, table) => handleOpenTable(c.id, c.type as ConnType, schema, table)}
+                onOpenTable={(schema, table, ssSchema) => handleOpenTable(c.id, c.type as ConnType, schema, table, ssSchema)}
               />
             </Suspense>
           </div>

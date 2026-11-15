@@ -95,6 +95,11 @@ function stripExt(path: string) {
   return baseName(path).replace(/\.[^.]+$/, '')
 }
 
+function replaceExt(path: string, ext: string) {
+  const cleanExt = ext.replace(/^\./, '')
+  return path.replace(/\.[^./\\]+$/, '') + `.${cleanExt}`
+}
+
 function escapeFileName(value: string) {
   const name = value.trim().replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, '-')
   return name || 'document'
@@ -291,6 +296,7 @@ function appendSplitPre(state: PaginationState, original: HTMLElement) {
 
     candidate.remove()
     if (working) {
+      state.article.appendChild(working)
       moveToNextPage(state)
       working = null
       chunk = []
@@ -349,6 +355,7 @@ function appendSplitTable(state: PaginationState, original: HTMLTableElement) {
 
     candidate.remove()
     if (working) {
+      state.article.appendChild(working)
       moveToNextPage(state)
       working = null
       chunk = []
@@ -399,6 +406,7 @@ function appendSplitList(state: PaginationState, original: HTMLElement) {
 
     candidate.remove()
     if (working) {
+      state.article.appendChild(working)
       moveToNextPage(state)
       working = null
       chunk = []
@@ -581,6 +589,8 @@ export function DocumentConvertTool() {
   const [source, setSource] = useState(() => localStorage.getItem('tool-mdpdf-draft') ?? '')
   const [sourceName, setSourceName] = useState('')
   const [inputPath, setInputPath] = useState('')
+  const [outputPath, setOutputPath] = useState('')
+  const [lastOutputPath, setLastOutputPath] = useState('')
   const [targetFormat, setTargetFormat] = useState('pdf')
   const [title, setTitle] = useState(() => firstHeading(localStorage.getItem('tool-mdpdf-draft') ?? ''))
   const [subtitle, setSubtitle] = useState('文档转 PDF')
@@ -607,6 +617,7 @@ export function DocumentConvertTool() {
   const effectiveTitle = title.trim() || firstHeading(source) || stripExt(sourceName || inputPath) || '文档'
   const sourceDisplayName = hasSelectedSource ? baseName(inputPath || sourceName) : '选择文件'
   const sourceDisplayPath = hasSelectedSource ? (inputPath || sourceName) : 'Word、Excel、PPT、PDF、Markdown、TXT、CSV、HTML'
+  const outputDisplayPath = outputPath || '请选择保存路径'
   const sourceFormatLabel = inputExt ? inputExt.toUpperCase() : '自动识别'
   const hintText = inputExt === 'pdf'
     ? 'PDF 源文件可转为 Word 或 TXT。'
@@ -641,6 +652,11 @@ export function DocumentConvertTool() {
   useEffect(() => {
     if (!targetOptions.includes(targetFormat)) setTargetFormat(targetOptions[0] ?? 'pdf')
   }, [targetFormat, targetOptions])
+
+  useEffect(() => {
+    setOutputPath('')
+    setLastOutputPath('')
+  }, [inputPath, sourceName, targetFormat])
 
   useEffect(() => {
     if (!isTauri()) return
@@ -682,6 +698,7 @@ export function DocumentConvertTool() {
     if (!file) return
     setStyledSource(await file.text(), file.name)
     setInputPath('')
+    setOutputPath('')
     setTargetFormat('pdf')
     toast.success(`已导入：${file.name}`)
   }
@@ -702,6 +719,7 @@ export function DocumentConvertTool() {
       if (!path) return
       setInputPath(path)
       setSourceName(path)
+      setOutputPath('')
       const ext = extName(path)
       const opts = targetOptionsForSource(ext)
       setTargetFormat(opts[0] ?? 'pdf')
@@ -715,11 +733,57 @@ export function DocumentConvertTool() {
     }
   }
 
-  const exportStyledPdf = async () => {
+  const defaultOutputPath = (format = targetFormat) => {
+    if (inputPath) return replaceExt(inputPath, format)
+    const base = escapeFileName(effectiveTitle || stripExt(sourceName || inputPath) || 'document')
+    return `${base}.${format}`
+  }
+
+  const chooseOutputPath = async () => {
+    if (!hasSelectedSource) {
+      toast.error('请先选择源文件')
+      return ''
+    }
+    if (!isTauri()) {
+      const fallback = defaultOutputPath(targetFormat)
+      setOutputPath(fallback)
+      return fallback
+    }
+    try {
+      const { save } = await import('@tauri-apps/plugin-dialog')
+      const path = await save({
+        title: '选择保存路径',
+        defaultPath: outputPath || defaultOutputPath(targetFormat),
+        filters: [{ name: formatLabel(targetFormat), extensions: [targetFormat] }],
+      })
+      if (!path) return ''
+      setOutputPath(path)
+      return path
+    } catch (error) {
+      toast.error(`选择保存路径失败：${String(error)}`)
+      return ''
+    }
+  }
+
+  const openOutputFolder = async () => {
+    const path = lastOutputPath || outputPath
+    if (!path) return
+    if (!isTauri()) return
+    try {
+      const { invoke } = await import('@tauri-apps/api/core')
+      await invoke('reveal_in_folder', { filePath: path })
+    } catch (error) {
+      toast.error(`打开目录失败：${String(error)}`)
+    }
+  }
+
+  const exportStyledPdf = async (selectedOutputPath?: string) => {
     if (!source.trim()) {
       toast.error('请先选择或输入 Markdown / TXT')
       return
     }
+    const finalOutputPath = selectedOutputPath || outputPath || await chooseOutputPath()
+    if (!finalOutputPath) return
     const node = exportRef.current
     if (!node) return
     setBusy(true)
@@ -773,18 +837,16 @@ export function DocumentConvertTool() {
           }
         }
       }
-      const defaultPath = `${escapeFileName(effectiveTitle)}.pdf`
       if (isTauri()) {
-        const { save } = await import('@tauri-apps/plugin-dialog')
-        const path = await save({ title: '保存 PDF', defaultPath, filters: [{ name: 'PDF 文档', extensions: ['pdf'] }] })
-        if (!path) return
         const { invoke } = await import('@tauri-apps/api/core')
         const bytes = new Uint8Array(pdf.output('arraybuffer'))
-        await invoke('write_local_bytes', { path, bytes: Array.from(bytes) })
-        toast.success(`PDF 已保存：${path}`)
+        await invoke('write_local_bytes', { path: finalOutputPath, bytes: Array.from(bytes) })
+        setLastOutputPath(finalOutputPath)
+        toast.success(`PDF 已保存：${finalOutputPath}`)
       } else {
-        pdf.save(defaultPath)
-        toast.success(`PDF 已生成：${defaultPath}`)
+        pdf.save(finalOutputPath)
+        setLastOutputPath(finalOutputPath)
+        toast.success(`PDF 已生成：${finalOutputPath}`)
       }
     } catch (error) {
       toast.error(`导出失败：${String(error)}`)
@@ -795,8 +857,10 @@ export function DocumentConvertTool() {
   }
 
   const convertFile = async () => {
+    const finalOutputPath = outputPath || await chooseOutputPath()
+    if (!finalOutputPath) return
     if (canUseTextPdf) {
-      await exportStyledPdf()
+      await exportStyledPdf(finalOutputPath)
       return
     }
     if (!inputPath) {
@@ -820,18 +884,12 @@ export function DocumentConvertTool() {
     }
     setBusy(true)
     try {
-      const { save } = await import('@tauri-apps/plugin-dialog')
-      const outputPath = await save({
-        title: '保存转换结果',
-        defaultPath: `${stripExt(inputPath)}.${targetFormat}`,
-        filters: [{ name: formatLabel(targetFormat), extensions: [targetFormat] }],
-      })
-      if (!outputPath) return
       const result = await invoke<ConvertResult>('convert_document_file', {
         inputPath,
-        outputPath,
+        outputPath: finalOutputPath,
         outputFormat: targetFormat,
       })
+      setLastOutputPath(result.path)
       toast.success(`转换完成：${result.path}`)
     } catch (error) {
       toast.error(`转换失败：${String(error)}`)
@@ -967,7 +1025,7 @@ export function DocumentConvertTool() {
                   <div className="docconvert-text-editor">
                     <div className="docconvert-text-editor__head">
                       <span>Markdown / TXT 内容</span>
-                      <button onClick={exportStyledPdf} disabled={busy || !source.trim()}><Save size={13} />导出当前内容</button>
+                      <button onClick={() => exportStyledPdf()} disabled={busy || !source.trim()}><Save size={13} />导出当前内容</button>
                     </div>
                     <textarea
                       className="tool-textarea"
@@ -997,7 +1055,20 @@ export function DocumentConvertTool() {
           )}
 
           <div className="docconvert-action-row">
-            <span className="docconvert-action-row__hint">{hintText}</span>
+            <div className="docconvert-output">
+              <span className="docconvert-action-row__hint">{hintText}</span>
+              <div className="docconvert-output__path" title={outputDisplayPath}>{outputDisplayPath}</div>
+            </div>
+            <button className="docconvert-path-btn" onClick={chooseOutputPath} disabled={busy || !hasSelectedSource}>
+              <Save size={15} />
+              选择保存路径
+            </button>
+            {lastOutputPath && isTauri() && (
+              <button className="docconvert-path-btn" onClick={openOutputFolder} disabled={busy}>
+                <FolderOpen size={15} />
+                打开目录
+              </button>
+            )}
             <button className="docconvert-run-btn" onClick={convertFile} disabled={busy || !hasSelectedSource}>
               {busy ? <Loader2 size={16} className="spin" /> : <FileDown size={16} />}
               {busy ? '转换中...' : `开始转换`}

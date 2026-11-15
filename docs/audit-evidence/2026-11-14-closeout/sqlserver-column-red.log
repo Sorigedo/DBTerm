@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/Users/Nico/workSpace/claude/DBterm/scripts/acceptance/sqlserver-column-catalog.py", line 27, in <module>
+    assert rows == [('id','int','NO',keys[0],None),('v','int','NO',keys[1],None)], (schema, rows)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: ('dbo', [('id', 'int', 'NO', 'PRI', None), ('id', 'int', 'NO', 'PRI', None), ('id', 'int', 'NO', 'PRI', None), ('id', 'int', 'NO', 'PRI', None), ('v', 'int', 'NO', 'PRI', None), ('v', 'int', 'NO', 'PRI', None), ('v', 'int', 'NO', 'PRI', None), ('v', 'int', 'NO', 'PRI', None)])

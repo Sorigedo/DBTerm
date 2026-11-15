@@ -1,0 +1,1 @@
+PASS actual ImportDialog preserves positional mapping, requires explicit unknown-column mapping, blocks unreadable previews, and discards stale format replies; simulated IPC only.

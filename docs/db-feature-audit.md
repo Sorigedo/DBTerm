@@ -6,15 +6,15 @@
 
 | 项目               | 数量  |
 | ---------------- | --- |
-| 扫描前端文件           | 156 |
-| 前端 DB invoke 命令  | 248 |
-| 后端已注册 DB 命令      | 332 |
+| 扫描前端文件           | 206 |
+| 前端 DB invoke 命令  | 252 |
+| 后端已注册 DB 命令      | 337 |
 | 前端调用但后端未注册       | 0   |
 | 工具目录项            | 40  |
 | 目录有但未渲染工具        | 0   |
 | 内嵌集合有但 switch 缺失 | 0   |
 | 动态 invoke 调用点    | 5   |
-| 前端 SQL 方言风险候选    | 119 |
+| 前端 SQL 方言风险候选    | 115 |
 
 ## 前端调用但后端未注册
 
@@ -84,8 +84,8 @@
 | cmd         | src/components/DbTools/PartitionPanel.tsx:62   |
 | cmd         | src/components/DbTools/UserManagePanel.tsx:210 |
 | cmd         | src/components/DbTools/UsersPanel.tsx:212      |
-| executeInTx | src/components/SqlEditor/index.tsx:1549        |
-| executeInTx | src/components/SqlEditor/index.tsx:1639        |
+| executeInTx | src/components/SqlEditor/index.tsx:1605        |
+| executeInTx | src/components/SqlEditor/index.tsx:1701        |
 
 ## 前端自拼 SQL 方言风险候选
 
@@ -95,10 +95,10 @@
 
 | 类型                   | 数量 |
 | -------------------- | -- |
-| DDL/DCL 生成           | 56 |
+| DDL/DCL 生成           | 55 |
 | MySQL SHOW 语句        | 26 |
 | 分页语法                 | 17 |
-| DML 生成               | 15 |
+| DML 生成               | 12 |
 | 硬编码双引号标识符            | 7  |
 | SQLite/DuckDB PRAGMA | 5  |
 | 维护语句                 | 5  |
@@ -108,35 +108,33 @@
 
 | 检测到的守卫                                                                    | 数量 |
 | ------------------------------------------------------------------------- | -- |
-| 未检测到明显方言守卫                                                                | 68 |
-| connType, qid                                                             | 7  |
+| 未检测到明显方言守卫                                                                | 65 |
+| connType, qid                                                             | 8  |
 | connType                                                                  | 3  |
-| connType, sqlite guard                                                    | 3  |
+| connType, duckdb guard, sqlite guard                                      | 3  |
 | mssql guard                                                               | 3  |
 | mysql guard                                                               | 3  |
 | qid, sqlite guard                                                         | 3  |
 | capability guard, connType                                                | 2  |
 | capability guard, qid, sqlite guard                                       | 2  |
-| connType, duckdb guard, sqlite guard                                      | 2  |
-| connType, qid, shared dialect helper                                      | 2  |
 | connType, shared dialect helper                                           | 2  |
+| connType, sqlite guard                                                    | 2  |
 | oracle guard                                                              | 2  |
+| qid                                                                       | 2  |
 | capability guard                                                          | 1  |
 | capability guard, connType, qid                                           | 1  |
 | capability guard, connType, shared dialect helper                         | 1  |
 | connType, dialectFamily, mssql guard, oracle guard, shared dialect helper | 1  |
 | connType, duckdb guard, mssql guard, oracle guard, sqlite guard           | 1  |
 | connType, duckdb guard, mysql guard, pg guard, qid, sqlite guard          | 1  |
-| connType, duckdb guard, mysql guard, sqlite guard                         | 1  |
 | connType, mysql guard                                                     | 1  |
 | connType, mysql guard, oracle guard, pg guard                             | 1  |
 | connType, mysql guard, pg guard, qid, sqlite guard                        | 1  |
 | connType, mysql guard, sqlite guard                                       | 1  |
+| connType, qid, shared dialect helper                                      | 1  |
 | duckdb guard                                                              | 1  |
 | duckdb guard, oracle guard, sqlite guard                                  | 1  |
 | pg guard                                                                  | 1  |
-| qid                                                                       | 1  |
-| qid, shared dialect helper                                                | 1  |
 | sqlite guard                                                              | 1  |
 
 ### 候选明细
@@ -149,50 +147,47 @@
 | src/components/AssetPanel/DbSchemaTree.tsx:1607     | 维护语句                            | connType, shared dialect helper                                           | `openAction('检查表', \`对表 ${ctxMenu.table} 执行${connType === 'tidb' ? ' ADMIN CHECK TABLE' : ' CHECK TABLE'}（检查表与索引完整性）\`,`                                                                  |
 | src/components/AssetPanel/DbSchemaTree.tsx:1627     | DDL/DCL 生成, MySQL SHOW 语句       | capability guard, connType, qid                                           | `<button onClick={() => { openSchemaFill(\`SHOW CREATE ${routineCtx.kind === 'function' ? 'FUNCTION' : 'PROCEDURE'} ${qid(connType, routineCtx.name)};\`, routineCtx.schema); setRoutin`  |
 | src/components/AssetPanel/DbSchemaTree.tsx:2003     | DDL/DCL 生成                      | connType, qid                                                             | `await invoke('execute_query', { id: connectionId, sql: \`DROP DATABASE ${qid(connType, dropDbTarget)}\` })`                                                                              |
-| src/components/DbTools/AlterTableWizard.tsx:53      | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ADD COLUMN ${q(col.name)} ${col.dataType || 'VARCHAR'}${nullStr}${defStr};\`)`                                                                          |
-| src/components/DbTools/AlterTableWizard.tsx:55      | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} DROP COLUMN ${q(col._original?.name ?? col.name)};\`)`                                                                                                  |
-| src/components/DbTools/AlterTableWizard.tsx:64      | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} RENAME COLUMN ${q(orig.name)} TO ${q(col.name)};\`)`                                                                                                    |
-| src/components/DbTools/AlterTableWizard.tsx:67      | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${q(col.name)} TYPE ${col.dataType};\`)`                                                                                                   |
-| src/components/DbTools/AlterTableWizard.tsx:76      | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${q(col.name)} SET DEFAULT '${col.defaultValue.replace(/'/g, "''")}';\`)`                                                                  |
-| src/components/DbTools/AlterTableWizard.tsx:78      | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${q(col.name)} DROP DEFAULT;\`)`                                                                                                           |
-| src/components/DbTools/AlterTableWizard.tsx:99      | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} DROP COLUMN ${q(col._original?.name ?? col.name)};\`)`                                                                                                  |
-| src/components/DbTools/AlterTableWizard.tsx:104     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${q(orig.name)} ${type}${col.nullable ? ' NULL' : ' NOT NULL'};\`)`                                                                        |
-| src/components/DbTools/AlterTableWizard.tsx:106     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ADD DEFAULT ${lit(col.defaultValue)} FOR ${q(orig.name)};\`)`                                                                                           |
-| src/components/DbTools/AlterTableWizard.tsx:125     | DDL/DCL 生成                      | connType, qid                                                             | `stmts.push(\`ALTER TABLE ${tref} ADD (${inner});\`)`                                                                                                                                     |
-| src/components/DbTools/AlterTableWizard.tsx:127     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} DROP COLUMN ${q(col._original?.name ?? col.name)};\`)`                                                                                                  |
-| src/components/DbTools/AlterTableWizard.tsx:134     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `if (mod.length) stmts.push(\`ALTER TABLE ${tref} MODIFY (${q(orig.name)} ${mod.join(' ')});\`)`                                                                                          |
-| src/components/DbTools/AlterTableWizard.tsx:138     | DDL/DCL 生成                      | connType, qid                                                             | `stmts.push(\`ALTER TABLE ${tref} RENAME COLUMN ${q(orig.name)} TO ${q(col.name)};\`)`                                                                                                    |
-| src/components/DbTools/AlterTableWizard.tsx:161     | DDL/DCL 生成                      | pg guard                                                                  | `stmts.push(\`ALTER TABLE ${tref} ADD COLUMN ${def};\`)`                                                                                                                                  |
-| src/components/DbTools/AlterTableWizard.tsx:163     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} DROP COLUMN ${q(col._original?.name ?? col.name)};\`)`                                                                                                  |
-| src/components/DbTools/AlterTableWizard.tsx:168     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${q(orig.name)} TYPE ${col.dataType};\`)`                                                                                                  |
-| src/components/DbTools/AlterTableWizard.tsx:170     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${q(col.name)} ${col.nullable ? 'DROP' : 'SET'} NOT NULL;\`)`                                                                              |
-| src/components/DbTools/AlterTableWizard.tsx:173     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${q(col.name)} SET DEFAULT '${col.defaultValue.replace(/'/g, "''")}';\`)`                                                                  |
-| src/components/DbTools/AlterTableWizard.tsx:175     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${q(col.name)} DROP DEFAULT;\`)`                                                                                                           |
-| src/components/DbTools/AlterTableWizard.tsx:178     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} RENAME COLUMN ${q(orig.name)} TO ${q(col.name)};\`)`                                                                                                    |
-| src/components/DbTools/AlterTableWizard.tsx:218     | DDL/DCL 生成                      | connType, duckdb guard, mysql guard, sqlite guard                         | `return \`ALTER TABLE ${tref}\n${parts.join(',\n')};\``                                                                                                                                   |
-| src/components/DbTools/AlterTableWizard.tsx:283     | DDL/DCL 生成, MySQL SHOW 语句       | connType                                                                  | `const res = await invoke<R>('execute_query', { id: connectionId, sql: \`SHOW CREATE TABLE ${tref}\` })`                                                                                  |
+| src/components/DbTools/AlterTableWizard.tsx:55      | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ADD COLUMN ${q(col.name)} ${col.dataType || 'VARCHAR'}${nullStr}${defStr};\`)`                                                                          |
+| src/components/DbTools/AlterTableWizard.tsx:57      | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} DROP COLUMN ${q(col._original?.name ?? col.name)};\`)`                                                                                                  |
+| src/components/DbTools/AlterTableWizard.tsx:66      | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} RENAME COLUMN ${q(orig.name)} TO ${q(col.name)};\`)`                                                                                                    |
+| src/components/DbTools/AlterTableWizard.tsx:69      | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${q(col.name)} TYPE ${col.dataType};\`)`                                                                                                   |
+| src/components/DbTools/AlterTableWizard.tsx:78      | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${q(col.name)} SET DEFAULT '${col.defaultValue.replace(/'/g, "''")}';\`)`                                                                  |
+| src/components/DbTools/AlterTableWizard.tsx:80      | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${q(col.name)} DROP DEFAULT;\`)`                                                                                                           |
+| src/components/DbTools/AlterTableWizard.tsx:101     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} DROP COLUMN ${q(col._original?.name ?? col.name)};\`)`                                                                                                  |
+| src/components/DbTools/AlterTableWizard.tsx:106     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${q(orig.name)} ${type}${col.nullable ? ' NULL' : ' NOT NULL'};\`)`                                                                        |
+| src/components/DbTools/AlterTableWizard.tsx:108     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ADD DEFAULT ${lit(col.defaultValue)} FOR ${q(orig.name)};\`)`                                                                                           |
+| src/components/DbTools/AlterTableWizard.tsx:127     | DDL/DCL 生成                      | connType, qid                                                             | `stmts.push(\`ALTER TABLE ${tref} ADD (${inner});\`)`                                                                                                                                     |
+| src/components/DbTools/AlterTableWizard.tsx:129     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} DROP COLUMN ${q(col._original?.name ?? col.name)};\`)`                                                                                                  |
+| src/components/DbTools/AlterTableWizard.tsx:136     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `if (mod.length) stmts.push(\`ALTER TABLE ${tref} MODIFY (${q(orig.name)} ${mod.join(' ')});\`)`                                                                                          |
+| src/components/DbTools/AlterTableWizard.tsx:140     | DDL/DCL 生成                      | connType, qid                                                             | `stmts.push(\`ALTER TABLE ${tref} RENAME COLUMN ${q(orig.name)} TO ${q(col.name)};\`)`                                                                                                    |
+| src/components/DbTools/AlterTableWizard.tsx:163     | DDL/DCL 生成                      | pg guard                                                                  | `stmts.push(\`ALTER TABLE ${tref} ADD COLUMN ${def};\`)`                                                                                                                                  |
+| src/components/DbTools/AlterTableWizard.tsx:165     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} DROP COLUMN ${q(col._original?.name ?? col.name)};\`)`                                                                                                  |
+| src/components/DbTools/AlterTableWizard.tsx:170     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${q(orig.name)} TYPE ${col.dataType};\`)`                                                                                                  |
+| src/components/DbTools/AlterTableWizard.tsx:172     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${q(orig.name)} ${col.nullable ? 'DROP' : 'SET'} NOT NULL;\`)`                                                                             |
+| src/components/DbTools/AlterTableWizard.tsx:175     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${q(orig.name)} SET DEFAULT '${col.defaultValue.replace(/'/g, "''")}';\`)`                                                                 |
+| src/components/DbTools/AlterTableWizard.tsx:177     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${q(orig.name)} DROP DEFAULT;\`)`                                                                                                          |
+| src/components/DbTools/AlterTableWizard.tsx:180     | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `stmts.push(\`ALTER TABLE ${tref} RENAME COLUMN ${q(orig.name)} TO ${q(col.name)};\`)`                                                                                                    |
+| src/components/DbTools/AlterTableWizard.tsx:212     | DDL/DCL 生成                      | connType, duckdb guard, sqlite guard                                      | `return \`ALTER TABLE ${tref}\n${parts.join(',\n')};\``                                                                                                                                   |
+| src/components/DbTools/AlterTableWizard.tsx:285     | DDL/DCL 生成, MySQL SHOW 语句       | connType                                                                  | `const res = await invoke<R>('execute_query', { id: connectionId, sql: \`SHOW CREATE TABLE ${tref}\` })`                                                                                  |
 | src/components/DbTools/BinlogFlashbackPanel.tsx:92  | MySQL SHOW 语句                   | 未检测到明显方言守卫                                                                | `const res = await invoke<R>('execute_query', { id: connectionId, sql: 'SHOW BINARY LOGS' })`                                                                                             |
 | src/components/DbTools/BinlogFlashbackPanel.tsx:112 | MySQL SHOW 语句                   | 未检测到明显方言守卫                                                                | `let sql = \`SHOW BINLOG EVENTS IN '${selectedLog.replace(/'/g, "''")}'\``                                                                                                                |
 | src/components/DbTools/CreateDatabaseDialog.tsx:48  | MySQL SHOW 语句                   | mysql guard                                                               | `sql: \`SHOW COLLATION WHERE Charset = '${charset.replace(/'/g, "''")}'\`,`                                                                                                               |
-| src/components/DbTools/CreateTableWizard.tsx:345    | DDL/DCL 生成                      | qid, shared dialect helper                                                | `for (const o of origCols) if (!curIds.has(o._id)) clauses.push(\` DROP COLUMN ${qid(ct, o.name.trim())}\`)`                                                                              |
-| src/components/DbTools/CreateTableWizard.tsx:366    | DDL/DCL 生成                      | qid                                                                       | `return \`ALTER TABLE ${tref}\n${clauses.join(',\n')};\``                                                                                                                                 |
-| src/components/DbTools/CreateTableWizard.tsx:371    | DDL/DCL 生成                      | qid, sqlite guard                                                         | `for (const o of origCols) if (!curIds.has(o._id)) stmts.push(\`ALTER TABLE ${tref} DROP COLUMN ${qid(ct, o.name.trim())};\`)`                                                            |
-| src/components/DbTools/CreateTableWizard.tsx:374    | DDL/DCL 生成                      | qid, sqlite guard                                                         | `if (!orig) { stmts.push(\`ALTER TABLE ${tref} ADD COLUMN ${columnDef(c, ct)};\`); continue }`                                                                                            |
-| src/components/DbTools/CreateTableWizard.tsx:376    | DDL/DCL 生成                      | qid, sqlite guard                                                         | `stmts.push(\`ALTER TABLE ${tref} RENAME COLUMN ${qid(ct, orig.name.trim())} TO ${qid(ct, c.name.trim())};\`)`                                                                            |
-| src/components/DbTools/CreateTableWizard.tsx:380    | DDL/DCL 生成                      | capability guard, qid, sqlite guard                                       | `else stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${qid(ct, c.name.trim())} TYPE ${colType(c, ct)};\`)`                                                                                 |
-| src/components/DbTools/CreateTableWizard.tsx:383    | DDL/DCL 生成                      | capability guard, qid, sqlite guard                                       | `stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${qid(ct, c.name.trim())} ${c.nullable ? 'DROP NOT NULL' : 'SET NOT NULL'};\`)`                                                            |
-| src/components/DbTools/CreateTableWizard.tsx:432    | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `postIdx.push(\`CREATE ${idx.unique ? 'UNIQUE ' : ''}INDEX ${q(idxName)} ON ${tref}${using} (${idxCols.map(q).join(', ')});\`)`                                                           |
-| src/components/DbTools/CreateTableWizard.tsx:448    | DDL/DCL 生成                      | capability guard                                                          | `let sql = \`CREATE TABLE ${tref} (\n${lines.join(',\n')}\n)\``                                                                                                                           |
-| src/components/DbTools/CreateTableWizard.tsx:532    | MySQL SHOW 语句                   | mysql guard                                                               | `const cs = await invoke<Rows>('execute_query', { id: connectionId, sql: 'SHOW CHARACTER SET' })`                                                                                         |
-| src/components/DbTools/CreateTableWizard.tsx:537    | MySQL SHOW 语句                   | 未检测到明显方言守卫                                                                | `const eg = await invoke<Rows>('execute_query', { id: connectionId, sql: 'SHOW ENGINES' })`                                                                                               |
-| src/components/DbTools/CreateTableWizard.tsx:641    | MySQL SHOW 语句                   | mysql guard                                                               | `sql: \`SHOW COLLATION WHERE Charset = '${charset.replace(/'/g, "''")}'\`,`                                                                                                               |
+| src/components/DbTools/CreateTableWizard.tsx:351    | DDL/DCL 生成                      | qid                                                                       | `for (const o of origCols) if (!curIds.has(o._id)) clauses.push(\` DROP COLUMN ${qid(ct, o.name.trim())}\`)`                                                                              |
+| src/components/DbTools/CreateTableWizard.tsx:380    | DDL/DCL 生成                      | qid                                                                       | `return \`ALTER TABLE ${tref}\n${clauses.join(',\n')};\``                                                                                                                                 |
+| src/components/DbTools/CreateTableWizard.tsx:385    | DDL/DCL 生成                      | qid, sqlite guard                                                         | `for (const o of origCols) if (!curIds.has(o._id)) stmts.push(\`ALTER TABLE ${tref} DROP COLUMN ${qid(ct, o.name.trim())};\`)`                                                            |
+| src/components/DbTools/CreateTableWizard.tsx:388    | DDL/DCL 生成                      | qid, sqlite guard                                                         | `if (!orig) { stmts.push(\`ALTER TABLE ${tref} ADD COLUMN ${columnDef(c, ct)};\`); continue }`                                                                                            |
+| src/components/DbTools/CreateTableWizard.tsx:390    | DDL/DCL 生成                      | qid, sqlite guard                                                         | `stmts.push(\`ALTER TABLE ${tref} RENAME COLUMN ${qid(ct, orig.name.trim())} TO ${qid(ct, c.name.trim())};\`)`                                                                            |
+| src/components/DbTools/CreateTableWizard.tsx:394    | DDL/DCL 生成                      | capability guard, qid, sqlite guard                                       | `else stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${qid(ct, c.name.trim())} TYPE ${colType(c, ct)};\`)`                                                                                 |
+| src/components/DbTools/CreateTableWizard.tsx:397    | DDL/DCL 生成                      | capability guard, qid, sqlite guard                                       | `stmts.push(\`ALTER TABLE ${tref} ALTER COLUMN ${qid(ct, c.name.trim())} ${c.nullable ? 'DROP NOT NULL' : 'SET NOT NULL'};\`)`                                                            |
+| src/components/DbTools/CreateTableWizard.tsx:447    | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `postIdx.push(\`CREATE ${idx.unique ? 'UNIQUE ' : ''}INDEX ${q(idxName)} ON ${tref}${using} (${idxCols.map(q).join(', ')});\`)`                                                           |
+| src/components/DbTools/CreateTableWizard.tsx:463    | DDL/DCL 生成                      | capability guard                                                          | `let sql = \`CREATE TABLE ${tref} (\n${lines.join(',\n')}\n)\``                                                                                                                           |
+| src/components/DbTools/CreateTableWizard.tsx:550    | MySQL SHOW 语句                   | mysql guard                                                               | `const cs = await invoke<Rows>('execute_query', { id: connectionId, sql: 'SHOW CHARACTER SET' })`                                                                                         |
+| src/components/DbTools/CreateTableWizard.tsx:555    | MySQL SHOW 语句                   | 未检测到明显方言守卫                                                                | `const eg = await invoke<Rows>('execute_query', { id: connectionId, sql: 'SHOW ENGINES' })`                                                                                               |
+| src/components/DbTools/CreateTableWizard.tsx:663    | MySQL SHOW 语句                   | mysql guard                                                               | `sql: \`SHOW COLLATION WHERE Charset = '${charset.replace(/'/g, "''")}'\`,`                                                                                                               |
 | src/components/DbTools/DashboardPanel.tsx:111       | MySQL SHOW 语句                   | 未检测到明显方言守卫                                                                | `id: connId, sql: "SHOW GLOBAL STATUS LIKE 'Threadpool%'",`                                                                                                                               |
 | src/components/DbTools/DataCleanPanel.tsx:61        | 硬编码反引号标识符                       | connType, duckdb guard, mysql guard, pg guard, qid, sqlite guard          | `return \`-- MySQL 去重（将 \\`id\\` 替换为实际主键列名）\nDELETE FROM ${t}\nWHERE ${qid(connType, 'id')} NOT IN (\n SELECT * FROM (\n SELECT MIN(${qid(connType, 'id')}) FROM ${t} GROUP BY ${col}\n ` |
 | src/components/DbTools/DataCleanPanel.tsx:65        | DML 生成                          | connType, mysql guard, pg guard, qid, sqlite guard                        | `return \`UPDATE ${t}\nSET ${col} = ${quote(replaceVal)}\nWHERE ${col} = ${quote(findVal)};\``                                                                                            |
 | src/components/DbTools/DataCleanPanel.tsx:70        | DML 生成                          | connType, mysql guard, sqlite guard                                       | `return \`UPDATE ${t}\nSET ${col} = ${quote(fillVal)}\nWHERE ${col} IS NULL${emptyCheck};\``                                                                                              |
-| src/components/DbTools/DataDiffPanel.tsx:75         | DML 生成                          | connType, qid, shared dialect helper                                      | `lines.push(\`INSERT INTO ${tbl} (${cols}) VALUES (${vals});\`)`                                                                                                                          |
-| src/components/DbTools/DataDiffPanel.tsx:81         | DML 生成                          | 未检测到明显方言守卫                                                                | `lines.push(\`DELETE FROM ${tbl} WHERE ${where};\`)`                                                                                                                                      |
-| src/components/DbTools/DataDiffPanel.tsx:92         | DML 生成                          | 未检测到明显方言守卫                                                                | `lines.push(\`UPDATE ${tbl} SET ${set} WHERE ${where};\`)`                                                                                                                                |
 | src/components/DbTools/DbaTemplatesPanel.tsx:25     | 分页语法                            | duckdb guard, oracle guard, sqlite guard                                  | `sql: \`PREPARE stmt FROM 'SELECT 1 LIMIT 1';`                                                                                                                                            |
 | src/components/DbTools/DbaTemplatesPanel.tsx:175    | MySQL SHOW 语句                   | 未检测到明显方言守卫                                                                | `sql: \`SHOW GLOBAL STATUS LIKE 'Threads_connected';`                                                                                                                                     |
 | src/components/DbTools/DbaTemplatesPanel.tsx:383    | MySQL SHOW 语句                   | 未检测到明显方言守卫                                                                | `sql: \`SHOW GLOBAL STATUS WHERE Variable_name IN (`                                                                                                                                      |
@@ -237,12 +232,11 @@
 | src/components/DbTools/ReplicationPanel.tsx:82      | MySQL SHOW 语句                   | 未检测到明显方言守卫                                                                | `sql: 'SHOW ALL SLAVES STATUS',`                                                                                                                                                          |
 | src/components/DbTools/SequencePanel.tsx:137        | DDL/DCL 生成, DML 生成              | 未检测到明显方言守卫                                                                | `const sql = \`CREATE OR REPLACE SEQUENCE ${seqRef(name.trim())} START WITH ${start.trim()} INCREMENT BY ${increment.trim()} MINVALUE ${minVal.trim()} MAXVALUE ${maxVal.trim()}${cycl`   |
 | src/components/DbTools/SequencePanel.tsx:163        | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `sql: \`DROP SEQUENCE ${seqRef(seqName)}\`,`                                                                                                                                              |
-| src/components/DbTools/TableBrowser.tsx:410         | SQLite/DuckDB PRAGMA, 硬编码双引号标识符 | connType, sqlite guard                                                    | `sql: \`PRAGMA table_info("${table.replace(/"/g, '""')}")\`,`                                                                                                                             |
-| src/components/DbTools/TableBrowser.tsx:654         | DML 生成                          | 未检测到明显方言守卫                                                                | `const sql = \`INSERT INTO ${tableRef} (${entries.map(([c]) => q(c)).join(', ')}) VALUES (${entries.map(([, v]) => sqlLiteral(v)).join(', ')})\``                                         |
-| src/components/DbTools/TableBrowser.tsx:751         | DML 生成                          | 未检测到明显方言守卫                                                                | `return \`INSERT INTO ${tableRef} (${cols}) VALUES (${vals});\``                                                                                                                          |
-| src/components/DbTools/TableBrowser.tsx:831         | MySQL SHOW 语句                   | connType, mysql guard, oracle guard, pg guard                             | `sql = \`SHOW FULL COLUMNS FROM ${tableRef}\``                                                                                                                                            |
-| src/components/DbTools/TableBrowser.tsx:843         | SQLite/DuckDB PRAGMA, 硬编码双引号标识符 | connType, duckdb guard, mssql guard, oracle guard, sqlite guard           | `sql = \`PRAGMA table_info("${table.replace(/"/g, '""')}")\``                                                                                                                             |
-| src/components/DbTools/TableBrowser.tsx:916         | DDL/DCL 生成, DML 生成              | connType, sqlite guard                                                    | `const clearSql = isSqlite(connType) ? \`DELETE FROM ${tableRef};\` : \`TRUNCATE TABLE ${tableRef};\``                                                                                    |
+| src/components/DbTools/TableBrowser.tsx:453         | SQLite/DuckDB PRAGMA, 硬编码双引号标识符 | connType, sqlite guard                                                    | `sql: \`PRAGMA table_xinfo("${table.replace(/"/g, '""')}")\`,`                                                                                                                            |
+| src/components/DbTools/TableBrowser.tsx:853         | DML 生成                          | 未检测到明显方言守卫                                                                | `return \`INSERT INTO ${tableRef} (${cols}) VALUES (${vals});\``                                                                                                                          |
+| src/components/DbTools/TableBrowser.tsx:935         | MySQL SHOW 语句                   | connType, mysql guard, oracle guard, pg guard                             | `sql = \`SHOW FULL COLUMNS FROM ${tableRef}\``                                                                                                                                            |
+| src/components/DbTools/TableBrowser.tsx:947         | SQLite/DuckDB PRAGMA, 硬编码双引号标识符 | connType, duckdb guard, mssql guard, oracle guard, sqlite guard           | `sql = \`PRAGMA table_info("${table.replace(/"/g, '""')}")\``                                                                                                                             |
+| src/components/DbTools/TableBrowser.tsx:1021        | DDL/DCL 生成, DML 生成              | connType, sqlite guard                                                    | `const clearSql = isSqlite(connType) ? \`DELETE FROM ${tableRef};\` : \`TRUNCATE TABLE ${tableRef};\``                                                                                    |
 | src/components/DbTools/TestDataGenPanel.tsx:94      | DML 生成                          | connType, qid                                                             | `return \`INSERT INTO ${t} (${colList})\nVALUES\n ${rows.join(',\n ')};\``                                                                                                                |
 | src/components/DbTools/TidbPanel.tsx:180            | MySQL SHOW 语句                   | 未检测到明显方言守卫                                                                | `const varRes = await q(\`SHOW VARIABLES LIKE 'tidb_%gc%'\`)`                                                                                                                             |
 | src/components/DbTools/TimeravelPanel.tsx:121       | DML 生成                          | 未检测到明显方言守卫                                                                | `const deleteSql = \`DELETE HISTORY FROM ${tableRef} BEFORE SYSTEM_TIME TIMESTAMP '${deleteBeforeTs}'\``                                                                                  |
@@ -255,13 +249,13 @@
 | src/components/SchemaBrowser/index.tsx:507          | DDL/DCL 生成                      | 未检测到明显方言守卫                                                                | `await invoke('execute_query', { id: connectionId, sql: \`DROP PROCEDURE ${tref(name)};\` })`                                                                                             |
 | src/components/SchemaBrowser/index.tsx:776          | MySQL SHOW 语句                   | capability guard, connType                                                | `id: connectionId, sql: \`SHOW FULL COLUMNS FROM ${tref(tableName)}\`,`                                                                                                                   |
 | src/components/SchemaBrowser/index.tsx:1329         | DDL/DCL 生成, MySQL SHOW 语句       | capability guard, connType                                                | `<button onClick={() => { fillQuery(\`SHOW CREATE ${rkind} ${localRef(name)};\`); closeMenu() }}>`                                                                                        |
-| src/components/SqlEditor/index.tsx:1470             | SQLite/DuckDB PRAGMA            | connType, duckdb guard, sqlite guard                                      | `const uvBefore = await inv<QueryResult>('execute_query', { id: connectionId, sql: 'PRAGMA user_version' })`                                                                              |
-| src/components/SqlEditor/index.tsx:1568             | SQLite/DuckDB PRAGMA            | connType, duckdb guard, sqlite guard                                      | `const uvRow = await inv2<QueryResult>('execute_query', { id: connectionId, sql: 'PRAGMA user_version' })`                                                                                |
-| src/components/SqlEditor/ObjectEditor.tsx:390       | DDL/DCL 生成                      | connType, sqlite guard                                                    | `await invoke('execute_query', { id: connectionId, sql: \`DROP VIEW IF EXISTS "${viewName.replace(/"/g, '""')}"\` })`                                                                     |
-| src/components/SqlEditor/ObjectEditor.tsx:553       | 分页语法                            | connType, dialectFamily, mssql guard, oracle guard, shared dialect helper | `const sql = fam === 'mssql' ? \`SELECT TOP 100 * FROM ${ref};\``                                                                                                                         |
-| src/components/SqlEditor/ResultTable.tsx:243        | DML 生成                          | connType, qid, shared dialect helper                                      | `return \`INSERT INTO ${tref} (${cols}) VALUES (${vals});\``                                                                                                                              |
-| src/components/SqlEditor/ResultTable.tsx:249        | DML 生成                          | connType, qid                                                             | `return \`DELETE FROM ${tref} WHERE ${where};\``                                                                                                                                          |
-| src/components/SqlEditor/ResultTable.tsx:255        | DML 生成                          | connType, qid                                                             | `return \`UPDATE ${tref} SET ${qid(connType, columns[change.col])}=${sqlLiteral(change.newVal)} WHERE ${where};\``                                                                        |
+| src/components/SqlEditor/index.tsx:1511             | SQLite/DuckDB PRAGMA            | connType, duckdb guard, sqlite guard                                      | `const uvBefore = await inv<QueryResult>('execute_query', { id: connectionId, sql: 'PRAGMA user_version' })`                                                                              |
+| src/components/SqlEditor/index.tsx:1624             | SQLite/DuckDB PRAGMA            | connType, duckdb guard, sqlite guard                                      | `const uvRow = await inv2<QueryResult>('execute_query', { id: connectionId, sql: 'PRAGMA user_version' })`                                                                                |
+| src/components/SqlEditor/ObjectEditor.tsx:536       | 分页语法                            | connType, dialectFamily, mssql guard, oracle guard, shared dialect helper | `const sql = fam === 'mssql' ? \`SELECT TOP 100 * FROM ${ref};\``                                                                                                                         |
+| src/components/SqlEditor/ResultTable.tsx:261        | DML 生成                          | connType, qid, shared dialect helper                                      | `return \`INSERT INTO ${tref} (${cols}) VALUES (${vals});\``                                                                                                                              |
+| src/components/SqlEditor/ResultTable.tsx:267        | DML 生成                          | connType, qid                                                             | `return \`DELETE FROM ${tref} WHERE ${where};\``                                                                                                                                          |
+| src/components/SqlEditor/ResultTable.tsx:273        | DML 生成                          | connType, qid                                                             | `return \`UPDATE ${tref} SET ${qid(connType, columns[change.col])}=${sqlLiteral(change.newVal)} WHERE ${where};\``                                                                        |
+| src/components/SqlEditor/rollbackSql.ts:49          | DML 生成                          | connType, qid                                                             | `return \`UPDATE ${table} SET ${sets.join(', ')} WHERE ${where.join(' AND ')};\``                                                                                                         |
 
 ## 前端 DB 命令清单
 
@@ -281,6 +275,7 @@
 - `db_dba_query`
 - `db_delete_rows`
 - `db_diff_data`
+- `db_diff_schema_snapshot`
 - `db_diff_structure`
 - `db_drop_database`
 - `db_drop_routine`
@@ -292,6 +287,7 @@
 - `db_fulltext_search`
 - `db_health_check`
 - `db_import_csv`
+- `db_insert_drafts`
 - `db_insert_rows`
 - `db_instance_info`
 - `db_instance_metrics`
@@ -315,6 +311,7 @@
 - `db_truncate_table`
 - `db_tx_status`
 - `db_verify_migration`
+- `duckdb_alter_table_atomic`
 - `duckdb_attach`
 - `duckdb_checkpoint`
 - `duckdb_conn_info`
@@ -511,6 +508,7 @@
 - `table_columns`
 - `tidb_ticdc_changefeeds`
 - `update_cell`
+- `update_cells`
 - `write_local_bytes`
 - `write_local_file`
 
@@ -521,6 +519,7 @@
 - `db_call_procedure`
 - `db_cleanup_export_workspace`
 - `db_cleanup_stale_tx`
+- `db_diff_database_definition`
 - `db_drop_partition`
 - `db_exec_in_tx`
 - `db_export_schema`

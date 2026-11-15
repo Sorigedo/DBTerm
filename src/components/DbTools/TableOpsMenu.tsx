@@ -6,6 +6,7 @@ import {
 } from 'lucide-react'
 import { queueTableExport } from '../../utils/exportTasks'
 import { toast } from '../../stores/toastStore'
+import { isMysqlFamily } from '../../utils/sqlDialect'
 
 interface Props {
   connectionId: string
@@ -42,7 +43,7 @@ const EXPORT_FORMATS: FormatOption[] = [
 ]
 
 export default function TableOpsMenu({
-  connectionId, connType: _connType, schema, table, position, onClose, onDone,
+  connectionId, connType, schema, table, position, onClose, onDone,
 }: Props) {
   const [dialog, setDialog]           = useState<Dialog>(null)
   const [confirmName, setConfirmName] = useState('')
@@ -134,7 +135,7 @@ export default function TableOpsMenu({
   }
 
   async function runCopy() {
-    if (!copyName.trim() || busy) return
+    if (!isMysqlFamily(connType) || !copyName.trim() || busy) return
     setBusy(true)
     setOpError('')
     try {
@@ -205,10 +206,10 @@ export default function TableOpsMenu({
         <Pencil size={13} className="tops-item__icon" />
         重命名
       </button>
-      <button className="tops-item" onClick={() => openDialog('copy')}>
+      {isMysqlFamily(connType) && <button className="tops-item" onClick={() => openDialog('copy')}>
         <Copy size={13} className="tops-item__icon" />
         复制表
-      </button>
+      </button>}
 
       <div className="tops-sep" />
 

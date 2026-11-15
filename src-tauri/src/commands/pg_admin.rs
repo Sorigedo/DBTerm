@@ -1,6 +1,84 @@
 //! PostgreSQL 专属管理命令（pg_* 前缀，不污染 MySQL/SQLite 共享函数）
 //! 可选增强：pgvector 列探测 / EXPLAIN JSON / 索引类型顾问 / PgBouncer 检测
 
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+    use std::time::Duration;
+    #[tokio::test]
+    async fn pg_admin_malformed_extra_rejects_before_direct_connection(){
+        for raw in ["{\"sshTunnel\":true,\"sshPort\":\"invalid\"}","{\"sshTunnel\":true,\"sshPassword\":42}","{","[]","null"]{
+            let mut cfg=config(1,false,serde_json::json!({}));cfg.extra_json=Some(raw.into());
+            let error=match pg_connect(&cfg,None).await{Err(error)=>error,Ok(_)=>panic!("malformed configuration connected")};
+            assert_eq!(error,"数据库管理连接配置格式错误，已拒绝连接；请检查连接设置","malformed configuration must never fall back to direct connection");
+        }
+    }
+    #[test]
+    fn pg_admin_valid_minimal_extra_preserves_defaults_and_tunnel(){
+        for raw in [None,Some(""),Some("  "),Some("{}")]{let mut c=config(1,false,serde_json::json!({}));c.extra_json=raw.map(str::to_string);let parsed=PgConnCfg::from_config(&c).unwrap();assert!(!parsed.ssh_tunnel);assert!(parsed.ssl_mode.is_empty());}
+        let c=config(1,false,serde_json::json!({"sshTunnel":true,"sshPort":22,"sshPassword":"fixture"}));let parsed=PgConnCfg::from_config(&c).unwrap();assert!(parsed.ssh_tunnel);assert_eq!(parsed.ssh_port,22);assert!(parsed.ssh_password=="fixture");
+    }
+    #[test]
+    fn pg_admin_tunnel_restores_persisted_credential_at_construction(){
+        let cfg=PgConnCfg{ssh_host:"fixture-jump".into(),ssh_port:2222,ssh_user:"fixture-user".into(),ssh_auth_type:"password".into(),..Default::default()};
+        let tunnel=cfg.tunnel_config_with("fixture-db",|key|{assert_eq!(key,"fixture-db::ssh-tunnel");Ok(Some("saved-fixture-secret".into()))}).unwrap();
+        assert!(tunnel.password=="saved-fixture-secret","saved tunnel credential missing");
+        assert_eq!(tunnel.host,"fixture-jump");assert_eq!(tunnel.port,2222);assert_eq!(tunnel.user,"fixture-user");assert_eq!(tunnel.auth_type,"password");
+    }
+    #[test]
+    fn pg_admin_tunnel_legacy_credential_wins_without_lookup(){
+        let cfg=PgConnCfg{ssh_password:"legacy-fixture-secret".into(),..Default::default()};
+        let tunnel=cfg.tunnel_config_with("fixture-db",|_|panic!("explicit legacy password must bypass lookup")).unwrap();assert!(tunnel.password=="legacy-fixture-secret");
+    }
+    #[test]
+    fn pg_admin_tunnel_missing_saved_credential_allows_key_auth(){
+        let cfg=PgConnCfg{ssh_auth_type:"key".into(),ssh_key_path:"fixture-key".into(),..Default::default()};
+        let tunnel=cfg.tunnel_config_with("fixture-db",|_|Ok(None)).unwrap();assert!(tunnel.password.is_empty());assert_eq!(tunnel.key_path,"fixture-key");
+    }
+    #[test]
+    fn pg_admin_tunnel_credential_lookup_failure_is_not_empty_password(){
+        let cfg=PgConnCfg{ssh_auth_type:"password".into(),..Default::default()};
+        let result=cfg.tunnel_config_with("fixture-db",|_|Err("fixture credential store unavailable".into()));assert!(result.is_err(),"credential lookup failure must not attempt empty authentication");
+    }
+    #[test]
+    fn pg_admin_tunnel_agent_and_none_never_read_unused_credentials(){
+        for auth in ["agent","none"]{let cfg=PgConnCfg{ssh_auth_type:auth.into(),..Default::default()};let tunnel=cfg.tunnel_config_with("fixture-db",|_|panic!("unused credential lookup must be bypassed")).unwrap();assert!(tunnel.password.is_empty());}
+    }
+    fn config(port:u16,use_ssl:bool,extra:serde_json::Value)->ConnConfig {
+        serde_json::from_value(serde_json::json!({"id":"pg-admin-tls-test","name":"test","type":"postgres","host":"127.0.0.1","port":port,"username":"postgres","database":"postgres","useSsl":use_ssl,"extraJson":extra.to_string(),"createdAt":0,"updatedAt":0})).unwrap()
+    }
+    #[tokio::test]
+    async fn pg_admin_unknown_tls_rejects_before_tunnel_or_network(){
+        let cfg=config(1,false,serde_json::json!({"sslMode":"unrecognized","sshTunnel":true,"sshHost":"127.0.0.1","sshPort":1,"sshUser":"unused","sshAuthType":"password"}));
+        let error=match pg_connect(&cfg,None).await{Err(error)=>error,Ok(_)=>panic!("unknown TLS policy connected")};
+        assert!(error.contains("未知 TLS 模式"),"policy must reject before attempting tunnel: {error}");
+    }
+    async fn set_ssl(admin:&mut sqlx::PgConnection,enabled:bool)->Result<(),sqlx::Error>{
+        sqlx::query(if enabled{"ALTER SYSTEM SET ssl='on'"}else{"ALTER SYSTEM SET ssl='off'"}).execute(&mut *admin).await?;
+        let _:bool=sqlx::query_scalar("SELECT pg_reload_conf()").fetch_one(&mut *admin).await?;
+        for _ in 0..100{let state:String=sqlx::query_scalar("SHOW ssl").fetch_one(&mut *admin).await?;if state==if enabled{"on"}else{"off"}{return Ok(())}tokio::time::sleep(Duration::from_millis(10)).await;}
+        Err(sqlx::Error::Protocol("fixture SSL reload timeout".into()))
+    }
+    #[tokio::test]
+    #[ignore="requires dedicated PostgreSQL17 TLS fixture DBTERM_TEST_PG_TLS_ROOT"]
+    async fn pg_admin_tls_policy_matches_query_connector(){
+        use sqlx::Connection;
+        static LOCK:tokio::sync::Mutex<()>=tokio::sync::Mutex::const_new(());let _guard=LOCK.lock().await;
+        let port:u16=std::env::var("DBTERM_TEST_PG_PORT").unwrap().parse().unwrap();let cert=std::env::var("DBTERM_TEST_PG_TLS_ROOT").unwrap();
+        let options=sqlx::postgres::PgConnectOptions::new().host("127.0.0.1").port(port).username("postgres").database("postgres").ssl_mode(sqlx::postgres::PgSslMode::Disable);let mut admin=sqlx::PgConnection::connect_with(&options).await.unwrap();
+        let expected=std::path::PathBuf::from(std::env::var("DBTERM_TEST_PG_DATA_DIR").expect("explicit disposable directory required")).canonicalize().unwrap();
+        assert!(expected.parent().unwrap().file_name().unwrap().to_string_lossy().starts_with("dbterm-isolated-databases-"));
+        let actual:String=sqlx::query_scalar("SHOW data_directory").fetch_one(&mut admin).await.unwrap();
+        assert_eq!(std::path::PathBuf::from(actual).canonicalize().unwrap(),expected,"refuse SSL mutation outside isolated fixture");
+        let unrelated=std::path::Path::new(&cert).parent().unwrap().join("unrelated.crt");
+        let disabled=set_ssl(&mut admin,false).await;let required=if disabled.is_ok(){Some(pg_connect(&config(port,true,serde_json::json!({})),None).await)}else{None};let restored=set_ssl(&mut admin,true).await;restored.unwrap();disabled.unwrap();
+        assert!(matches!(required,Some(Err(_))),"useSsl=true empty mode must refuse plaintext server");
+        let (mut plain,_)=pg_connect(&config(port,true,serde_json::json!({"sslMode":"disabled"})),None).await.unwrap();let encrypted:bool=sqlx::query_scalar("SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()").fetch_one(&mut plain).await.unwrap();assert!(!encrypted,"explicit disabled must remain plaintext");
+        let (mut verified,_)=pg_connect(&config(port,true,serde_json::json!({"sslMode":"verify-full","sslCa":cert})),None).await.unwrap();let encrypted:bool=sqlx::query_scalar("SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()").fetch_one(&mut verified).await.unwrap();assert!(encrypted);
+        let wrong=pg_connect(&config(port,true,serde_json::json!({"sslMode":"verify-full","sslCa":unrelated})),None).await;assert!(wrong.is_err(),"unrelated CA must be rejected");
+    }
+}
+
 use serde::{Deserialize, Serialize};
 use sqlx::{ConnectOptions, Row};
 use tauri::State;
@@ -27,10 +105,19 @@ struct PgConnCfg {
     #[serde(rename = "sshKeyPath",  default)] ssh_key_path: String,
 }
 impl PgConnCfg {
-    fn from_config(c: &ConnConfig) -> Self {
-        c.extra_json.as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default()
+    fn tunnel_config_with(&self,conn_id:&str,lookup:impl FnOnce(&str)->Result<Option<String>,String>)->Result<crate::db_tunnel::DbTunnelCfg,String>{
+        // save_connection removes legacy plaintext after persisting this exact key.
+        let password=if matches!(self.ssh_auth_type.as_str(),"agent"|"none"){String::new()}else if !self.ssh_password.is_empty(){self.ssh_password.clone()}else{
+            lookup(&format!("{conn_id}::ssh-tunnel")).map_err(|_|"读取数据库 SSH 隧道凭据失败，已拒绝连接；请检查凭据存储后重试".to_string())?.unwrap_or_default()
+        };
+        Ok(crate::db_tunnel::DbTunnelCfg{host:self.ssh_host.clone(),port:self.ssh_port,user:self.ssh_user.clone(),auth_type:self.ssh_auth_type.clone(),password,key_path:self.ssh_key_path.clone()})
+    }
+    fn from_config(c: &ConnConfig) -> Result<Self,String> {
+        let Some(raw)=c.extra_json.as_deref().filter(|s|!s.trim().is_empty())else{return Ok(Self::default())};
+        let error=||"数据库管理连接配置格式错误，已拒绝连接；请检查连接设置".to_string();
+        let value:serde_json::Value=serde_json::from_str(raw).map_err(|_|error())?;
+        if !value.is_object(){return Err(error())}
+        serde_json::from_value(value).map_err(|_|error())
     }
     fn timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
@@ -55,21 +142,18 @@ async fn pg_connect(
     config: &ConnConfig,
     password: Option<&str>,
 ) -> Result<(sqlx::PgConnection, Option<std::sync::Arc<crate::db_tunnel::DbTunnel>>), String> {
-    use sqlx::postgres::{PgConnectOptions, PgSslMode};
-    use crate::{db_tunnel::{DbTunnel, DbTunnelCfg}, tester::expand_home};
+    use sqlx::postgres::PgConnectOptions;
+    use crate::{db_tunnel::DbTunnel, tester::expand_home};
 
-    let cfg  = PgConnCfg::from_config(config);
+    let cfg  = PgConnCfg::from_config(config)?;
+    let tls_mode = super::query::pg_tls_mode(config, &cfg.ssl_mode)?;
     let user = config.username.as_deref().unwrap_or("postgres");
     let db   = config.database.as_deref().unwrap_or("postgres");
     let pwd  = password.unwrap_or("");
 
     let tunnel: Option<std::sync::Arc<DbTunnel>>;
     let (h, p) = if cfg.ssh_tunnel {
-        let tcfg = DbTunnelCfg {
-            host: cfg.ssh_host.clone(), port: cfg.ssh_port,
-            user: cfg.ssh_user.clone(), auth_type: cfg.ssh_auth_type.clone(),
-            password: cfg.ssh_password.clone(), key_path: cfg.ssh_key_path.clone(),
-        };
+        let tcfg = cfg.tunnel_config_with(&config.id,crate::keychain::get_password)?;
         let t = DbTunnel::open_shared(&config.id, &tcfg,
             config.host.as_deref().unwrap_or("127.0.0.1"),
             config.port.unwrap_or(5432)).await?;
@@ -83,12 +167,7 @@ async fn pg_connect(
 
     let mut opts = PgConnectOptions::new()
         .host(&h).port(p).username(user).password(pwd).database(db);
-    opts = opts.ssl_mode(match cfg.ssl_mode.as_str() {
-        "require"     => PgSslMode::Require,
-        "verify-ca"   => PgSslMode::VerifyCa,
-        "verify-full" => PgSslMode::VerifyFull,
-        _             => PgSslMode::Prefer,
-    });
+    opts = opts.ssl_mode(tls_mode);
     if !cfg.ssl_ca.is_empty()   { opts = opts.ssl_root_cert(expand_home(&cfg.ssl_ca)); }
     if !cfg.ssl_cert.is_empty() { opts = opts.ssl_client_cert(expand_home(&cfg.ssl_cert)); }
     if !cfg.ssl_key.is_empty()  { opts = opts.ssl_client_key(expand_home(&cfg.ssl_key)); }
@@ -306,7 +385,7 @@ pub struct PgExplainResult {
 }
 
 /// PG1.6+: EXPLAIN (ANALYZE, FORMAT JSON) 返回结构化计划（用于可视化/对比）
-/// 注意：ANALYZE 会实际执行语句，对 SELECT 安全，对 DML 请前端加确认
+/// ANALYZE 会实际执行一次查询；强制只读事务不能隔离用户函数的外部副作用。
 #[tauri::command]
 pub async fn pg_explain_json(
     id: String,
@@ -339,42 +418,7 @@ pub async fn pg_explain_json(
 
     let (mut conn, _tunnel) = pg_connect(&config, password.as_deref()).await?;
 
-    let explain_prefix = if analyze {
-        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)"
-    } else {
-        "EXPLAIN (FORMAT JSON)"
-    };
-    let explain_sql = format!("{explain_prefix} {trimmed}");
-
-    // 用事务包裹并强制 ROLLBACK：即便分析含写副作用的 CTE，也会被撤销（双保险）
-    use sqlx::Connection;
-    let mut tx = conn.begin().await.map_err(|e| format!("开启事务失败: {e}"))?;
-
-    // JSON 格式计划
-    let json_row = sqlx::query(&explain_sql)
-        .fetch_one(&mut *tx).await
-        .map_err(|e| format!("EXPLAIN 执行失败: {e}"))?;
-    let plan_json: String = json_row.try_get(0)
-        .map(|v: serde_json::Value| v.to_string())
-        .unwrap_or_else(|_| json_row.try_get::<String, _>(0).unwrap_or_default());
-
-    // 解析 planning_time / execution_time
-    let plan_value: serde_json::Value = serde_json::from_str(&plan_json).unwrap_or_default();
-    let planning_time_ms  = plan_value[0]["Planning Time"].as_f64().unwrap_or(0.0);
-    let execution_time_ms = plan_value[0]["Execution Time"].as_f64().unwrap_or(0.0);
-
-    // 文本格式计划（用于人类阅读）；同样在事务内执行，确保被 ROLLBACK
-    let text_format = if analyze { "ANALYZE, FORMAT TEXT" } else { "FORMAT TEXT" };
-    let text_sql = format!("EXPLAIN ({text_format}) {trimmed}");
-    let text_rows = sqlx::query(&text_sql).fetch_all(&mut *tx).await.unwrap_or_default();
-    let plan_text = text_rows.iter()
-        .filter_map(|r| r.try_get::<String, _>(0).ok())
-        .collect::<Vec<_>>().join("\n");
-
-    // 强制回滚：撤销 ANALYZE 可能产生的任何副作用
-    let _ = tx.rollback().await;
-
-    Ok(PgExplainResult { plan_json, plan_text, planning_time_ms, execution_time_ms })
+    super::pg_explain::run(&mut conn, trimmed, analyze).await
 }
 
 // ── 可选增强 PG0: PgBouncer / 连接池感知 ────────────────────────────────────

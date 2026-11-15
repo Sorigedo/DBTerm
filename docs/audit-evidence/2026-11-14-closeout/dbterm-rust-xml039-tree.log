@@ -1,0 +1,39 @@
+quick-xml v0.39.4
+└── plist v1.9.0
+    ├── tauri v2.11.2
+    │   ├── app v0.1.23 (/Users/Nico/workSpace/claude/DBterm/src-tauri)
+    │   ├── tauri-plugin-clipboard-manager v2.3.2
+    │   │   └── app v0.1.23 (/Users/Nico/workSpace/claude/DBterm/src-tauri)
+    │   ├── tauri-plugin-dialog v2.7.1
+    │   │   └── app v0.1.23 (/Users/Nico/workSpace/claude/DBterm/src-tauri)
+    │   ├── tauri-plugin-fs v2.5.1
+    │   │   └── tauri-plugin-dialog v2.7.1 (*)
+    │   └── tauri-plugin-log v2.8.0
+    │       └── app v0.1.23 (/Users/Nico/workSpace/claude/DBterm/src-tauri)
+    ├── tauri-codegen v2.6.2
+    │   └── tauri-macros v2.6.2 (proc-macro)
+    │       └── tauri v2.11.2 (*)
+    ├── tauri-plugin v2.6.2
+    │   [build-dependencies]
+    │   ├── tauri-plugin-clipboard-manager v2.3.2 (*)
+    │   ├── tauri-plugin-dialog v2.7.1 (*)
+    │   ├── tauri-plugin-fs v2.5.1 (*)
+    │   └── tauri-plugin-log v2.8.0 (*)
+    ├── tauri-utils v2.9.2
+    │   ├── tauri-build v2.6.2
+    │   │   [build-dependencies]
+    │   │   ├── app v0.1.23 (/Users/Nico/workSpace/claude/DBterm/src-tauri)
+    │   │   └── tauri v2.11.2 (*)
+    │   ├── tauri-codegen v2.6.2 (*)
+    │   ├── tauri-macros v2.6.2 (proc-macro) (*)
+    │   └── tauri-plugin v2.6.2 (*)
+    │   [build-dependencies]
+    │   ├── tauri v2.11.2 (*)
+    │   └── tauri-plugin-fs v2.5.1 (*)
+    └── tauri-utils v2.9.2
+        ├── tauri v2.11.2 (*)
+        ├── tauri-runtime v2.11.2
+        │   ├── tauri v2.11.2 (*)
+        │   └── tauri-runtime-wry v2.11.2
+        │       └── tauri v2.11.2 (*)
+        └── tauri-runtime-wry v2.11.2 (*)

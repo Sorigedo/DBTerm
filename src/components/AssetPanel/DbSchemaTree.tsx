@@ -24,7 +24,7 @@ import DataDictPanel from '../DbTools/DataDictPanel'
 import SearchableSelect from '../DbTools/SearchableSelect'
 import type { ConnType } from '../../types'
 import {
-  qid, tableRef, dialectFamily, isMysqlFamily,
+  qid, tableRef, dialectFamily, isMysqlFamily, sqlServerRename,
   supportsShowStatements, supportsMyMaintenance, supportsOptimizeTable, checkTableSql,
 } from '../../utils/sqlDialect'
 import { useAppStore } from '../../stores/appStore'
@@ -67,7 +67,7 @@ interface Props {
   objectFilter?: string
   /** 跨 schema/连接 粘贴时打开数据迁移向导（由上层渲染向导） */
   onMigrate?: (p: MigratePreset) => void
-  onOpenTable: (schema: string, table: string) => void
+  onOpenTable: (schema: string, table: string, ssSchema?: string) => void
 }
 
 type Cat = 'tables' | 'views' | 'functions' | 'procedures'
@@ -161,7 +161,7 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
   const [viewWizard, setViewWizard] = useState<string | null>(null)
   const [routineWizard, setRoutineWizard] = useState<{ schema: string; kind: 'function' | 'procedure' } | null>(null)
   // 修改表结构（复用建表设计器的编辑模式）
-  const [editTable, setEditTable] = useState<{ schema: string; table: string } | null>(null)
+  const [editTable, setEditTable] = useState<{ schema: string; table: string; ssSchema?: string } | null>(null)
   // 删除数据库强确认（需输入库名）
   const [dropDbTarget, setDropDbTarget] = useState<string | null>(null)
   const [dropDbInput, setDropDbInput]   = useState('')
@@ -176,21 +176,21 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
   const [createDbBusy, setCreateDbBusy]           = useState(false)
   const [createDbErr, setCreateDbErr]             = useState('')
   // 表信息弹窗
-  const [infoTarget, setInfoTarget] = useState<{ schema: string; table: string; isView: boolean } | null>(null)
+  const [infoTarget, setInfoTarget] = useState<{ schema: string; table: string; isView: boolean; ssSchema?: string } | null>(null)
   // 重命名表 / 视图
-  const [renameTarget, setRenameTarget] = useState<{ schema: string; table: string; isView: boolean } | null>(null)
+  const [renameTarget, setRenameTarget] = useState<{ schema: string; table: string; isView: boolean; ssSchema?: string } | null>(null)
   const [renameInput, setRenameInput]   = useState('')
   const [renameBusy, setRenameBusy]     = useState(false)
   const [renameErr, setRenameErr]       = useState('')
   // 清空 / 删除 表（视图）强确认（需输入表名）
   const [tblDanger, setTblDanger] = useState<{
-    kind: 'truncate' | 'drop'; schema: string; table: string; isView: boolean
+    kind: 'truncate' | 'drop'; schema: string; table: string; isView: boolean; ssSchema?: string
   } | null>(null)
   const [tblDangerInput, setTblDangerInput] = useState('')
   const [tblDangerBusy, setTblDangerBusy]   = useState(false)
   const [tblDangerErr, setTblDangerErr]     = useState('')
   const [ddlState, setDdlState]     = useState<{
-    schema: string; table: string; ddl: string; loading: boolean; error: string
+    schema: string; table: string; ssSchema?: string; requestId: number; ddl: string; loading: boolean; error: string
   } | null>(null)
   // 命令型操作（优化/分析/检查/统计行数）确认执行弹窗
   const [actionDlg, setActionDlg] = useState<{
@@ -805,14 +805,16 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
     } catch { /* 取消 */ }
   }
 
-  async function openDdl(schema: string, table: string) {
-    setDdlState({ schema, table, ddl: '', loading: true, error: '' })
+  const ddlRequestRef = useRef(0)
+  async function openDdl(schema: string, table: string, ssSchema?: string) {
+    const requestId = ++ddlRequestRef.current
+    setDdlState({ schema, table, ssSchema, requestId, ddl: '', loading: true, error: '' })
     try {
       const { invoke } = await import('@tauri-apps/api/core')
-      const ddl = await invoke<string>('get_table_ddl', { id: connectionId, schema, table })
-      setDdlState(d => d ? { ...d, ddl, loading: false } : null)
+      const ddl = await invoke<string>('get_table_ddl', { id: connectionId, schema, table, ssSchema })
+      setDdlState(d => d?.requestId === requestId ? { ...d, ddl, loading: false } : d)
     } catch (e) {
-      setDdlState(d => d ? { ...d, error: String(e), loading: false } : null)
+      setDdlState(d => d?.requestId === requestId ? { ...d, error: String(e), loading: false } : d)
     }
   }
 
@@ -883,7 +885,7 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
           if (tbl.isView && !isModEvent(e)) {
             openEditObject({ connectionId, connType, schema, objType: 'view', name: tbl.name })
           } else {
-            onOpenTable(schema, tbl.name)
+            onOpenTable(schema, tbl.name, ssSchema)
           }
         }}
         onContextMenu={e => onCtxMenu(e, schema, tbl.name, tbl.isView, ssSchema)}
@@ -1475,7 +1477,7 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
           style={{ position: 'fixed', top: ctxPos?.top ?? ctxMenu.y, left: ctxPos?.left ?? ctxMenu.x, visibility: ctxPos ? 'visible' : 'hidden' }}
         >
           {/* 数据 / 查询 区 */}
-          <button onMouseEnter={() => setSubOpen(null)} onClick={() => { onOpenTable(ctxMenu.schema, ctxMenu.table); closeMenu() }}
+          <button onMouseEnter={() => setSubOpen(null)} onClick={() => { onOpenTable(ctxMenu.schema, ctxMenu.table, ctxMenu.ssSchema); closeMenu() }}
             style={{ display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'space-between' }}>
             <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}><Table2 size={12} strokeWidth={1.8} />打开{ctxMenu.isView ? '视图' : '表'}数据</span>
             <span className="ctx-item__shortcut">{ctxMenu.isView ? `${modLabel()}-双击` : '双击'}</span>
@@ -1493,13 +1495,13 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
             <Terminal size={12} strokeWidth={1.8} />查询此{ctxMenu.isView ? '视图' : '表'}
           </button>
           <button onMouseEnter={() => setSubOpen(null)} onClick={() => {
-            setInfoTarget({ schema: ctxMenu.schema, table: ctxMenu.table, isView: ctxMenu.isView }); closeMenu()
+            setInfoTarget({ schema: ctxMenu.schema, table: ctxMenu.table, isView: ctxMenu.isView, ssSchema: ctxMenu.ssSchema }); closeMenu()
           }}>
             <Info size={12} strokeWidth={1.8} />表信息
           </button>
           <div className="db-ctx-menu__sep" />
           {/* 查看 / 复制 区 */}
-          <button onMouseEnter={() => setSubOpen(null)} onClick={() => { openDdl(ctxMenu.schema, ctxMenu.table); closeMenu() }}
+          <button onMouseEnter={() => setSubOpen(null)} onClick={() => { openDdl(ctxMenu.schema, ctxMenu.table, ctxMenu.ssSchema); closeMenu() }}
             style={{ display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'space-between' }}>
             <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}><Code2 size={12} strokeWidth={1.8} />查看 DDL</span>
             {sc('dbObjDdl') && <span className="ctx-item__shortcut">{sc('dbObjDdl')}</span>}
@@ -1526,7 +1528,7 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
           {/* 结构 区 */}
           {!ctxMenu.isView && (
             <button onMouseEnter={() => setSubOpen(null)} onClick={() => {
-              setEditTable({ schema: ctxMenu.schema, table: ctxMenu.table })
+              setEditTable({ schema: ctxMenu.schema, table: ctxMenu.table, ssSchema: ctxMenu.ssSchema })
               closeMenu()
             }} style={{ display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'space-between' }}>
               <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}><Settings2 size={12} strokeWidth={1.8} />修改表结构…</span>
@@ -1541,7 +1543,7 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
             </button>
           )}
           <button onMouseEnter={() => setSubOpen(null)} onClick={() => {
-            setRenameTarget({ schema: ctxMenu.schema, table: ctxMenu.table, isView: ctxMenu.isView })
+            setRenameTarget({ schema: ctxMenu.schema, table: ctxMenu.table, isView: ctxMenu.isView, ssSchema: ctxMenu.ssSchema })
             setRenameInput(ctxMenu.table); setRenameErr('')
             closeMenu()
           }} style={{ display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'space-between' }}>
@@ -1562,7 +1564,7 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
           <div className="db-ctx-menu__sep" />
           {!ctxMenu.isView && (
             <button className="db-ctx-menu__item--danger" onMouseEnter={() => setSubOpen(null)} onClick={() => {
-              setTblDanger({ kind: 'truncate', schema: ctxMenu.schema, table: ctxMenu.table, isView: false })
+              setTblDanger({ kind: 'truncate', schema: ctxMenu.schema, table: ctxMenu.table, isView: false, ssSchema: ctxMenu.ssSchema })
               setTblDangerInput(''); setTblDangerErr('')
               closeMenu()
             }}>
@@ -1570,7 +1572,7 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
             </button>
           )}
           <button className="db-ctx-menu__item--danger" onMouseEnter={() => setSubOpen(null)} onClick={() => {
-            setTblDanger({ kind: 'drop', schema: ctxMenu.schema, table: ctxMenu.table, isView: ctxMenu.isView })
+            setTblDanger({ kind: 'drop', schema: ctxMenu.schema, table: ctxMenu.table, isView: ctxMenu.isView, ssSchema: ctxMenu.ssSchema })
             setTblDangerInput(''); setTblDangerErr('')
             closeMenu()
           }}>
@@ -1853,7 +1855,7 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               <p style={{ margin: 0, fontSize: 13, color: 'var(--text-muted)' }}>
-                {renameTarget.schema} / <strong style={{ color: 'var(--text)' }}>{renameTarget.table}</strong>
+                {renameTarget.schema} / {renameTarget.ssSchema && <>{renameTarget.ssSchema} / </>}<strong style={{ color: 'var(--text)' }}>{renameTarget.table}</strong>
               </p>
               <input value={renameInput} autoFocus
                 autoComplete="off" autoCorrect="off" spellCheck={false}
@@ -1880,12 +1882,13 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
                           : connType === 'oracle'
                             ? `RENAME ${qid(connType, oldName)} TO ${qid(connType, newName)}`
                             : connType === 'sqlServer'
-                              ? `EXEC sp_rename '${renameTarget.schema}.${oldName.replace(/'/g, "''")}', '${newName.replace(/'/g, "''")}', 'OBJECT'`
+                              ? sqlServerRename(renameTarget.schema, oldName, newName, undefined, renameTarget.ssSchema)
                               : `ALTER TABLE ${fromRef} RENAME TO ${qid(connType, newName)}`
                         await invoke('execute_query', { id: connectionId, sql: renameSql })
                         const s = renameTarget.schema
                         setRenameTarget(null)
-                        doLoadTables(s)
+                        if (isSqlServer && renameTarget.ssSchema) doLoadSsTablesBySchema(s, renameTarget.ssSchema)
+                        else doLoadTables(s)
                         toast.success(`已重命名为 ${newName}`)
                       } catch (e) { setRenameErr(String(e)); toast.error(`重命名 ${oldName} 失败：${String(e)}`) }
                       finally { setRenameBusy(false) }
@@ -1917,7 +1920,7 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
                   : <>此操作将永久删除{tblDanger.isView ? '视图' : '表'} <strong style={{ color: 'var(--error)' }}>{tblDanger.table}</strong>{tblDanger.isView ? '' : ' 及其全部数据'}，无法恢复。</>}
               </p>
               <p style={{ margin: 0, fontSize: 13, color: 'var(--text-muted)' }}>
-                请输入名称 <strong>{tblDanger.table}</strong> 确认：
+                {tblDanger.schema} / {tblDanger.ssSchema && <>{tblDanger.ssSchema} / </>}请输入名称 <strong>{tblDanger.table}</strong> 确认：
               </p>
               <input value={tblDangerInput} onChange={e => setTblDangerInput(e.target.value)}
                 placeholder={tblDanger.table} autoFocus
@@ -1938,7 +1941,7 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
                       const tname = tblDanger.table
                       try {
                         const { invoke } = await import('@tauri-apps/api/core')
-                        const ref = tableRef(connType, tblDanger.schema, tblDanger.table)
+                        const ref = tableRef(connType, tblDanger.schema, tblDanger.table, tblDanger.ssSchema)
                         // SQLite 无 TRUNCATE TABLE → 退化为 DELETE FROM（清空数据，保留结构）
                         const truncSql = dialectFamily(connType) === 'sqlite'
                           ? `DELETE FROM ${ref}`
@@ -1949,7 +1952,8 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
                         await invoke('execute_query', { id: connectionId, sql })
                         const s = tblDanger.schema
                         setTblDanger(null); setTblDangerInput('')
-                        doLoadTables(s)
+                        if (isSqlServer && tblDanger.ssSchema) doLoadSsTablesBySchema(s, tblDanger.ssSchema)
+                        else doLoadTables(s)
                         toast.success(isTrunc ? `已清空表 ${tname}` : `已删除${tblDanger.isView ? '视图' : '表'} ${tname}`)
                       } catch (e) {
                         setTblDangerErr(String(e))
@@ -2060,21 +2064,23 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
               table={editTable.table}
               connType={connType}
               onClose={() => setEditTable(null)}
-              onDone={() => doLoadTables(editTable.schema)}
+              onDone={() => { if (isSqlServer && editTable.ssSchema) doLoadSsTablesBySchema(editTable.schema, editTable.ssSchema); else doLoadTables(editTable.schema) }}
             />
           : <CreateTableWizard
               connectionId={connectionId}
               connType={connType}
               schema={editTable.schema}
               editTable={editTable.table}
+              ssSchema={editTable.ssSchema}
               onClose={() => setEditTable(null)}
-              onDone={() => doLoadTables(editTable.schema)}
+              onDone={() => { if (isSqlServer && editTable.ssSchema) doLoadSsTablesBySchema(editTable.schema, editTable.ssSchema); else doLoadTables(editTable.schema) }}
             />
       )}
 
       {ddlState && (
         <DdlModal
           schema={ddlState.schema}
+          ssSchema={ddlState.ssSchema}
           table={ddlState.table}
           ddl={ddlState.ddl}
           loading={ddlState.loading}
@@ -2087,7 +2093,7 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
 
       {infoTarget && (
         <TableInfoModal connectionId={connectionId} connType={connType}
-          schema={infoTarget.schema} name={infoTarget.table} isView={infoTarget.isView}
+          schema={infoTarget.schema} ssSchema={infoTarget.ssSchema} name={infoTarget.table} isView={infoTarget.isView}
           onClose={() => setInfoTarget(null)} />
       )}
 

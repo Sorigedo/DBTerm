@@ -1,0 +1,31 @@
+Re-optimizing dependencies because vite config has changed
+node:internal/modules/run_main:107
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
++ actual - expected
+
+  'ALTER TABLE "fixture"."sample" ALTER COLUMN "old_name" TYPE varchar(128);\n' +
++   'ALTER TABLE "fixture"."sample" ALTER COLUMN "new_name" SET NOT NULL;\n' +
++   `ALTER TABLE "fixture"."sample" ALTER COLUMN "new_name" SET DEFAULT 'next';\n` +
+-   'ALTER TABLE "fixture"."sample" ALTER COLUMN "old_name" SET NOT NULL;\n' +
+-   `ALTER TABLE "fixture"."sample" ALTER COLUMN "old_name" SET DEFAULT 'next';\n` +
+    'ALTER TABLE "fixture"."sample" RENAME COLUMN "old_name" TO "new_name";'
+
+    at file:///Users/Nico/workSpace/claude/DBterm/scripts/acceptance/alter-column-order.mjs:18:9 {
+  generatedMessage: true,
+  code: 'ERR_ASSERTION',
+  actual: 'ALTER TABLE "fixture"."sample" ALTER COLUMN "old_name" TYPE varchar(128);\n' +
+    'ALTER TABLE "fixture"."sample" ALTER COLUMN "new_name" SET NOT NULL;\n' +
+    `ALTER TABLE "fixture"."sample" ALTER COLUMN "new_name" SET DEFAULT 'next';\n` +
+    'ALTER TABLE "fixture"."sample" RENAME COLUMN "old_name" TO "new_name";',
+  expected: 'ALTER TABLE "fixture"."sample" ALTER COLUMN "old_name" TYPE varchar(128);\n' +
+    'ALTER TABLE "fixture"."sample" ALTER COLUMN "old_name" SET NOT NULL;\n' +
+    `ALTER TABLE "fixture"."sample" ALTER COLUMN "old_name" SET DEFAULT 'next';\n` +
+    'ALTER TABLE "fixture"."sample" RENAME COLUMN "old_name" TO "new_name";',
+  operator: 'strictEqual',
+  diff: 'simple'
+}
+
+Node.js v26.8.2

@@ -1,0 +1,7 @@
+    Updating crates.io index
+error: failed to select a version for the requirement `quick-xml = "^0.39.2"`
+candidate versions found which didn't match: 0.41.0
+location searched: crates.io index
+required by package `plist v1.9.0`
+    ... which satisfies dependency `plist = "^1"` (locked to 1.9.0) of package `tauri v2.11.2`
+    ... which satisfies dependency `tauri = "^2"` (locked to 2.11.2) of package `app v0.1.23 (/Users/Nico/workSpace/claude/DBterm/src-tauri)`

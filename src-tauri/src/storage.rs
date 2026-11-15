@@ -17,12 +17,13 @@
 //! [`StorageState`] wraps [`Storage`] in a `Mutex` for safe concurrent access
 //! from multiple Tauri commands.
 
+use crate::models::ConnConfig;
 use std::{
     fs,
-    path::PathBuf,
+    io::Write,
+    path::{Path, PathBuf},
     sync::Mutex,
 };
-use crate::models::ConnConfig;
 
 /// Connection configuration storage
 ///
@@ -30,6 +31,15 @@ use crate::models::ConnConfig;
 /// Thread-safe via [`StorageState`] wrapper.
 pub struct Storage {
     path: PathBuf,
+}
+
+impl Storage {
+    pub(crate) fn data_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
+    }
 }
 
 impl Storage {
@@ -44,8 +54,7 @@ impl Storage {
     /// # Errors
     /// Returns error if directory creation fails
     pub fn new(app_data_dir: PathBuf) -> Result<Self, String> {
-        fs::create_dir_all(&app_data_dir)
-            .map_err(|e| format!("无法创建配置目录: {e}"))?;
+        fs::create_dir_all(&app_data_dir).map_err(|e| format!("无法创建配置目录: {e}"))?;
         Ok(Self {
             path: app_data_dir.join("connections.json"),
         })
@@ -62,13 +71,12 @@ impl Storage {
         if !self.path.exists() {
             return Ok(vec![]);
         }
-        let content = fs::read_to_string(&self.path)
-            .map_err(|e| format!("读取配置文件失败: {e}"))?;
+        let content =
+            fs::read_to_string(&self.path).map_err(|e| format!("读取配置文件失败: {e}"))?;
         if content.trim().is_empty() {
             return Ok(vec![]);
         }
-        serde_json::from_str(&content)
-            .map_err(|e| format!("解析配置文件失败: {e}"))
+        serde_json::from_str(&content).map_err(|e| format!("解析配置文件失败: {e}"))
     }
 
     /// Atomically writes all connections to disk
@@ -84,16 +92,38 @@ impl Storage {
     /// # Errors
     /// Returns error if serialization, write, or rename fails
     fn write_all(&self, conns: &[ConnConfig]) -> Result<(), String> {
-        let json = serde_json::to_string_pretty(conns)
-            .map_err(|e| format!("序列化失败: {e}"))?;
+        let json = serde_json::to_string_pretty(conns).map_err(|e| format!("序列化失败: {e}"))?;
         // 先写临时文件再原子重命名，防止写入中途崩溃损坏配置
-        let tmp = self.path.with_extension("json.tmp");
-        fs::write(&tmp, &json)
+        // Use a unique create_new sibling. A fixed .tmp + fs::write would follow
+        // a pre-existing symlink and could overwrite an unrelated local file.
+        let tmp = self
+            .path
+            .with_file_name(format!(".connections-{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&tmp)
+                .map_err(|e| format!("写入临时配置文件失败: {e}"))?;
+            file.write_all(json.as_bytes())
             .map_err(|e| format!("写入临时配置文件失败: {e}"))?;
+            file.sync_all()
+                .map_err(|e| format!("配置文件刷盘失败: {e}"))?;
+            drop(file);
         // 连接表含主机/用户名/密钥路径及（SSH 代理/跳板机）密码，收紧到 0600 防同机其他用户读取
         crate::keychain::restrict_permissions(&tmp);
-        fs::rename(&tmp, &self.path)
-            .map_err(|e| format!("配置文件重命名失败: {e}"))?;
+            crate::keychain::atomic_replace_file(&tmp, &self.path)
+                .map_err(|e| format!("配置文件重命名失败: {e}"))
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result?;
         crate::keychain::restrict_permissions(&self.path);
         Ok(())
     }
@@ -122,6 +152,41 @@ impl Storage {
         Ok(saved)
     }
 
+    /// Insert or replace a batch of connections with one durable configuration publish.
+    /// If serialization or file publication fails, the previous file remains intact.
+    pub fn upsert_many(&self, configs: Vec<ConnConfig>) -> Result<(), String> {
+        let mut all = self.load()?;
+        for config in configs {
+            if let Some(pos) = all.iter().position(|c| c.id == config.id) {
+                all[pos] = config;
+            } else {
+                all.push(config);
+            }
+        }
+        self.write_all(&all)
+    }
+
+    pub(crate) fn restore_import_snapshot(&self, snapshot: Option<&[u8]>) -> Result<(), String> {
+        let Some(bytes) = snapshot else {
+            match fs::remove_file(&self.path) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(format!("恢复连接配置失败: {error}")),
+            }
+        };
+        let configs: Vec<ConnConfig> = serde_json::from_slice(bytes)
+            .map_err(|e| format!("导入恢复日志中的连接配置无效: {e}"))?;
+        self.write_all(&configs)
+    }
+
+    pub(crate) fn snapshot_raw(&self) -> Result<Option<Vec<u8>>, String> {
+        match fs::read(&self.path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("读取连接配置快照失败: {error}")),
+        }
+    }
+
     /// Deletes a connection configuration by ID
     ///
     /// # Arguments
@@ -146,8 +211,7 @@ impl Storage {
     /// Returns error if file deletion fails (OK if file doesn't exist)
     pub fn clear(&self) -> Result<(), String> {
         if self.path.exists() {
-            fs::remove_file(&self.path)
-                .map_err(|e| format!("删除连接配置失败: {e}"))?;
+            fs::remove_file(&self.path).map_err(|e| format!("删除连接配置失败: {e}"))?;
         }
         Ok(())
     }
@@ -199,7 +263,8 @@ mod tests {
 
     #[test]
     fn test_storage_new() {
-        let temp_dir = std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
         let result = Storage::new(temp_dir.clone());
         assert!(result.is_ok());
         let _ = std::fs::remove_dir_all(temp_dir);
@@ -207,7 +272,8 @@ mod tests {
 
     #[test]
     fn test_load_empty() {
-        let temp_dir = std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
         let storage = Storage::new(temp_dir.clone()).unwrap();
 
         let conns = storage.load().unwrap();
@@ -218,7 +284,8 @@ mod tests {
 
     #[test]
     fn test_upsert_new_connection() {
-        let temp_dir = std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
         let storage = Storage::new(temp_dir.clone()).unwrap();
 
         let config = create_test_config("conn-1", "Test Connection");
@@ -236,7 +303,8 @@ mod tests {
 
     #[test]
     fn test_upsert_update_existing() {
-        let temp_dir = std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
         let storage = Storage::new(temp_dir.clone()).unwrap();
 
         let config1 = create_test_config("conn-1", "Original Name");
@@ -256,12 +324,19 @@ mod tests {
 
     #[test]
     fn test_upsert_multiple_connections() {
-        let temp_dir = std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
         let storage = Storage::new(temp_dir.clone()).unwrap();
 
-        storage.upsert(create_test_config("conn-1", "Connection 1")).unwrap();
-        storage.upsert(create_test_config("conn-2", "Connection 2")).unwrap();
-        storage.upsert(create_test_config("conn-3", "Connection 3")).unwrap();
+        storage
+            .upsert(create_test_config("conn-1", "Connection 1"))
+            .unwrap();
+        storage
+            .upsert(create_test_config("conn-2", "Connection 2"))
+            .unwrap();
+        storage
+            .upsert(create_test_config("conn-3", "Connection 3"))
+            .unwrap();
 
         let loaded = storage.load().unwrap();
         assert_eq!(loaded.len(), 3);
@@ -270,12 +345,47 @@ mod tests {
     }
 
     #[test]
+    fn batch_import_does_not_leave_partial_configuration_on_write_failure() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
+        let storage = Storage::new(temp_dir.clone()).unwrap();
+        let destination = storage.path.with_extension("destination-directory");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("marker"), b"preserve").unwrap();
+        // Use a directory as the final target so staging succeeds but atomic
+        // publication fails deterministically on every supported test OS.
+        let storage = Storage {
+            path: destination.clone(),
+        };
+        let result = storage.write_all(&[
+            create_test_config("import-1", "Imported 1"),
+            create_test_config("import-2", "Imported 2"),
+        ]);
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(destination.join("marker")).unwrap(),
+            b"preserve"
+        );
+        assert_eq!(
+            std::fs::read_dir(&temp_dir).unwrap().count(),
+            1,
+            "failed publish should clean staging file"
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn test_delete_connection() {
-        let temp_dir = std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
         let storage = Storage::new(temp_dir.clone()).unwrap();
 
-        storage.upsert(create_test_config("conn-1", "Connection 1")).unwrap();
-        storage.upsert(create_test_config("conn-2", "Connection 2")).unwrap();
+        storage
+            .upsert(create_test_config("conn-1", "Connection 1"))
+            .unwrap();
+        storage
+            .upsert(create_test_config("conn-2", "Connection 2"))
+            .unwrap();
 
         storage.delete("conn-1").unwrap();
 
@@ -288,10 +398,13 @@ mod tests {
 
     #[test]
     fn test_delete_nonexistent() {
-        let temp_dir = std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
         let storage = Storage::new(temp_dir.clone()).unwrap();
 
-        storage.upsert(create_test_config("conn-1", "Connection 1")).unwrap();
+        storage
+            .upsert(create_test_config("conn-1", "Connection 1"))
+            .unwrap();
 
         let result = storage.delete("nonexistent");
         assert!(result.is_ok());
@@ -304,11 +417,16 @@ mod tests {
 
     #[test]
     fn test_clear() {
-        let temp_dir = std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
         let storage = Storage::new(temp_dir.clone()).unwrap();
 
-        storage.upsert(create_test_config("conn-1", "Connection 1")).unwrap();
-        storage.upsert(create_test_config("conn-2", "Connection 2")).unwrap();
+        storage
+            .upsert(create_test_config("conn-1", "Connection 1"))
+            .unwrap();
+        storage
+            .upsert(create_test_config("conn-2", "Connection 2"))
+            .unwrap();
 
         storage.clear().unwrap();
 
@@ -320,11 +438,14 @@ mod tests {
 
     #[test]
     fn test_atomic_write() {
-        let temp_dir = std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
         let storage = Storage::new(temp_dir.clone()).unwrap();
 
         // 写入数据
-        storage.upsert(create_test_config("conn-1", "Connection 1")).unwrap();
+        storage
+            .upsert(create_test_config("conn-1", "Connection 1"))
+            .unwrap();
 
         // 验证临时文件已被删除
         let tmp_path = storage.path.with_extension("json.tmp");
@@ -338,13 +459,35 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn ignores_legacy_temp_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+        let temp_dir =
+            std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
+        let storage = Storage::new(temp_dir.clone()).unwrap();
+        let outside = temp_dir.join("outside");
+        std::fs::write(&outside, b"must remain unchanged").unwrap();
+        let tmp_path = storage.path.with_extension("json.tmp");
+        symlink(&outside, &tmp_path).unwrap();
+        storage
+            .upsert(create_test_config("symlink", "Safe"))
+            .unwrap();
+        assert_eq!(std::fs::read(&outside).unwrap(), b"must remain unchanged");
+        assert_eq!(storage.load().unwrap()[0].name, "Safe");
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_file_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp_dir = std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
         let storage = Storage::new(temp_dir.clone()).unwrap();
 
-        storage.upsert(create_test_config("conn-1", "Connection 1")).unwrap();
+        storage
+            .upsert(create_test_config("conn-1", "Connection 1"))
+            .unwrap();
 
         let metadata = std::fs::metadata(&storage.path).unwrap();
         let permissions = metadata.permissions();
@@ -357,11 +500,14 @@ mod tests {
 
     #[test]
     fn test_persistence() {
-        let temp_dir = std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("dbterm-storage-test-{}", uuid::Uuid::new_v4()));
 
         {
             let storage = Storage::new(temp_dir.clone()).unwrap();
-            storage.upsert(create_test_config("conn-1", "Persistent Connection")).unwrap();
+            storage
+                .upsert(create_test_config("conn-1", "Persistent Connection"))
+                .unwrap();
         }
 
         // 重新加载

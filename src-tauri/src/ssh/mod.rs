@@ -6,9 +6,7 @@ use std::{
 pub mod sftp;
 pub mod tunnel;
 
-use async_trait::async_trait;
 use russh::{client, ChannelMsg, Disconnect, Pty};
-use russh_keys::key::PublicKey;
 use tokio::sync::mpsc;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
@@ -376,86 +374,100 @@ pub struct SshHandler {
     forwards: Arc<Mutex<HashMap<u32, (String, u16)>>>,
 }
 
-#[async_trait]
 impl client::Handler for SshHandler {
     type Error = russh::Error;
 
-    async fn check_server_key(
+    fn check_server_key(
         &mut self,
-        server_public_key: &PublicKey,
-    ) -> Result<bool, Self::Error> {
-        if self.host_key_policy == "skip" {
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+        let result = if self.host_key_policy == "skip" {
             log::warn!("已跳过 {}:{} 的主机密钥校验（连接配置选择了跳过模式）", self.host, self.port);
-            return Ok(true);
-        }
-        let fp = server_public_key.fingerprint();
-        let strict = self.host_key_policy == "strict";
-        match tofu_check(&fp, &self.host, self.port, strict) {
-            Ok(()) => Ok(true),
-            Err(e) => {
-                *safe_lock(&self.tofu_err) = Some(e);
-                Ok(false)
+            Ok(true)
+        } else {
+            let public_key = server_public_key.public_key();
+            let fp = public_key.fingerprint(russh::keys::HashAlg::Sha256).to_string();
+            match tofu_check(&fp, &self.host, self.port, self.host_key_policy == "strict") {
+                Ok(()) => Ok(true),
+                Err(e) => {
+                    *safe_lock(&self.tofu_err) = Some(e);
+                    Ok(false)
+                }
             }
-        }
+        };
+        async move { result }
     }
 
     /// SSH Agent 转发：服务器开 auth-agent 通道时，代理到本地 SSH_AUTH_SOCK
     #[cfg_attr(not(target_family = "unix"), allow(unused_variables))]
-    async fn server_channel_open_agent_forward(
+    fn server_channel_open_agent_forward(
         &mut self,
         channel: russh::Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
         _session: &mut client::Session,
-    ) -> Result<(), Self::Error> {
-        #[cfg(unix)]
-        {
-            let sock = match std::env::var("SSH_AUTH_SOCK") {
-                Ok(p) => p,
-                Err(_) => {
-                    log::warn!("Agent 转发：SSH_AUTH_SOCK 未设置");
-                    return Err(russh::Error::RequestDenied);
-                }
-            };
-            tokio::spawn(async move {
-                match tokio::net::UnixStream::connect(&sock).await {
-                    Ok(mut agent_sock) => {
-                        let mut ch = channel.into_stream();
-                        let _ = tokio::io::copy_bidirectional(&mut ch, &mut agent_sock).await;
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        async move {
+            #[cfg(unix)]
+            {
+                let sock = match std::env::var("SSH_AUTH_SOCK") {
+                    Ok(p) => p,
+                    Err(_) => {
+                        log::warn!("Agent 转发：SSH_AUTH_SOCK 未设置");
+                        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+                        return Ok(());
                     }
-                    Err(e) => {
-                        log::warn!("Agent 转发：连接 SSH_AUTH_SOCK 失败: {e}");
-                        let _ = channel.close().await;
+                };
+                reply.accept().await;
+                tokio::spawn(async move {
+                    match tokio::net::UnixStream::connect(&sock).await {
+                        Ok(mut agent_sock) => {
+                            let mut ch = channel.into_stream();
+                            let _ = tokio::io::copy_bidirectional(&mut ch, &mut agent_sock).await;
+                        }
+                        Err(e) => {
+                            log::warn!("Agent 转发：连接 SSH_AUTH_SOCK 失败: {e}");
+                            let _ = channel.close().await;
+                        }
                     }
-                }
-            });
-            return Ok(());
+                });
+                return Ok(());
+            }
+            #[allow(unreachable_code)]
+            {
+                let _ = channel;
+                reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+                Ok(())
+            }
         }
-        #[allow(unreachable_code)]
-        Err(russh::Error::RequestDenied)
     }
 
     /// 远程隧道：服务器侧有连接进来，转接到本地目标
-    async fn server_channel_open_forwarded_tcpip(
+    fn server_channel_open_forwarded_tcpip(
         &mut self,
         channel: russh::Channel<client::Msg>,
         _connected_address: &str,
         connected_port: u32,
         _originator_address: &str,
         _originator_port: u32,
+        reply: client::ChannelOpenHandle,
         _session: &mut client::Session,
-    ) -> Result<(), Self::Error> {
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         let target = safe_lock(&self.forwards).get(&connected_port).cloned();
-        if let Some((ip, port)) = target {
-            tokio::spawn(async move {
+        async move {
+            if let Some((ip, port)) = target {
                 match tokio::net::TcpStream::connect((ip.as_str(), port)).await {
                     Ok(mut tcp) => {
+                        reply.accept().await;
                         let mut ch = channel.into_stream();
                         let _ = tokio::io::copy_bidirectional(&mut ch, &mut tcp).await;
                     }
-                    Err(_) => { let _ = channel.close().await; }
+                    Err(_) => reply.reject(russh::ChannelOpenFailure::ConnectFailed).await,
                 }
-            });
+            } else {
+                reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+            }
+            Ok(())
         }
-        Ok(())
     }
 }
 
@@ -663,7 +675,7 @@ async fn authenticate_with_agent(
     user: &str,
 ) -> Result<bool, String> {
     #[cfg(unix)]
-    let mut agent = russh_keys::agent::client::AgentClient::connect_env()
+    let mut agent = russh::keys::agent::client::AgentClient::connect_env()
         .await
         .map_err(|e| format!("连接 ssh-agent 失败（请确认已启动并设置 SSH_AUTH_SOCK）: {e}"))?;
     #[cfg(windows)]
@@ -673,7 +685,7 @@ async fn authenticate_with_agent(
             .map_err(|e| {
                 format!("连接 ssh-agent 失败（请确认 Windows 的 OpenSSH Authentication Agent 服务已启动）: {e}")
             })?;
-        russh_keys::agent::client::AgentClient::connect(pipe)
+        russh::keys::agent::client::AgentClient::connect(pipe)
     };
 
     let keys = agent
@@ -684,18 +696,14 @@ async fn authenticate_with_agent(
         return Err("ssh-agent 中没有可用密钥，请先 ssh-add".to_string());
     }
     let mut ok = false;
-    let mut agent_opt = Some(agent);
     for key in keys {
-        let (a, res) = handle
-            .authenticate_future(user, key, agent_opt.take().expect("agent"))
-            .await;
-        agent_opt = Some(a);
+        let res = handle.authenticate_publickey_with(user, key.public_key().into_owned(), None, &mut agent).await;
         match res {
-            Ok(true) => {
+            Ok(russh::client::AuthResult::Success) => {
                 ok = true;
                 break;
             }
-            Ok(false) => {}
+            Ok(russh::client::AuthResult::Failure { .. }) => {}
             Err(e) => log::debug!("agent 密钥认证尝试失败: {e}"),
         }
     }
@@ -715,14 +723,14 @@ async fn authenticate_jump(
                 return Err("跳板机私钥路径不能为空".to_string());
             }
             let pass = if extra.jump_password.is_empty() { None } else { Some(extra.jump_password.as_str()) };
-            let key = russh_keys::load_secret_key(crate::tester::expand_home(&extra.jump_key_path), pass)
+            let key = russh::keys::load_secret_key(crate::tester::expand_home(&extra.jump_key_path), pass)
                 .map_err(|e| format!("加载跳板机密钥失败: {e}"))?;
-            handle.authenticate_publickey(user, Arc::new(key)).await
-                .map_err(|e| format!("跳板机密钥认证失败: {e}"))?
+            handle.authenticate_publickey(user, russh::keys::key::PrivateKeyWithHashAlg::new(Arc::new(key), None)).await
+                .map_err(|e| format!("跳板机密钥认证失败: {e}"))?.success()
         }
         _ => {
             handle.authenticate_password(user, &extra.jump_password).await
-                .map_err(|e| format!("跳板机密码认证失败: {e}"))?
+                .map_err(|e| format!("跳板机密码认证失败: {e}"))?.success()
         }
     };
     if !ok { return Err("跳板机认证被拒绝，请检查认证配置".to_string()); }
@@ -742,14 +750,14 @@ async fn authenticate_extra_jump(
                 return Err("私钥路径不能为空".to_string());
             }
             let pass = if hop.password.is_empty() { None } else { Some(hop.password.as_str()) };
-            let key = russh_keys::load_secret_key(crate::tester::expand_home(&hop.key_path), pass)
+            let key = russh::keys::load_secret_key(crate::tester::expand_home(&hop.key_path), pass)
                 .map_err(|e| format!("加载私钥失败: {e}"))?;
-            handle.authenticate_publickey(user, Arc::new(key)).await
-                .map_err(|e| format!("密钥认证失败: {e}"))?
+            handle.authenticate_publickey(user, russh::keys::key::PrivateKeyWithHashAlg::new(Arc::new(key), None)).await
+                .map_err(|e| format!("密钥认证失败: {e}"))?.success()
         }
         _ => {
             handle.authenticate_password(user, &hop.password).await
-                .map_err(|e| format!("密码认证失败: {e}"))?
+                .map_err(|e| format!("密码认证失败: {e}"))?.success()
         }
     };
     if !ok { return Err("认证被拒绝，请检查用户名和认证配置".to_string()); }
@@ -855,6 +863,11 @@ async fn open_jump_transport(
 
 type ForwardMap = Arc<Mutex<HashMap<u32, (String, u16)>>>;
 
+fn secure_compression_preferences() -> std::borrow::Cow<'static, [russh::compression::Name]> {
+    // Do not negotiate zlib with russh versions whose decompressor is unbounded.
+    std::borrow::Cow::Borrowed(&[russh::compression::NONE])
+}
+
 pub(crate) async fn connect_and_auth(
     config: &ConnConfig,
     password: Option<&str>,
@@ -882,15 +895,10 @@ pub(crate) async fn connect_and_auth(
         ssh_cfg.keepalive_interval = Some(std::time::Duration::from_secs(extra.heartbeat_interval.clamp(5, 600)));
         ssh_cfg.keepalive_max = 3;
     }
-    if extra.enable_compression {
-        // zlib 优先，服务器不支持时自动协商回退 none
-        const COMPRESS_PREF: &[russh::compression::Name] = &[
-            russh::compression::ZLIB,
-            russh::compression::ZLIB_LEGACY,
-            russh::compression::NONE,
-        ];
-        ssh_cfg.preferred.compression = std::borrow::Cow::Borrowed(COMPRESS_PREF);
-    }
+    // russh <0.61.1 has an unbounded decompression path for negotiated zlib.
+    // Keep compression disabled even for legacy saved profiles until the SSH
+    // transport dependency is upgraded and its bounded decompressor is verified.
+    ssh_cfg.preferred.compression = secure_compression_preferences();
     let ssh_cfg = Arc::new(ssh_cfg);
 
     let mut handle = tokio::time::timeout(
@@ -921,7 +929,7 @@ pub(crate) async fn connect_and_auth(
             loop {
                 match resp {
                     Kb::Success => break true,
-                    Kb::Failure => break false,
+            Kb::Failure { .. } => break false,
                     Kb::InfoRequest { name, instructions, prompts } => {
                         rounds += 1;
                         if rounds > 10 {
@@ -981,21 +989,21 @@ pub(crate) async fn connect_and_auth(
         }
         "none" => {
             handle.authenticate_none(&user).await
-                .map_err(|e| format!("无认证登录失败: {e}"))?
+                .map_err(|e| format!("无认证登录失败: {e}"))?.success()
         }
         _ => {
             // password / key：密钥路径存在则走公钥，否则密码
             if let Some(kp) = config.ssh_key_path.as_deref().filter(|s| !s.is_empty()) {
                 let pass = if pwd.is_empty() { None } else { Some(pwd.as_str()) };
-                let key = russh_keys::load_secret_key(crate::tester::expand_home(kp), pass)
+                let key = russh::keys::load_secret_key(crate::tester::expand_home(kp), pass)
                     .map_err(|e| format!("加载密钥文件失败: {e}"))?;
-                handle.authenticate_publickey(&user, Arc::new(key))
+                handle.authenticate_publickey(&user, russh::keys::key::PrivateKeyWithHashAlg::new(Arc::new(key), None))
                     .await
-                    .map_err(|e| format!("密钥认证失败: {e}"))?
+                    .map_err(|e| format!("密钥认证失败: {e}"))?.success()
             } else {
                 handle.authenticate_password(&user, &pwd)
                     .await
-                    .map_err(|e| format!("密码认证失败: {e}"))?
+                    .map_err(|e| format!("密码认证失败: {e}"))?.success()
             }
         }
     };
@@ -1048,33 +1056,183 @@ pub async fn connect_for_db_tunnel(
     Ok(handle)
 }
 
+#[cfg(test)]
+mod compression_policy_tests {
+    #[test]
+    fn ssh_never_offers_legacy_or_modern_zlib_compression() {
+        assert_eq!(super::secure_compression_preferences().as_ref(), &[russh::compression::NONE]);
+    }
+}
+
 // ── 独立 exec 连接 ────────────────────────────────────────
+
+#[cfg(test)]
+#[path = "exec_integration_tests.rs"]
+mod exec_integration_tests;
 
 pub async fn exec_command(
     config: &ConnConfig,
     password: Option<&str>,
     command: &str,
 ) -> Result<String, String> {
-    let (handle, _) = connect_and_auth(config, password, None).await?;
-    let mut channel = handle.channel_open_session().await
-        .map_err(|e| format!("打开通道失败: {e}"))?;
-    channel.exec(true, command).await
-        .map_err(|e| format!("执行命令失败: {e}"))?;
+    exec_command_with_idle_limit(config, password, command, std::time::Duration::from_secs(600)).await
+}
+
+async fn exec_command_with_idle_limit(
+    config: &ConnConfig, password: Option<&str>, command: &str, idle_limit: std::time::Duration,
+) -> Result<String, String> {
+    // Independent commands have no interactive MFA UI. Bound authentication as well
+    // as transport setup; shared interactive sessions keep their existing timing.
+    let setup_limit = std::time::Duration::from_secs(SshExtra::from_config(config).connect_timeout.clamp(5, 300));
+    let (handle, _) = tokio::time::timeout(setup_limit, connect_and_auth(config, password, None))
+        .await.map_err(|_| "SSH连接或认证超时，命令未发送".to_string())??;
+    let setup = tokio::time::timeout(setup_limit, async {
+        let channel = handle.channel_open_session().await
+            .map_err(|e| format!("打开通道失败，命令未发送: {e}"))?;
+        // russh exec enqueues the request; it does not wait for a server ACK.
+        channel.exec(true, command).await
+            .map_err(|e| format!("发送命令失败；操作结果未知，禁止自动重试: {e}"))?;
+        Ok::<_, String>(channel)
+    }).await.unwrap_or_else(|_| Err("SSH命令通道建立或发送超时；操作结果未知，禁止自动重试".into()));
+    let mut channel = match setup {
+        Ok(channel) => channel,
+        Err(error) => {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1),
+                handle.disconnect(Disconnect::ByApplication, "", "English")).await;
+            return Err(error);
+        }
+    };
 
     let mut output = Vec::new();
+    let mut status = None;
+    let mut signal = None;
+    let mut interrupted = None;
     loop {
-        match channel.wait().await {
-            Some(ChannelMsg::Data { ref data }) => output.extend_from_slice(data),
-            Some(ChannelMsg::ExtendedData { ref data, .. }) => output.extend_from_slice(data),
-            Some(ChannelMsg::ExitStatus { .. }) | Some(ChannelMsg::Eof) | None => break,
+        let message = match tokio::time::timeout(idle_limit, channel.wait()).await {
+            Ok(message) => message,
+            Err(_) => { interrupted = Some("远程命令长时间无响应，已停止等待；操作结果未知，禁止自动重试"); break; }
+        };
+        match message {
+            Some(ChannelMsg::Data { ref data }) | Some(ChannelMsg::ExtendedData { ref data, .. }) => {
+                const MAX_EXEC_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+                if data.len() > MAX_EXEC_OUTPUT_BYTES.saturating_sub(output.len()) {
+                    interrupted = Some("远程命令输出超过32MiB，已停止接收；操作结果未知，禁止自动重试，请改用终端或SFTP传输");
+                    break;
+                }
+                output.extend_from_slice(data);
+            },
+            Some(ChannelMsg::ExitStatus { exit_status }) => status = Some(exit_status),
+            Some(ChannelMsg::ExitSignal { signal_name, .. }) => signal = Some(format!("{signal_name:?}")),
+            // EOF closes stdout only; the exit status may follow it.
+            Some(ChannelMsg::Eof) => {},
+            Some(ChannelMsg::Close) | None => break,
             _ => {}
         }
     }
-    handle.disconnect(Disconnect::ByApplication, "", "English").await.ok();
-    Ok(String::from_utf8_lossy(&output).into_owned())
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1),
+        handle.disconnect(Disconnect::ByApplication, "", "English")).await;
+    if let Some(error) = interrupted { return Err(error.into()); }
+    let output = String::from_utf8_lossy(&output).into_owned();
+    if let Some(signal) = signal {
+        return Err(format!("远程命令被信号终止（{signal}）；操作是否生效需核对，禁止自动重试
+{output}"));
+    }
+    match status {
+        Some(0) => Ok(output),
+        Some(code) => Err(format!("远程命令执行失败，退出码 {code}；可能已产生部分操作，请核对后处理
+{output}")),
+        None => Err(format!("远程命令退出状态未确认；操作结果未知，禁止自动重试
+{output}")),
+    }
 }
 
 // ── 上传文件（exec channel + base64） ────────────────────
+
+async fn upload_source_digest<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result<(u64, String), String> {
+    use tokio::io::AsyncReadExt;
+    use sha2::{Digest, Sha256};
+    let mut buffer = vec![0u8; 48 * 1024];
+    let mut checksum = Sha256::new();
+    let mut length = 0u64;
+    loop {
+        let count = reader.read(&mut buffer).await.map_err(|e| format!("读取上传文件失败: {e}"))?;
+        if count == 0 { break; }
+        checksum.update(&buffer[..count]);
+        length = length.checked_add(count as u64).ok_or("上传文件过大")?;
+    }
+    Ok((length, format!("{:x}", checksum.finalize())))
+}
+
+#[cfg(test)]
+fn fallback_upload_command(remote_path: &str, data: &[u8]) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    fallback_upload_command_with_digest(remote_path, data.len() as u64, &format!("{:x}", Sha256::digest(data)))
+}
+
+fn fallback_upload_command_with_digest(remote_path: &str, expected: u64, digest: &str) -> Result<String, String> {
+    validate_remote_path(remote_path)?;
+    // Python is required for the fallback's exclusive staging, exact validation
+    // and atomic replacement. Absence must fail before opening the target.
+    let script = r#"import os,sys,stat,tempfile,base64,hashlib
+target=os.path.abspath(sys.argv[1])
+expected=int(sys.argv[2])
+digest=sys.argv[3]
+temporary=None
+def snapshot():
+    try:
+        value=os.lstat(target)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(value.st_mode):
+        raise RuntimeError('target must be a regular file, not a link or directory')
+    return value
+def identity(value):
+    return None if value is None else (value.st_dev,value.st_ino,value.st_size,value.st_mtime_ns,value.st_ctime_ns,value.st_mode,value.st_uid,value.st_gid)
+try:
+    original=snapshot()
+    fd,temporary=tempfile.mkstemp(prefix='.dbterm-upload-',dir=os.path.dirname(target))
+    with os.fdopen(fd,'wb') as output:
+        total=0
+        checksum=hashlib.sha256()
+        while True:
+            encoded=sys.stdin.buffer.read(65536)
+            if not encoded:
+                break
+            chunk=base64.b64decode(encoded,validate=True)
+            total+=len(chunk)
+            if total>expected:
+                raise RuntimeError('upload exceeds expected length')
+            output.write(chunk)
+            checksum.update(chunk)
+        if total!=expected or checksum.hexdigest()!=digest:
+            raise RuntimeError('incomplete or corrupt upload; original preserved')
+        output.flush()
+        if original is not None:
+            current=os.fstat(output.fileno())
+            if (current.st_uid,current.st_gid)!=(original.st_uid,original.st_gid):
+                os.fchown(output.fileno(),original.st_uid,original.st_gid)
+            os.fchmod(output.fileno(),stat.S_IMODE(original.st_mode))
+            if hasattr(os,'listxattr'):
+                for name in os.listxattr(target):
+                    os.setxattr(temporary,name,os.getxattr(target,name))
+        os.fsync(output.fileno())
+    if identity(snapshot())!=identity(original):
+        raise RuntimeError('target changed during upload; replacement refused')
+    os.replace(temporary,target)
+    temporary=None
+except Exception as error:
+    sys.stderr.write('DBTerm safe upload failed: '+str(error)+'\n')
+    sys.exit(1)
+finally:
+    if temporary is not None:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+"#;
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+    Ok(format!("python3 -c {} {} {} {}", quote(script), quote(remote_path), expected, quote(digest)))
+}
 
 pub async fn upload_bytes(
     config: &ConnConfig,
@@ -1082,35 +1240,106 @@ pub async fn upload_bytes(
     remote_path: &str,
     data: &[u8],
 ) -> Result<(), String> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let b64 = STANDARD.encode(data);
+    upload_bytes_with_idle_limit(config, password, remote_path, data, std::time::Duration::from_secs(600)).await
+}
 
-    let (handle, _) = connect_and_auth(config, password, None).await?;
-    let mut channel = handle.channel_open_session().await
-        .map_err(|e| format!("打开通道失败: {e}"))?;
+async fn upload_bytes_with_idle_limit(
+    config: &ConnConfig, password: Option<&str>, remote_path: &str, data: &[u8],
+    idle_limit: std::time::Duration,
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let command = fallback_upload_command_with_digest(remote_path, data.len() as u64, &format!("{:x}", Sha256::digest(data)))?;
+    let mut source = data;
+    upload_reader(config, password, &mut source, command, idle_limit).await
+}
 
-    let cmd = format!(r#"base64 -d > "{}""#, remote_path.replace('"', "\\\""));
-    channel.exec(true, cmd.as_str()).await
-        .map_err(|e| format!("执行上传命令失败: {e}"))?;
-    channel.data(b64.as_bytes()).await
-        .map_err(|e| format!("发送数据失败: {e}"))?;
-    channel.eof().await
-        .map_err(|e| format!("发送 EOF 失败: {e}"))?;
-
-    loop {
-        match channel.wait().await {
-            Some(ChannelMsg::ExitStatus { exit_status }) => {
-                if exit_status != 0 {
-                    return Err(format!("上传失败，远程命令退出码: {exit_status}"));
-                }
-                break;
-            }
-            Some(ChannelMsg::Eof) | None => break,
-            _ => {}
-        }
+pub async fn upload_path(
+    config: &ConnConfig, password: Option<&str>, remote_path: &str, local_path: &std::path::Path,
+) -> Result<(), String> {
+    use tokio::io::AsyncSeekExt;
+    validate_remote_path(remote_path)?;
+    if !local_path.is_absolute() { return Err("本地路径必须是绝对路径".into()); }
+    let mut source = tokio::fs::File::open(local_path).await.map_err(|e| format!("打开上传文件失败: {e}"))?;
+    if !source.metadata().await.map_err(|e| format!("读取上传文件信息失败: {e}"))?.is_file() {
+        return Err("上传来源必须是普通文件".into());
     }
-    handle.disconnect(Disconnect::ByApplication, "", "English").await.ok();
-    Ok(())
+    let (length, digest) = upload_source_digest(&mut source).await?;
+    source.rewind().await.map_err(|e| format!("重置上传文件位置失败: {e}"))?;
+    let command = fallback_upload_command_with_digest(remote_path, length, &digest)?;
+    upload_reader(config, password, &mut source, command, std::time::Duration::from_secs(600)).await
+}
+
+async fn upload_reader<R: tokio::io::AsyncRead + Unpin>(
+    config: &ConnConfig, password: Option<&str>, source: &mut R, cmd: String, idle_limit: std::time::Duration,
+) -> Result<(), String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use tokio::io::AsyncReadExt;
+    let setup_limit = std::time::Duration::from_secs(SshExtra::from_config(config).connect_timeout.clamp(5, 300));
+    let (handle, _) = tokio::time::timeout(setup_limit, connect_and_auth(config, password, None))
+        .await.map_err(|_| "SSH上传连接或认证超时，上传命令未发送".to_string())??;
+    let setup = tokio::time::timeout(setup_limit, handle.channel_open_session()).await
+        .map_err(|_| "SSH上传通道建立超时，上传命令未发送".to_string())
+        .and_then(|result| result.map_err(|e| format!("打开上传通道失败，上传命令未发送: {e}")));
+    let mut channel = match setup {
+        Ok(channel) => channel,
+        Err(error) => {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1),
+                handle.disconnect(Disconnect::ByApplication, "", "English")).await;
+            return Err(error);
+        }
+    };
+    let transfer = async {
+        tokio::time::timeout(setup_limit, channel.exec(true, cmd.as_str())).await
+            .map_err(|_| "上传命令发送超时；结果未知，目标文件可能已部分写入，禁止自动重试".to_string())?
+            .map_err(|e| format!("发送上传命令失败；结果未知，禁止自动重试: {e}"))?;
+        // Encode bounded chunks (divisible by three) instead of allocating another
+        // whole-file base64 string. Timeout measures progress per chunk, not file size.
+        let mut buffer = vec![0u8; 48 * 1024];
+        loop {
+            let mut filled = 0;
+            // Fill whole blocks so only the final block has Base64 padding.
+            while filled < buffer.len() {
+                let count = tokio::time::timeout(idle_limit, source.read(&mut buffer[filled..])).await
+                    .map_err(|_| "读取上传来源超时；结果未知，禁止自动重试".to_string())?
+                    .map_err(|e| format!("读取上传来源失败；结果未知，禁止自动重试: {e}"))?;
+                if count == 0 { break; }
+                filled += count;
+            }
+            if filled == 0 { break; }
+            let encoded = STANDARD.encode(&buffer[..filled]);
+            tokio::time::timeout(idle_limit, channel.data(encoded.as_bytes())).await
+                .map_err(|_| "上传数据长时间无响应；结果未知，禁止自动重试".to_string())?
+                .map_err(|e| format!("发送上传数据失败；结果未知，禁止自动重试: {e}"))?;
+            if filled < buffer.len() { break; }
+        }
+        tokio::time::timeout(idle_limit, channel.eof()).await
+            .map_err(|_| "发送上传EOF超时；结果未知，禁止自动重试".to_string())?
+            .map_err(|e| format!("发送上传EOF失败；结果未知，禁止自动重试: {e}"))?;
+        let mut status = None;
+        let mut signal = None;
+        loop {
+            match tokio::time::timeout(idle_limit, channel.wait()).await
+                .map_err(|_| "上传结果长时间无响应；结果未知，目标文件可能已部分写入，禁止自动重试".to_string())? {
+                Some(ChannelMsg::ExitStatus { exit_status }) => status = Some(exit_status),
+                Some(ChannelMsg::ExitSignal { signal_name, .. }) => signal = Some(format!("{signal_name:?}")),
+                // EOF closes stdout only; it does not confirm that the file was written.
+                Some(ChannelMsg::Eof) => {},
+                Some(ChannelMsg::Close) | None => break,
+                _ => {}
+            }
+        }
+        if let Some(signal) = signal {
+            return Err(format!("上传被信号终止（{signal}）；目标文件可能已部分写入，请核对，禁止自动重试"));
+        }
+        match status {
+            Some(0) => Ok(()),
+            Some(code) => Err(format!("上传失败，远程命令退出码: {code}；目标文件可能已部分写入，请核对后处理")),
+            None => Err("上传退出状态未确认；结果未知，目标文件可能已部分写入，禁止自动重试".into()),
+        }
+    }.await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1),
+        handle.disconnect(Disconnect::ByApplication, "", "English")).await;
+    transfer
 }
 
 // ── 主 PTY 会话 ───────────────────────────────────────────

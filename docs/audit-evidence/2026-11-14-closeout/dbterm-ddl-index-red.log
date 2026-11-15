@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/Users/Nico/workSpace/claude/DBterm/scripts/acceptance/sqlserver-ddl-indexes.py", line 5, in <module>
+    assert 'ddl_indexes::read_indexes' in source, 'table DDL only reads primary key names; unique/secondary/include/filter/index options are lost'
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: table DDL only reads primary key names; unique/secondary/include/filter/index options are lost

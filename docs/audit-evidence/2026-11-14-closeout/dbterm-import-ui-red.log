@@ -1,0 +1,18 @@
+node:internal/modules/run_main:107
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: pending write must keep the dialog open
+
+3 !== 0
+
+    at file:///Users/Nico/workSpace/claude/DBterm/scripts/acceptance/import-submit-safety.mjs:39:9 {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: 3,
+  expected: 0,
+  operator: 'strictEqual',
+  diff: 'simple'
+}
+
+Node.js v26.8.2

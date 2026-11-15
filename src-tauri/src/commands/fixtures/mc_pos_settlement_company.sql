@@ -1,0 +1,21 @@
+CREATE TABLE `mc_pos_settlement_company` (
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT COMMENT '主键',
+  `plan_name` varchar(128) NOT NULL DEFAULT '' COMMENT '结算方案名称',
+  `company_name` varchar(128) NOT NULL DEFAULT '' COMMENT '清算公司名称',
+  `pos_type` varchar(32) NOT NULL DEFAULT '' COMMENT 'POS 机类型，如 PAX/NAYAX',
+  `pos_model` varchar(64) NOT NULL DEFAULT '' COMMENT 'POS 机型号',
+  `country_code` varchar(16) NOT NULL DEFAULT '' COMMENT '国家或大区代码，如 US/EU',
+  `status` varchar(16) NOT NULL DEFAULT 'ACTIVE' COMMENT 'ACTIVE=启用 | INACTIVE=停用',
+  `remark` varchar(500) NOT NULL DEFAULT '' COMMENT '备注',
+  `created_by` varchar(24) NOT NULL DEFAULT '' COMMENT '创建者 user_no',
+  `create_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `update_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  `delete_time` datetime DEFAULT NULL COMMENT '软删除时间',
+  `plan_code` varchar(64) NOT NULL DEFAULT '' COMMENT '结算方案编码',
+  PRIMARY KEY (`id`) USING BTREE,
+  UNIQUE KEY `uk_pos_settlement_plan_code` ((nullif(`plan_code`,_utf8mb4''))),
+  KEY `create_time` (`create_time`) USING BTREE,
+  KEY `update_time` (`update_time`) USING BTREE,
+  KEY `delete_time` (`delete_time`) USING BTREE,
+  KEY `idx_pos_settlement_company_scope` (`pos_type`,`country_code`,`status`)
+) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci ROW_FORMAT=DYNAMIC COMMENT='POS 结算方案配置表，维护不同 POS 类型、国家和结算方的可用结算方案'

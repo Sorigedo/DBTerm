@@ -1,0 +1,2 @@
+PASS production table DDL reads index identity, type, column roles/order/direction, filters, placement and persisted rowstore options; source contract only.
+PASS actual production index catalog joins, object isolation, filter and key/include roles; synthetic SQLite catalogs only.

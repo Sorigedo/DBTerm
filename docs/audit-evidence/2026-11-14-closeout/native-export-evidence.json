@@ -1,0 +1,18 @@
+{
+  "receipt": {
+    "ok": true,
+    "checks": [
+      "真实IPC读取完整DDL与独立MySQL客户端一致",
+      "真实IPC完整结构导出及结构加数据备份",
+      "真实IPC流式SQL导出",
+      "执行失败后任务释放且同任务ID可重新导出"
+    ]
+  },
+  "output_sha256": {
+    "structure.sql": "ede723d24010ef3809de7a0d1e347d4ee174be105507162edccf41b5a8202f63",
+    "data.sql": "7ba85cbae17bc3cb1e252f082421e61f127bca34759c422b146b51cd93832492",
+    "both.sql": "8671b58a2f370141764dd23e6f36632cfc4288a6ecfb8b9547b02610e599d069",
+    "retry.sql": "7ba85cbae17bc3cb1e252f082421e61f127bca34759c422b146b51cd93832492",
+    "protected.sql": "a9e083142d1e263e377dad03c7e345dc79ef29a536b24eb1f5e6bcdd21e89816"
+  }
+}

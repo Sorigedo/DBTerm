@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   checkTableSql,
   dialectFamily,
+  MIGRATABLE_DB_TYPES,
   previewSelect,
   qid,
   sqlStr,
@@ -10,7 +11,15 @@ import {
   supportsOptimizeTable,
   supportsShowStatements,
   tableRef,
+  sqlServerRename,
 } from './sqlDialect.ts'
+
+test('SQL Server rename targets selected database and quotes object path separately from Unicode values', () => {
+  assert.equal(sqlServerRename("db']name", "table.'name]", "new'; SELECT 1;--中文"),
+    "EXEC [db']]name].sys.sp_rename N'[table.''name]]]', N'new''; SELECT 1;--中文', N'OBJECT';")
+  assert.equal(sqlServerRename('', 'sample', 'renamed', 'old.name'),
+    "EXEC sys.sp_rename N'[sample].[old.name]', N'renamed', N'COLUMN';")
+})
 
 test('identifier quoting is dialect aware and escapes delimiters', () => {
   assert.equal(qid('mysql', 'a`b'), '`a``b`')
@@ -56,6 +65,10 @@ test('dialect families group compatible engines', () => {
   assert.equal(dialectFamily('duckdb'), 'duckdb')
   assert.equal(dialectFamily('sqlServer'), 'mssql')
   assert.equal(dialectFamily('clickHouse'), 'clickhouse')
+})
+
+test('migration exposes only engines with verified full-DDL fidelity', () => {
+  assert.deepEqual(MIGRATABLE_DB_TYPES, ['mysql', 'mariadb', 'tidb', 'oceanBase'])
 })
 
 test('capability helpers encode MySQL-family maintenance differences', () => {

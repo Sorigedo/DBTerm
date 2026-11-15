@@ -1,6 +1,6 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert';
-import { useQueryStore } from './queryStore.ts';
+import { flushQueryStorePersistence, useQueryStore } from './queryStore.ts';
 
 describe('queryStore', () => {
   beforeEach(() => {
@@ -54,7 +54,27 @@ describe('queryStore', () => {
   });
 
   describe('SQL 大小限制', () => {
-    it('应该拒绝超过单个限制的 SQL', () => {
+    it('达到总量限制时应保留最近编辑的旧标签，淘汰最久未编辑的草稿', () => {
+      const store = useQueryStore.getState();
+      const sql = 'x'.repeat(300_000);
+      for (let i = 0; i < 5; i++) store.setSql(`tab-${i}`, sql);
+      store.setSql('tab-0', `${sql.slice(0, -1)}y`);
+      store.setSql('tab-5', sql);
+      assert.ok(useQueryStore.getState().sqls['tab-0']);
+      assert.ok(useQueryStore.getState().sqls['tab-1'], '打开的草稿不能因持久化限额丢失');
+      const persisted = useQueryStore.persist.getOptions().partialize!(useQueryStore.getState());
+      assert.strictEqual(persisted.sqls['tab-1'], undefined);
+      assert.deepEqual(Object.keys(persisted.sqls), ['tab-2', 'tab-3', 'tab-4', 'tab-0', 'tab-5']);
+    });
+
+    it('恢复历史快照时也应限制草稿大小，避免绕过内存上限', () => {
+      const merge = useQueryStore.persist.getOptions().merge!;
+      const restored = merge({ sqls: { oversized: 'x'.repeat(300_001), valid: 'SELECT 1' } }, useQueryStore.getState());
+      assert.deepEqual(Object.keys(restored.sqls), ['valid']);
+      assert.strictEqual(restored.sqls.valid, 'SELECT 1');
+    });
+
+    it('超大草稿保留在内存中，仅跳过持久化', () => {
       const store = useQueryStore.getState();
 
       // 生成超过 300,000 字符的 SQL
@@ -62,8 +82,9 @@ describe('queryStore', () => {
       store.setSql('tab-large', largeSql);
 
       const state = useQueryStore.getState();
-      // 超过限制的不会被保存
-      assert.strictEqual(state.sqls['tab-large'], undefined);
+      // 持久化可以跳过大草稿，但编辑内容必须完整保留
+      assert.strictEqual(state.sqls['tab-large'], largeSql);
+      assert.strictEqual(useQueryStore.persist.getOptions().partialize!(state).sqls['tab-large'], undefined);
     });
 
     it('应该保留最近的 SQL 直到总大小限制', () => {
@@ -77,9 +98,10 @@ describe('queryStore', () => {
       }
 
       const state = useQueryStore.getState();
-      // 应该保留最近的几个，但不是全部（总限制 1.5MB）
-      const totalSize = Object.values(state.sqls).reduce((sum, sql) => sum + sql.length, 0);
-      assert.ok(totalSize <= 1_500_000, '总 SQL 大小应该在限制内');
+      // 仅持久化快照受总限制 1.5MB 约束
+      const totalSize = Object.values(useQueryStore.persist.getOptions().partialize!(state).sqls).reduce((sum, sql) => sum + sql.length, 0);
+      assert.ok(totalSize <= 1_500_000, '持久化 SQL 大小应该在限制内');
+      assert.strictEqual(Object.keys(state.sqls).length, 25, '打开的草稿应全部保留');
     });
 
     it('应该优先保留最新的 SQL', () => {
@@ -103,8 +125,9 @@ describe('queryStore', () => {
       assert.ok(totalKeys > 0, '应该保留一些 SQL');
 
       // 总大小应该在限制内
-      const totalSize = Object.values(state.sqls).reduce((sum, sql) => sum + sql.length, 0);
-      assert.ok(totalSize <= 1_500_000, '总 SQL 大小应该在限制内');
+      const totalSize = Object.values(useQueryStore.persist.getOptions().partialize!(state).sqls).reduce((sum, sql) => sum + sql.length, 0);
+      assert.ok(totalSize <= 1_500_000, '持久化 SQL 大小应该在限制内');
+      assert.strictEqual(Object.keys(state.sqls).length, 25, '打开的草稿应全部保留');
     });
   });
 
@@ -171,6 +194,17 @@ LIMIT 100;
   });
 
   describe('边界情况', () => {
+    it('应在防抖刷新时才序列化最新快照，避免每次输入序列化全部 SQL', () => {
+      let serializations = 0;
+      const state = { sqls: {}, toJSON() { serializations++; return { sqls: {} }; } };
+      const storage = useQueryStore.persist.getOptions().storage!;
+      storage.setItem('dbterm-query-sqls', { state, version: 1 });
+      storage.setItem('dbterm-query-sqls', { state, version: 1 });
+      assert.strictEqual(serializations, 0);
+      flushQueryStorePersistence();
+      assert.strictEqual(serializations, 1);
+    });
+
     it('应该处理非常短的 SQL', () => {
       const store = useQueryStore.getState();
 

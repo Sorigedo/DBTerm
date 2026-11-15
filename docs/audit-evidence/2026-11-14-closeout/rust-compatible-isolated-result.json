@@ -1,0 +1,11 @@
+{
+  "fixture": "/var/folders/29/p22btbvx12n6p5bqjgkjwy800000gn/T/dbterm-isolated-databases-0xvwmpv9",
+  "mysql_port": 61099,
+  "postgres_port": 61100,
+  "scope": "new temporary data directories; loopback only; no desktop app",
+  "excluded": [
+    "DuckDB native library (6)"
+  ],
+  "exit_code": 0,
+  "stopped": true
+}

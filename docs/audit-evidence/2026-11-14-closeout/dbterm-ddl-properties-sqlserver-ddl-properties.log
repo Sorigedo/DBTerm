@@ -1,0 +1,2 @@
+PASS table DDL reads table/column extended-property identity, value and SQL_VARIANT type metadata.
+PASS production extended-property joins, selected object identity, table/column distinction and typed metadata; synthetic SQLite catalog only.

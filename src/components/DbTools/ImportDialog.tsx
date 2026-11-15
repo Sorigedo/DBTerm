@@ -38,14 +38,24 @@ export default function ImportDialog({ connectionId, schema, table, columns, tab
   // 目标表（可在弹窗内切换）；切换时重新拉取该表的列
   const [targetTable, setTargetTable] = useState(table)
   const [targetCols, setTargetCols]   = useState<string[]>(columns)
+  const [targetLoading, setTargetLoading] = useState(false)
+  const targetRequest = useRef(0)
   async function changeTarget(t: string) {
+    if (operationRef.current) return
+    const request = ++targetRequest.current
+    setTargetLoading(true)
     setTargetTable(t)
+    setTargetCols([])
     setCsvResult(null); setCsvError('')
     try {
       const { invoke } = await import('@tauri-apps/api/core')
       const c = await invoke<{ name: string }[]>('table_columns', { id: connectionId, schema, table: t })
-      setTargetCols(c.map(x => x.name))
-    } catch { setTargetCols([]) }
+      if (request === targetRequest.current) setTargetCols(c.map(x => x.name))
+    } catch (e) {
+      if (request === targetRequest.current) setCsvError('读取目标字段失败：' + String(e))
+    } finally {
+      if (request === targetRequest.current) setTargetLoading(false)
+    }
   }
 
   // CSV/TSV/JSON state
@@ -55,10 +65,13 @@ export default function ImportDialog({ connectionId, schema, table, columns, tab
   const [nullValue, setNullValue]       = useState('NULL')
   const [onError, setOnError]           = useState<OnError>('stop')
   const [csvPreviewCols, setCsvPreviewCols] = useState<string[]>([])
-  const [colMapping, setColMapping]     = useState<Record<string, string>>({})
+  const [colMapping, setColMapping]     = useState<string[]>([])
   const [csvImporting, setCsvImporting] = useState(false)
   const [csvResult, setCsvResult]       = useState<ImportResult | null>(null)
   const [csvError, setCsvError]         = useState('')
+  const [previewLoading, setPreviewLoading] = useState(false)
+  const [previewReady, setPreviewReady] = useState(false)
+  const previewRequest = useRef(0)
 
   // SQL file state
   const [sqlPath, setSqlPath]           = useState('')
@@ -69,75 +82,94 @@ export default function ImportDialog({ connectionId, schema, table, columns, tab
   const [sqlError, setSqlError]         = useState('')
 
   const unlistenRef = useRef<(() => void) | null>(null)
+  const operationRef = useRef(false)
+  const [csvNeedsReview, setCsvNeedsReview] = useState(false)
+  const [sqlNeedsReview, setSqlNeedsReview] = useState(false)
+  const busy = csvImporting || sqlRunning
+  function requestClose() { if (!operationRef.current) onClose() }
+
 
   // Escape key to close
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape' && !operationRef.current) onClose() }
     document.addEventListener('keydown', handler)
     return () => document.removeEventListener('keydown', handler)
   }, [onClose])
 
   // Cleanup event listener on unmount
   useEffect(() => {
-    return () => { unlistenRef.current?.() }
+    return () => {
+      ++targetRequest.current
+      ++previewRequest.current
+      unlistenRef.current?.()
+    }
   }, [])
 
-  // Re-build default mapping when preview cols or table columns change
+  // Keep mappings by source position: duplicate labels must remain independent.
   useEffect(() => {
-    const mapping: Record<string, string> = {}
-    csvPreviewCols.forEach((c) => {
-      mapping[c] = targetCols.includes(c) ? c : (targetCols[0] ?? '')
-    })
-    setColMapping(mapping)
-  }, [csvPreviewCols, targetCols])
+    setColMapping(csvPreviewCols.map((name, index) => hasHeader
+      ? (targetCols.includes(name) ? name : '')
+      : (targetCols[index] ?? '')))
+  }, [csvPreviewCols, targetCols, hasHeader])
+
+  const delimited = csvFormat === 'csv' || csvFormat === 'txt' || csvFormat === 'tsv'
+  const mappedCols = delimited ? colMapping : targetCols
+  const mappingValid = mappedCols.length > 0
+    && mappedCols.every(name => name !== '' && targetCols.includes(name))
+    && new Set(mappedCols).size === mappedCols.length
+    && (!delimited || (previewReady && mappedCols.length === csvPreviewCols.length))
+  const csvReady = !!csvPath && !!targetTable && !targetLoading && !previewLoading && mappingValid
 
   async function pickCsvFile() {
+    if (operationRef.current) return
+    const request = ++previewRequest.current
+    const format = csvFormat
+    setPreviewLoading(true)
+    setPreviewReady(false)
+    setCsvPreviewCols([])
+    setCsvPath('')
+    setCsvResult(null)
+    setCsvError('')
     try {
-      const exts = csvFormat === 'tsv' ? ['tsv', 'txt']
-        : csvFormat === 'txt' ? ['txt', 'tsv']
-        : csvFormat === 'json' ? ['json']
-        : csvFormat === 'xml' ? ['xml']
-        : csvFormat === 'excel' ? ['xlsx', 'xls']
+      const exts = format === 'tsv' ? ['tsv', 'txt']
+        : format === 'txt' ? ['txt', 'tsv']
+        : format === 'json' ? ['json']
+        : format === 'xml' ? ['xml']
+        : format === 'excel' ? ['xlsx', 'xls']
         : ['csv', 'txt']
       const { open } = await import('@tauri-apps/plugin-dialog')
-      const result = await open({ filters: [{ name: csvFormat.toUpperCase(), extensions: exts }] })
-      if (!result || typeof result !== 'string') return
+      const result = await open({ filters: [{ name: format.toUpperCase(), extensions: exts }] })
+      if (request !== previewRequest.current || !result || typeof result !== 'string') return
       setCsvPath(result)
-      setCsvResult(null)
-      setCsvError('')
-      // JSON/XML 按字段名匹配 / Excel 为二进制：无需文本列映射预览
-      if (csvFormat === 'json' || csvFormat === 'excel' || csvFormat === 'xml') { setCsvPreviewCols([]); return }
-      // 读取首行预览列（按分隔符切分）
+      if (format === 'json' || format === 'excel' || format === 'xml') return
       const { invoke } = await import('@tauri-apps/api/core')
-      try {
-        const firstLine = await invoke<string>('read_file_first_line', { path: result })
-        if (firstLine) {
-          const sep = csvFormat === 'tsv' || csvFormat === 'txt' ? '\t' : ','
-          const parts = firstLine.split(sep).map((p) => p.trim().replace(/^"|"$/g, ''))
-          setCsvPreviewCols(parts)
-        }
-      } catch {
-        setCsvPreviewCols([])
-      }
-    } catch { /* user cancelled */ }
+      const parts = await invoke<string[]>('read_delimited_file_header', { path: result, format })
+      if (request !== previewRequest.current) return
+      if (!parts.length) throw new Error('文件没有可映射的数据列')
+      setCsvPreviewCols(parts)
+      setPreviewReady(true)
+    } catch (e) {
+      if (request === previewRequest.current) setCsvError('读取文件预览失败：' + String(e))
+    } finally {
+      if (request === previewRequest.current) setPreviewLoading(false)
+    }
   }
 
   async function startCsvImport() {
-    if (!csvPath || csvImporting) return
+    if (!csvReady || operationRef.current || csvNeedsReview) return
+    operationRef.current = true
     setCsvImporting(true)
     setCsvResult(null)
     setCsvError('')
     try {
       const { invoke } = await import('@tauri-apps/api/core')
-      const mappedCols = csvPreviewCols.length > 0
-        ? csvPreviewCols.map((c) => colMapping[c] ?? targetCols[0] ?? c)
-        : targetCols
+      setCsvNeedsReview(true)
       const result = await invoke<ImportResult>('db_import_csv', {
         id: connectionId,
         schema,
         table: targetTable,
         path: csvPath,
-        columns: (csvFormat === 'json' || csvFormat === 'xml') ? targetCols : mappedCols,
+        columns: mappedCols,
         hasHeader: (csvFormat === 'json' || csvFormat === 'xml') ? false : hasHeader,
         nullValue,
         onError,
@@ -151,11 +183,12 @@ export default function ImportDialog({ connectionId, schema, table, columns, tab
       if (result.errors.length === 0 && result.inserted >= 0) {
         toast.success(`已导入 ${result.inserted} 行${result.skipped ? `（跳过 ${result.skipped} 行）` : ''}`)
       } else if (result.errors.length > 0) {
-        toast.error(`导入完成，但有 ${result.errors.length} 处错误，请查看后重试`)
+        toast.error('部分记录未导入；请核对目标数据，不要直接重跑整个文件')
       }
     } catch (e) {
       setCsvError(String(e)) // 失败只在面板内提示，避免一错两处
     } finally {
+      operationRef.current = false
       setCsvImporting(false)
     }
   }
@@ -174,7 +207,8 @@ export default function ImportDialog({ connectionId, schema, table, columns, tab
   }
 
   async function startSqlExec() {
-    if (!sqlPath || sqlRunning) return
+    if (!sqlPath || operationRef.current || sqlNeedsReview) return
+    operationRef.current = true
     setSqlRunning(true)
     setSqlProgress(null)
     setSqlErrors([])
@@ -195,8 +229,11 @@ export default function ImportDialog({ connectionId, schema, table, columns, tab
       unlistenRef.current = unlisten
 
       const { invoke } = await import('@tauri-apps/api/core')
+      setSqlNeedsReview(true)
       const res = await invoke<{ executed: number; failed: number; errors: string[] }>(
         'db_exec_sql_file', { id: connectionId, path: sqlPath, schema })
+      setSqlErrors(res.errors)
+      setSqlProgress(prev => ({ current: res.executed + res.failed, total: res.executed + res.failed, sql: prev?.sql ?? '', error: null }))
       setSqlDone(true)
       // 不论成败都刷新（部分语句可能已生效，如 CREATE TABLE）
       notifySchemaChanged(connectionId, schema)
@@ -205,12 +242,13 @@ export default function ImportDialog({ connectionId, schema, table, columns, tab
         toast.success(`SQL 执行完成，共 ${res.executed} 条语句`)
         onClose()   // 全部成功：友好提示并关闭
       } else {
-        // 有失败：保留弹窗与错误列表，便于分析重试
-        toast.error(`执行完成，但有 ${res.failed} 条语句失败，请查看下方错误后重试`)
+        // 前面的语句可能已提交，禁止鼓励直接重跑整个文件。
+        toast.error(`执行已停止，成功执行 ${res.executed} 条；此前语句可能已提交，请先核查数据库状态`)
       }
     } catch (e) {
       setSqlError(String(e)) // 失败只在面板内提示，避免一错两处
     } finally {
+      operationRef.current = false
       setSqlRunning(false)
       unlistenRef.current?.()
       unlistenRef.current = null
@@ -222,25 +260,25 @@ export default function ImportDialog({ connectionId, schema, table, columns, tab
     : 0
 
   return createPortal(
-    <div className="imp-overlay" onMouseDown={onClose}>
+    <div className="imp-overlay" onMouseDown={requestClose}>
       <div className="imp-card" onMouseDown={(e) => e.stopPropagation()}>
         {/* Header */}
         <div className="imp-header">
           <span className="imp-header__title">导入数据 — {schema ? `${schema}.` : ''}{targetTable}</span>
-          <button className="imp-header__close" onClick={onClose}><X size={15} /></button>
+          <button className="imp-header__close" disabled={busy} onClick={requestClose}><X size={15} /></button>
         </div>
 
         {/* Tabs */}
         <div className="imp-tabs">
           <button
             className={`imp-tab ${activeTab === 'sql' ? 'imp-tab--active' : ''}`}
-            onClick={() => setActiveTab('sql')}
+            disabled={busy} onClick={() => setActiveTab('sql')}
           >
             <Database size={13} /> SQL 文件
           </button>
           <button
             className={`imp-tab ${activeTab === 'csv' ? 'imp-tab--active' : ''}`}
-            onClick={() => setActiveTab('csv')}
+            disabled={busy} onClick={() => setActiveTab('csv')}
           >
             <FileText size={13} /> 数据文件
           </button>
@@ -248,12 +286,12 @@ export default function ImportDialog({ connectionId, schema, table, columns, tab
 
         {/* CSV/TSV/JSON Tab */}
         {activeTab === 'csv' && (
-          <div className="imp-body">
+          <fieldset className="imp-body" disabled={busy}>
             {/* 目标表选择（提供了表列表时可切换） */}
             {tables && tables.length > 1 && (
               <div className="imp-row imp-row--gap">
                 <span className="imp-label">目标表</span>
-                <SearchableSelect value={targetTable} onChange={changeTarget} options={tables} width={240} />
+                <SearchableSelect disabled={busy} value={targetTable} onChange={changeTarget} options={tables} width={240} />
               </div>
             )}
             {/* 格式选择 */}
@@ -262,7 +300,7 @@ export default function ImportDialog({ connectionId, schema, table, columns, tab
               {(['csv', 'txt', 'tsv', 'json', 'excel', 'xml'] as const).map((f) => (
                 <button key={f}
                   className={`imp-fmt-btn ${csvFormat === f ? 'imp-fmt-btn--active' : ''}`}
-                  onClick={() => { setCsvFormat(f); setCsvPath(''); setCsvPreviewCols([]); setCsvResult(null); setCsvError('') }}>
+                  onClick={() => { ++previewRequest.current; setPreviewLoading(false); setPreviewReady(false); setCsvFormat(f); setCsvPath(''); setCsvPreviewCols([]); setCsvResult(null); setCsvError('') }}>
                   {f === 'excel' ? 'Excel' : f.toUpperCase()}
                 </button>
               ))}
@@ -284,16 +322,16 @@ export default function ImportDialog({ connectionId, schema, table, columns, tab
               </label>
             )}
             {csvFormat === 'json' && (
-              <div className="imp-hint">JSON 需为对象数组，按字段名自动匹配目标表列（缺失字段写入 NULL）。</div>
+              <div className="imp-hint">JSON 需为字段名唯一的对象数组，按字段名匹配；缺失字段和 JSON null 写入 NULL，字符串 "NULL" 保留为文本。</div>
             )}
             {csvFormat === 'xml' && (
-              <div className="imp-hint">XML 需为 &lt;row&gt; 行、列作为子节点（如本工具导出的格式），按节点名匹配目标表列。</div>
+              <div className="imp-hint">XML 按 row 行和字段节点名匹配；自闭合字段为 NULL，空标签为字符串空值，文本 NULL 保留；文件必须完整。</div>
             )}
             {csvFormat === 'txt' && (
               <div className="imp-hint">按制表符（Tab）分隔解析，与 TSV 相同。</div>
             )}
             {csvFormat === 'excel' && (
-              <div className="imp-hint">读取第一个工作表；勾选「包含表头行」则按表头名匹配目标列，否则按列顺序映射。</div>
+              <div className="imp-hint">读取第一个工作表；有表头时按唯一名称匹配，缺少目标字段会报错；无表头须列数一致。错误单元格拒绝导入。</div>
             )}
 
             {csvPreviewCols.length > 0 && (
@@ -307,13 +345,14 @@ export default function ImportDialog({ connectionId, schema, table, columns, tab
                     </tr>
                   </thead>
                   <tbody>
-                    {csvPreviewCols.map((csvCol) => (
-                      <tr key={csvCol}>
-                        <td className="imp-map-table__src">{csvCol}</td>
+                    {csvPreviewCols.map((csvCol, index) => (
+                      <tr key={index}>
+                        <td className="imp-map-table__src">{hasHeader ? csvCol : '第 ' + (index + 1) + ' 列'}</td>
                         <td>
                           <SearchableSelect
-                            value={colMapping[csvCol] ?? ''}
-                            onChange={(v) => setColMapping({ ...colMapping, [csvCol]: v })}
+                            disabled={busy}
+                            value={colMapping[index] ?? ''}
+                            onChange={(v) => setColMapping(previous => previous.map((name, i) => i === index ? v : name))}
                             options={targetCols}
                           />
                         </td>
@@ -359,6 +398,8 @@ export default function ImportDialog({ connectionId, schema, table, columns, tab
               </label>
             </div>
 
+            {(targetLoading || previewLoading) && <div className="imp-hint">正在读取字段或文件预览…</div>}
+            {delimited && previewReady && !mappingValid && <div className="imp-warning">请为每个来源列选择不同的目标字段；未匹配字段不会自动赋值。</div>}
             {csvError && <div className="imp-error"><AlertTriangle size={13} /> {csvError}</div>}
 
             {csvResult && (
@@ -374,25 +415,31 @@ export default function ImportDialog({ connectionId, schema, table, columns, tab
               </div>
             )}
 
+            {csvNeedsReview && !busy && (
+              <label className="imp-checkbox-row">
+                <input type="checkbox" checked={false} onChange={() => setCsvNeedsReview(false)} />
+                <span>我已核对目标数据和执行结果，确认下一次导入不会重复写入</span>
+              </label>
+            )}
             {!targetTable && (
               <div className="imp-hint">当前库还没有表。请到「SQL 文件」标签导入包含建表语句的 .sql 脚本，或先建表后再用此处导入数据文件。</div>
             )}
             <div className="imp-footer">
-              <button className="imp-btn imp-btn--cancel" onClick={onClose}>关闭</button>
+              <button className="imp-btn imp-btn--cancel" disabled={busy} onClick={requestClose}>关闭</button>
               <button
                 className="imp-btn imp-btn--primary"
-                disabled={!csvPath || !targetTable || csvImporting}
+                disabled={!csvReady || busy || csvNeedsReview}
                 onClick={startCsvImport}
               >
                 {csvImporting ? <><Loader2 size={13} className="spin" /> 导入中…</> : '开始导入'}
               </button>
             </div>
-          </div>
+          </fieldset>
         )}
 
         {/* SQL Tab */}
         {activeTab === 'sql' && (
-          <div className="imp-body">
+          <fieldset className="imp-body" disabled={busy}>
             <div className="imp-row">
               <button className="imp-pick-btn" onClick={pickSqlFile}>选择 SQL 文件</button>
               {sqlPath && <span className="imp-filepath">{sqlPath}</span>}
@@ -419,8 +466,8 @@ export default function ImportDialog({ connectionId, schema, table, columns, tab
 
             {sqlDone && !sqlRunning && (
               <div className="imp-result">
-                <CheckCircle2 size={13} className="imp-result__icon" />
-                执行完成
+                {sqlErrors.length > 0 ? <AlertTriangle size={13} /> : <CheckCircle2 size={13} className="imp-result__icon" />}
+                {sqlErrors.length > 0 ? '执行已停止，请核查此前语句的提交状态' : '执行完成'}
                 {sqlProgress && <span> · 共 {sqlProgress.total} 条语句</span>}
               </div>
             )}
@@ -435,18 +482,24 @@ export default function ImportDialog({ connectionId, schema, table, columns, tab
             )}
 
             {sqlError && <div className="imp-error"><AlertTriangle size={13} /> {sqlError}</div>}
+            {sqlNeedsReview && !busy && (
+              <label className="imp-checkbox-row">
+                <input type="checkbox" checked={false} onChange={() => setSqlNeedsReview(false)} />
+                <span>我已核对数据库状态，确认下一次执行不会重复写入</span>
+              </label>
+            )}
 
             <div className="imp-footer">
-              <button className="imp-btn imp-btn--cancel" onClick={onClose}>关闭</button>
+              <button className="imp-btn imp-btn--cancel" disabled={busy} onClick={requestClose}>关闭</button>
               <button
                 className="imp-btn imp-btn--primary"
-                disabled={!sqlPath || sqlRunning}
+                disabled={!sqlPath || busy || sqlNeedsReview}
                 onClick={startSqlExec}
               >
                 {sqlRunning ? <><Loader2 size={13} className="spin" /> 执行中…</> : '开始执行'}
               </button>
             </div>
-          </div>
+          </fieldset>
         )}
       </div>
 
@@ -491,6 +544,7 @@ export default function ImportDialog({ connectionId, schema, table, columns, tab
         .imp-tab:hover { color: var(--text); background: var(--surface-hover); }
         .imp-tab--active { color: var(--accent); border-bottom-color: var(--accent); }
         .imp-body {
+          border: 0; margin: 0; min-width: 0;
           flex: 1; overflow-y: auto;
           padding: 14px 16px;
           display: flex; flex-direction: column; gap: 10px;

@@ -1,0 +1,2 @@
+PASS table DDL trigger catalog contract includes definition, creation flags, disabled and event ordering.
+PASS actual production trigger SELECT target joins, definition, flags, disabled and event order; synthetic SQLite catalog only.

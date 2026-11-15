@@ -15,17 +15,71 @@ pub type SqliteWatcherMap = Arc<std::sync::Mutex<HashMap<String, notify::Recomme
 
 // ── 连接打开辅助（复用 query.rs 的 sqlite_open 逻辑） ────────────────────────
 // 为避免跨模块调用，此处内联轻量版本（只需 PRAGMA 命令，无需 busy_timeout/FK 等）
+fn sqlite_admin_readonly(config: &ConnConfig) -> bool {
+    let extra = config.extra_json.as_deref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()).unwrap_or_default();
+    config.read_only == Some(true) || ["sqliteReadonly", "sqliteImmutable"].iter().any(|key| extra.get(*key).and_then(|v| v.as_bool()) == Some(true))
+}
+
+fn require_admin_write(config: &ConnConfig) -> Result<(), String> {
+    if sqlite_admin_readonly(config) { return Err("只读连接不允许修改数据库或恢复备份".into()); }
+    Ok(())
+}
+
+struct NewSqliteOutput {
+    staged: super::db_export::StagedExport,
+    destination: std::path::PathBuf,
+}
+
+impl NewSqliteOutput {
+    fn new(path: &str, source: &str) -> Result<Self, String> {
+        super::db_extra::validate_path(path)?;
+        let destination = std::path::PathBuf::from(path);
+        let parent = destination.parent().ok_or("输出目录不存在")?.canonicalize().map_err(|e| e.to_string())?;
+        let target = parent.join(destination.file_name().ok_or("输出文件名无效")?);
+        let source = std::path::Path::new(source).canonicalize().map_err(|e| e.to_string())?;
+        if ["", "-wal", "-shm", "-journal"].iter().any(|suffix| target == std::path::PathBuf::from(format!("{}{suffix}", source.display()))) {
+            return Err("输出路径不能是源数据库或其日志文件".into());
+        }
+        if std::fs::symlink_metadata(&destination).is_ok() { return Err("输出文件已存在，请选择新文件，原文件未修改".into()); }
+        Ok(Self { staged: super::db_export::StagedExport::new(path)?, destination })
+    }
+
+    fn publish(&self) -> Result<(), String> {
+        std::fs::OpenOptions::new().write(true).open(&self.staged.path).and_then(|file| file.sync_all()).map_err(|e| format!("输出落盘失败: {e}"))?;
+        // Atomic no-replace publication, even if another process creates the
+        // destination after preflight. The staging guard removes its link.
+        std::fs::hard_link(&self.staged.path, &self.destination).map_err(|e| format!("发布新输出文件失败，已有文件未修改: {e}"))
+    }
+}
+
+async fn vacuum_into_new_file(config: &ConnConfig, path: &str) -> Result<(), String> {
+    use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions};
+    use std::str::FromStr;
+    let source = config.file_path.as_deref().ok_or("SQLite 文件路径不能为空")?;
+    let output = NewSqliteOutput::new(path, source)?;
+    // File-mode readonly protects the source while permitting VACUUM INTO's
+    // separate output DB; query_only would also reject this legitimate backup.
+    let mut conn = SqliteConnectOptions::from_str(&super::query::sqlite_url(config)?).map_err(|e| e.to_string())?
+        .read_only(true).busy_timeout(std::time::Duration::from_secs(30)).log_statements(log::LevelFilter::Off)
+        .connect().await.map_err(|e| e.to_string())?;
+    sqlx::query("VACUUM INTO ?").bind(&output.staged.path).execute(&mut conn).await.map_err(|e| format!("备份失败: {e}"))?;
+    output.publish()
+}
+
 async fn admin_conn(config: &ConnConfig) -> Result<sqlx::sqlite::SqliteConnection, String> {
     use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions};
     use std::str::FromStr;
-    let path = config.file_path.as_deref().filter(|s| !s.is_empty())
-        .ok_or_else(|| "SQLite 文件路径不能为空".to_string())?;
-    let url = format!("sqlite://{path}");
+    let url = super::query::sqlite_url(config)?;
     let opts = SqliteConnectOptions::from_str(&url)
         .map_err(|e| format!("SQLite URL 解析失败: {e}"))?
+        .read_only(sqlite_admin_readonly(config))
         .busy_timeout(std::time::Duration::from_secs(5))
         .log_statements(log::LevelFilter::Off);
-    opts.connect().await.map_err(|e| format!("SQLite 打开失败: {e}"))
+    let mut conn = opts.connect().await.map_err(|e| format!("SQLite 打开失败: {e}"))?;
+    if sqlite_admin_readonly(config) {
+        sqlx::query("PRAGMA query_only=ON").execute(&mut conn).await.map_err(|e| format!("设置只读模式失败: {e}"))?;
+    }
+    Ok(conn)
 }
 
 fn load_config(storage: &StorageState, conn_id: &str) -> Result<ConnConfig, String> {
@@ -224,13 +278,13 @@ pub async fn sqlite_vacuum(
     storage: State<'_, StorageState>,
 ) -> Result<String, String> {
     let config = load_config(&storage, &id)?;
+    if let Some(path) = into_path {
+        vacuum_into_new_file(&config, &path).await?;
+        return Ok("VACUUM INTO 完成".into());
+    }
+    require_admin_write(&config)?;
     let mut conn = admin_conn(&config).await?;
-    let sql = if let Some(path) = into_path {
-        format!("VACUUM INTO '{}'", path.replace('\'', "''"))
-    } else {
-        "VACUUM".to_string()
-    };
-    sqlx::query(&sql).execute(&mut conn).await
+    sqlx::query("VACUUM").execute(&mut conn).await
         .map_err(|e| format!("VACUUM 失败: {e}"))?;
     Ok("VACUUM 完成".to_string())
 }
@@ -242,6 +296,7 @@ pub async fn sqlite_analyze(
     storage: State<'_, StorageState>,
 ) -> Result<String, String> {
     let config = load_config(&storage, &id)?;
+    require_admin_write(&config)?;
     let mut conn = admin_conn(&config).await?;
     let sql = if let Some(t) = table {
         format!("ANALYZE '{}'", t.replace('\'', "''"))
@@ -259,6 +314,7 @@ pub async fn sqlite_optimize(
     storage: State<'_, StorageState>,
 ) -> Result<String, String> {
     let config = load_config(&storage, &id)?;
+    require_admin_write(&config)?;
     let mut conn = admin_conn(&config).await?;
     sqlx::query("PRAGMA optimize").execute(&mut conn).await
         .map_err(|e| format!("PRAGMA optimize 失败: {e}"))?;
@@ -368,6 +424,7 @@ pub async fn sqlite_wal_checkpoint(
     storage: State<'_, StorageState>,
 ) -> Result<CheckpointResult, String> {
     let config = load_config(&storage, &id)?;
+    require_admin_write(&config)?;
     let mut conn = admin_conn(&config).await?;
     use sqlx::Row;
 
@@ -391,6 +448,7 @@ pub async fn sqlite_set_journal_mode(
     storage: State<'_, StorageState>,
 ) -> Result<String, String> {
     let config = load_config(&storage, &id)?;
+    require_admin_write(&config)?;
     let mut conn = admin_conn(&config).await?;
     use sqlx::Row;
 
@@ -477,6 +535,7 @@ pub async fn sqlite_set_pragma(
         return Err(format!("PRAGMA `{name}` 不在可写白名单"));
     }
     let config = load_config(&storage, &id)?;
+    require_admin_write(&config)?;
     let mut conn = admin_conn(&config).await?;
     use sqlx::Row;
     let sql = format!("PRAGMA {name}={value}");
@@ -520,7 +579,7 @@ pub async fn sqlite_lock_diagnosis(
     let processes = detect_locking_processes(&path);
 
     // WAL checkpoint 探测（PASSIVE，不阻塞）
-    let (wal_checkpoint, wal_size) = if let Ok(mut conn) = admin_conn(&config).await {
+    let (wal_checkpoint, wal_size) = if let Ok(mut conn) = async { require_admin_write(&config)?; admin_conn(&config).await }.await {
         use sqlx::Row;
         let wal_sz = std::fs::metadata(&format!("{path}-wal")).map(|m| m.len()).unwrap_or(0);
         let cp = sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
@@ -811,9 +870,6 @@ pub async fn sqlite_backup(
     note: Option<String>,
     storage: State<'_, StorageState>,
 ) -> Result<BackupRecord, String> {
-    use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions};
-    use std::str::FromStr;
-
     let config = load_config(&storage, &id)?;
     let db_path = config.file_path.as_deref().filter(|s| !s.is_empty())
         .ok_or_else(|| "SQLite 文件路径不能为空".to_string())?;
@@ -836,19 +892,7 @@ pub async fn sqlite_backup(
     let backup_path = out_dir.join(&backup_name);
     let backup_path_str = backup_path.to_string_lossy().to_string();
 
-    // VACUUM INTO creates a clean copy without WAL
-    let url = format!("sqlite://{db_path}");
-    let opts = SqliteConnectOptions::from_str(&url)
-        .map_err(|e| format!("URL 解析失败: {e}"))?
-        .busy_timeout(std::time::Duration::from_secs(30))
-        .log_statements(log::LevelFilter::Off);
-    let mut conn = opts.connect().await.map_err(|e| format!("连接失败: {e}"))?;
-
-    sqlx::query(&format!("VACUUM INTO '{}'", backup_path_str.replace('\'', "''")))
-        .execute(&mut conn)
-        .await
-        .map_err(|e| format!("VACUUM INTO 失败: {e}"))?;
-    drop(conn);
+    vacuum_into_new_file(&config, &backup_path_str).await?;
 
     let size = std::fs::metadata(&backup_path).map(|m| m.len()).unwrap_or(0);
     let record = BackupRecord {
@@ -889,6 +933,11 @@ pub async fn sqlite_restore_backup(
     storage: State<'_, StorageState>,
 ) -> Result<String, String> {
     let config = load_config(&storage, &id)?;
+    restore_backup_with_config(&config, backup_path).await
+}
+
+async fn restore_backup_with_config(config: &ConnConfig, backup_path: String) -> Result<String, String> {
+    require_admin_write(&config)?;
     let db_path = config.file_path.as_deref().filter(|s| !s.is_empty())
         .ok_or_else(|| "SQLite 文件路径不能为空".to_string())?;
 
@@ -907,27 +956,41 @@ pub async fn sqlite_restore_backup(
         }
     }
 
-    let ts = unix_now();
-    let archive_path = format!("{db_path}.{ts}.bak");
-
-    // Step 1: rename original db → .bak (留底)
-    std::fs::rename(db_path, &archive_path)
-        .map_err(|e| format!("原库重命名失败: {e}"))?;
-
-    // Step 2: remove stale WAL/SHM if present to avoid corruption
-    for ext in &["-wal", "-shm"] {
-        let sidecar = format!("{db_path}{ext}");
-        let _ = std::fs::remove_file(&sidecar);
+    use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions, Connection};
+    let db_canonical = std::path::Path::new(db_path).canonicalize().map_err(|e| e.to_string())?;
+    let backup_canonical = src.canonicalize().map_err(|e| e.to_string())?;
+    if db_canonical == backup_canonical { return Err("备份不能是当前数据库".into()); }
+    if same_file::is_same_file(&db_canonical, &backup_canonical).map_err(|e| format!("校验恢复文件标识失败: {e}"))? {
+        return Err("备份不能是当前数据库的硬链接".into());
     }
+    let mut source = SqliteConnectOptions::new().filename(&backup_canonical).read_only(true).connect().await.map_err(|e| format!("打开备份失败: {e}"))?;
+    let checks: Vec<String> = sqlx::query_scalar("PRAGMA integrity_check").fetch_all(&mut source).await.map_err(|e| format!("校验备份失败: {e}"))?;
+    if checks.as_slice() != ["ok"] { return Err(format!("备份完整性检查未通过: {}", checks.join("; "))); }
+    let mut destination = admin_conn(config).await?;
+    // Keep the active database inode and WAL/SHM ownership intact.
+    let archive_path = format!("{db_path}.{}.bak", uuid::Uuid::new_v4().simple());
+    sqlx::query("VACUUM INTO ?").bind(&archive_path).execute(&mut destination).await.map_err(|e| format!("创建恢复前备份失败，原库未修改: {e}"))?;
+    copy_sqlite_backup(&mut source, &mut destination).await?;
+    destination.close().await.map_err(|e| format!("恢复已提交，关闭连接失败，请核验: {e}"))?;
+    Ok(format!("恢复成功。原库一致性备份: {archive_path}"))
+}
 
-    // Step 3: copy backup to db_path
-    if let Err(e) = std::fs::copy(src, db_path) {
-        // Rollback: restore archive
-        let _ = std::fs::rename(&archive_path, db_path);
-        return Err(format!("复制备份文件失败（已回滚）: {e}"));
+async fn copy_sqlite_backup(source: &mut sqlx::SqliteConnection, destination: &mut sqlx::SqliteConnection) -> Result<(), String> {
+    let mut source_handle = source.lock_handle().await.map_err(|e| e.to_string())?;
+    let mut destination_handle = destination.lock_handle().await.map_err(|e| e.to_string())?;
+    // Locked SQLx handles exclude their background workers during FFI.
+    // DONE commits atomically; finish rolls back any incomplete backup.
+    let status = unsafe {
+        let backup = libsqlite3_sys::sqlite3_backup_init(destination_handle.as_raw_handle().as_ptr(), c"main".as_ptr(), source_handle.as_raw_handle().as_ptr(), c"main".as_ptr());
+        if backup.is_null() { return Err("无法启动原子恢复，目标库未替换".into()); }
+        let step = libsqlite3_sys::sqlite3_backup_step(backup, -1);
+        let finish = libsqlite3_sys::sqlite3_backup_finish(backup);
+        (step, finish)
+    };
+    if status != (libsqlite3_sys::SQLITE_DONE, libsqlite3_sys::SQLITE_OK) {
+        return Err(format!("恢复未完成（SQLite code {}/{}），未完成的备份事务已回滚，原库未被文件替换", status.0, status.1));
     }
-
-    Ok(format!("恢复成功。原库已留底为: {archive_path}"))
+    Ok(())
 }
 
 // ─── S4.4 数据字典导出 ────────────────────────────────────────────────────────
@@ -1190,6 +1253,236 @@ pub async fn sqlite_health_report(
 
 // ─── S3.5 SQLite ↔ SQLite 库对比 ─────────────────────────────────────────────
 
+#[cfg(test)]
+mod db_compare_boundary_tests {
+    #[tokio::test]
+    async fn real_sqlite_dump_and_rescue_keep_legal_sqlite_prefix_table() {
+        use sqlx::Connection;
+        let root = std::env::temp_dir().join(format!("dbterm-export-prefix-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("source.db");
+        std::fs::File::create(&source).unwrap();
+        let config = policy_config(&source, "writable");
+        let mut conn = super::admin_conn(&config).await.unwrap();
+        sqlx::query("CREATE TABLE sqliteXlegal(v INTEGER); INSERT INTO sqliteXlegal VALUES(17)").execute(&mut conn).await.unwrap();
+        conn.close().await.unwrap();
+        let mut evidence = Vec::new();
+        for rescue in [false, true] {
+            let output = root.join(format!("dump-{rescue}.sql"));
+            if rescue { super::rescue_with_config(&config, output.to_string_lossy().into_owned()).await.unwrap(); }
+            else { super::dump_sql_with_config(&config, output.to_string_lossy().into_owned(), None).await.unwrap(); }
+            let script = std::fs::read_to_string(output).unwrap();
+            let mut restored = sqlx::SqliteConnection::connect("sqlite::memory:").await.unwrap();
+            sqlx::raw_sql(&script).execute(&mut restored).await.unwrap();
+            let value = sqlx::query_scalar::<_, i64>("SELECT v FROM sqliteXlegal").fetch_one(&mut restored).await.ok();
+            restored.close().await.unwrap(); evidence.push((rescue, value));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        for (rescue, value) in evidence { assert_eq!(value, Some(17), "rescue={rescue}: legal sqliteX table lost from export"); }
+    }
+
+    #[tokio::test]
+    async fn real_sqlite_backup_restore_failure_preserves_database_and_output_publication() {
+        use sqlx::Connection;
+        let root = std::env::temp_dir().join(format!("dbterm-admin-boundaries-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("source.db");
+        let destination = root.join("destination.db");
+        for (path, value) in [(&source, 11), (&destination, 7)] {
+            std::fs::File::create(path).unwrap();
+            let mut conn = super::admin_conn(&policy_config(path, "writable")).await.unwrap();
+            sqlx::query(&format!("CREATE TABLE sentinel(v); INSERT INTO sentinel VALUES({value})")).execute(&mut conn).await.unwrap();
+            conn.close().await.unwrap();
+        }
+        let mut src = super::admin_conn(&policy_config(&source, "global")).await.unwrap();
+        let mut dst = super::admin_conn(&policy_config(&destination, "writable")).await.unwrap();
+        let mut writer = super::admin_conn(&policy_config(&destination, "writable")).await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE; UPDATE sentinel SET v=8").execute(&mut writer).await.unwrap();
+        let denied = super::copy_sqlite_backup(&mut src, &mut dst).await.is_err();
+        sqlx::query("ROLLBACK").execute(&mut writer).await.unwrap();
+        let value: i64 = sqlx::query_scalar("SELECT v FROM sentinel").fetch_one(&mut dst).await.unwrap();
+        writer.close().await.unwrap(); dst.close().await.unwrap(); src.close().await.unwrap();
+        let final_path = root.join("race.sql");
+        let staging = super::NewSqliteOutput::new(final_path.to_str().unwrap(), source.to_str().unwrap()).unwrap();
+        std::fs::write(&staging.staged.path, b"new output").unwrap();
+        std::fs::write(&final_path, b"concurrent owner").unwrap();
+        assert!(staging.publish().is_err());
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"concurrent owner");
+        let staged_path = staging.staged.path.clone(); drop(staging);
+        assert!(!std::path::Path::new(&staged_path).exists());
+        let new_path = root.join("new.sql");
+        let success = super::dump_sql_with_config(&policy_config(&source, "global"), new_path.to_string_lossy().into_owned(), None).await;
+        let backup = root.join("readonly-backup.db");
+        super::vacuum_into_new_file(&policy_config(&source, "global"), backup.to_str().unwrap()).await.unwrap();
+        let mut verify = super::admin_conn(&policy_config(&backup, "global")).await.unwrap();
+        let backup_value: i64 = sqlx::query_scalar("SELECT v FROM sentinel").fetch_one(&mut verify).await.unwrap();
+        verify.close().await.unwrap();
+        assert_eq!(backup_value, 11);
+        let mut sidecar = source.as_os_str().to_os_string(); sidecar.push("-wal");
+        assert!(super::NewSqliteOutput::new(std::path::Path::new(&sidecar).to_str().unwrap(), source.to_str().unwrap()).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(denied); assert_eq!(value, 7); assert!(success.is_ok());
+    }
+
+    #[tokio::test]
+    async fn real_sqlite_restore_keeps_open_connection_on_same_database() {
+        use sqlx::Connection;
+        let root = std::env::temp_dir().join(format!("dbterm-restore-open-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let database = root.join("active.db");
+        let backup = root.join("backup.db");
+        for (path, value) in [(&database, 7), (&backup, 11)] {
+            std::fs::File::create(path).unwrap();
+            let mut conn = super::admin_conn(&policy_config(path, "writable")).await.unwrap();
+            sqlx::query(&format!("PRAGMA journal_mode=WAL; CREATE TABLE sentinel(v); INSERT INTO sentinel VALUES({value})")).execute(&mut conn).await.unwrap();
+            conn.close().await.unwrap();
+        }
+        let config = policy_config(&database, "writable");
+        let mut existing = super::admin_conn(&config).await.unwrap();
+        let before: i64 = sqlx::query_scalar("SELECT v FROM sentinel").fetch_one(&mut existing).await.unwrap();
+        let alias = root.join("source-alias.db");
+        std::fs::hard_link(&database, &alias).unwrap();
+        let alias_refused = super::restore_backup_with_config(&config, alias.to_string_lossy().into_owned()).await.is_err();
+        let archives_before = std::fs::read_dir(&root).unwrap().filter_map(Result::ok).filter(|entry| entry.path().extension().is_some_and(|e| e == "bak")).count();
+        let result = super::restore_backup_with_config(&config, backup.to_string_lossy().into_owned()).await;
+        let old_view: Result<i64, _> = sqlx::query_scalar("SELECT v FROM sentinel").fetch_one(&mut existing).await;
+        let mut reopened = super::admin_conn(&config).await.unwrap();
+        let new_view: i64 = sqlx::query_scalar("SELECT v FROM sentinel").fetch_one(&mut reopened).await.unwrap();
+        existing.close().await.unwrap(); reopened.close().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        result.unwrap();
+        assert!(alias_refused, "same-inode source must be refused");
+        assert_eq!(archives_before, 0, "alias rejection must happen before archive side effects");
+        assert_eq!(before, 7);
+        assert_eq!(old_view.unwrap(), 11, "existing connection stayed on renamed original instead of restored database");
+        assert_eq!(new_view, 11);
+    }
+
+    #[tokio::test]
+    async fn real_sqlite_dump_and_rescue_never_overwrite_source_or_existing_output() {
+        use sqlx::Connection;
+        let root = std::env::temp_dir().join(format!("dbterm-admin-output-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let mut evidence = Vec::new();
+        for rescue in [false, true] {
+            for alias in [false, true] {
+                let source = root.join(format!("source-{rescue}-{alias}.db"));
+                std::fs::File::create(&source).unwrap();
+                let config = policy_config(&source, "global");
+                let mut writable = config.clone(); writable.read_only = Some(false);
+                let mut conn = super::admin_conn(&writable).await.unwrap();
+                sqlx::query("CREATE TABLE sentinel(v); INSERT INTO sentinel VALUES('keep')").execute(&mut conn).await.unwrap();
+                conn.close().await.unwrap();
+                let before = std::fs::read(&source).unwrap();
+                let output = root.join(format!("out-{rescue}-{alias}.sql"));
+                if alias { std::fs::hard_link(&source, &output).unwrap(); } else { std::fs::write(&output, b"existing output").unwrap(); }
+                let output_before = std::fs::read(&output).unwrap();
+                let failed = if rescue { super::rescue_with_config(&config, output.to_string_lossy().into_owned()).await.is_err() }
+                    else { super::dump_sql_with_config(&config, output.to_string_lossy().into_owned(), None).await.is_err() };
+                evidence.push((rescue, alias, failed, before == std::fs::read(&source).unwrap(), output_before == std::fs::read(&output).unwrap()));
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        for (rescue, alias, failed, source_kept, output_kept) in evidence {
+            assert!(failed, "rescue={rescue}, alias={alias}: existing output must be rejected");
+            assert!(source_kept && output_kept, "rescue={rescue}, alias={alias}: source or existing output overwritten");
+        }
+    }
+
+    fn policy_config(path: &std::path::Path, mode: &str) -> crate::models::ConnConfig {
+        let mut config: crate::models::ConnConfig = serde_json::from_value(serde_json::json!({
+            "id":"sqlite-admin-policy","name":"test","type":"sqlite",
+            "useSsl":false,"createdAt":0,"updatedAt":0
+        })).unwrap();
+        config.file_path = Some(path.to_string_lossy().into_owned());
+        config.read_only = Some(mode == "global");
+        config.extra_json = Some(serde_json::json!({ mode: true }).to_string());
+        config
+    }
+
+    #[tokio::test]
+    async fn real_sqlite_admin_connection_enforces_every_readonly_policy() {
+        use sqlx::Connection;
+        let path = std::env::temp_dir().join(format!("dbterm-admin-policy-{}.db", uuid::Uuid::new_v4()));
+        std::fs::File::create(&path).unwrap();
+        let mut setup = super::admin_conn(&policy_config(&path, "writable")).await.unwrap();
+        sqlx::query("CREATE TABLE sentinel(v INTEGER); INSERT INTO sentinel VALUES(7)").execute(&mut setup).await.unwrap();
+        setup.close().await.unwrap();
+        let mut evidence = Vec::new();
+        for mode in ["global", "sqliteReadonly", "sqliteImmutable"] {
+            let mut conn = super::admin_conn(&policy_config(&path, mode)).await.unwrap();
+            let update = sqlx::query("UPDATE sentinel SET v=99").execute(&mut conn).await;
+            let temp = sqlx::query("CREATE TEMP TABLE bypass(v)").execute(&mut conn).await;
+            let value: i64 = sqlx::query_scalar("SELECT v FROM sentinel").fetch_one(&mut conn).await.unwrap();
+            conn.close().await.unwrap();
+            evidence.push((mode, update.is_err(), temp.is_err(), value));
+        }
+        std::fs::remove_file(path).unwrap();
+        for (mode, update_blocked, temp_blocked, value) in evidence {
+            assert!(update_blocked, "{mode}: maintenance connection bypassed main DB write protection");
+            assert!(temp_blocked, "{mode}: maintenance connection bypassed TEMP write protection");
+            assert_eq!(value, 7, "{mode}: protected data changed");
+        }
+    }
+
+    #[tokio::test]
+    async fn real_sqlite_compare_keeps_legal_sqlite_prefix_names() {
+        use sqlx::{Connection, Executor};
+        let root = std::env::temp_dir().join(format!("dbterm-compare-prefix-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let left = root.join("left.sqlite");
+        let right = root.join("right.sqlite");
+        for (path, kind) in [(&left, "TEXT"), (&right, "INTEGER")] {
+            std::fs::File::create(path).unwrap();
+            let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display())).await.unwrap();
+            conn.execute(format!("CREATE TABLE sqliteXlegal(value {kind})").as_str()).await.unwrap();
+            conn.close().await.unwrap();
+        }
+        let result = super::sqlite_compare_files(left.to_str().unwrap(), right.to_str().unwrap(), None).await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(result.ddl_diff.iter().any(|d| d.name == "sqliteXlegal" && d.kind == "changed"), "legal sqliteX table must not be filtered as internal sqlite_ object");
+    }
+
+    #[test]
+    fn equal_counts_report_never_claims_data_equality_or_generates_sync_sql() {
+        let text = super::sqlite_count_only_report(&[("same".into(), 1, 1)]);
+        assert!(text.contains("内容未校验"));
+        assert!(!text.contains("INSERT"));
+        assert!(!text.contains("DELETE"));
+        assert!(!text.contains("数据一致"));
+    }
+
+    #[tokio::test]
+    async fn real_sqlite_equal_count_different_values_is_explicitly_unchecked() {
+        use sqlx::{Connection, Executor};
+        let root = std::env::temp_dir().join(format!("dbterm-sqlite-compare-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let left = root.join("left.sqlite");
+        let right = root.join("right.sqlite");
+        for (path, value) in [(&left, 1), (&right, 2)] {
+            std::fs::File::create(path).unwrap();
+            let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display())).await.unwrap();
+            conn.execute("CREATE TABLE data(id INTEGER PRIMARY KEY, value INTEGER); CREATE INDEX value_index ON data(value)").await.unwrap();
+            conn.execute(format!("INSERT INTO data VALUES(1,{value})").as_str()).await.unwrap();
+            conn.close().await.unwrap();
+        }
+        let result = super::sqlite_compare_files(left.to_str().unwrap(), right.to_str().unwrap(), None).await.unwrap();
+        assert!(result.ddl_diff.is_empty());
+        assert_eq!(result.data_changes, 0);
+        assert!(result.data_script.contains("内容未校验"));
+        assert!(!result.data_script.contains("INSERT"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+fn sqlite_count_only_report(rows: &[(String, i64, i64)]) -> String {
+    let mut lines = vec!["-- 仅行数比较；内容未校验，不生成同步 SQL。".to_string()];
+    for (table, left, right) in rows {
+        lines.push(format!("-- 表 {table:?}: 左 {left} 行，右 {right} 行；内容未校验"));
+    }
+    lines.join("\n")
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DbDiffResult {
@@ -1215,17 +1508,20 @@ pub async fn sqlite_db_diff(
     tables: Option<Vec<String>>,
     storage: State<'_, StorageState>,
 ) -> Result<DbDiffResult, String> {
-    use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions, Row};
-    use std::str::FromStr;
-    
-
     let left_cfg = load_config(&storage, &left_id)?;
     let right_cfg = load_config(&storage, &right_id)?;
+    if left_cfg.conn_type != crate::models::ConnType::Sqlite || right_cfg.conn_type != crate::models::ConnType::Sqlite { return Err("仅支持 SQLite 文件连接对比".into()); }
 
     let left_path = left_cfg.file_path.as_deref().filter(|s| !s.is_empty())
         .ok_or_else(|| "左侧 SQLite 文件路径不能为空".to_string())?;
     let right_path = right_cfg.file_path.as_deref().filter(|s| !s.is_empty())
         .ok_or_else(|| "右侧 SQLite 文件路径不能为空".to_string())?;
+    sqlite_compare_files(left_path, right_path, tables).await
+}
+
+async fn sqlite_compare_files(left_path: &str, right_path: &str, tables: Option<Vec<String>>) -> Result<DbDiffResult, String> {
+    use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions, Row};
+    use std::str::FromStr;
 
     // Open left as main, attach right as 'rdb'
     let left_url = format!("sqlite://{}?mode=ro", left_path);
@@ -1235,33 +1531,33 @@ pub async fn sqlite_db_diff(
         .log_statements(log::LevelFilter::Off);
     let mut conn = opts.connect().await.map_err(|e| format!("打开左库失败: {e}"))?;
 
-    // Attach right DB
-    let right_escaped = right_path.replace('\'', "''");
-    sqlx::query(&format!("ATTACH DATABASE '{right_escaped}' AS rdb"))
-        .execute(&mut conn).await
-        .map_err(|e| format!("ATTACH 右库失败: {e}"))?;
+    if !std::path::Path::new(right_path).is_file() { return Err("右侧 SQLite 文件不存在，已拒绝对比".into()); }
+    sqlx::query("PRAGMA query_only=ON").execute(&mut conn).await.map_err(|e| e.to_string())?;
+    sqlx::query("ATTACH DATABASE ? AS rdb").bind(right_path).execute(&mut conn).await.map_err(|e| format!("ATTACH 右库失败: {e}"))?;
+    sqlx::query("BEGIN").execute(&mut conn).await.map_err(|e| format!("开启对比快照失败: {e}"))?;
+    sqlx::query("SELECT (SELECT COUNT(*) FROM main.sqlite_master),(SELECT COUNT(*) FROM rdb.sqlite_master)").fetch_one(&mut conn).await.map_err(|e| format!("固定对比读取快照失败: {e}"))?;
 
     // ── DDL diff ──────────────────────────────────────────────────────────────
     let left_objs = sqlx::query(
-        "SELECT type, name, sql FROM main.sqlite_master WHERE type IN ('table','view','index','trigger') AND name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        "SELECT type, name, sql FROM main.sqlite_master WHERE type IN ('table','view','index','trigger') AND name NOT GLOB 'sqlite_*' ORDER BY type, name"
     ).fetch_all(&mut conn).await.map_err(|e| format!("读取左库对象失败: {e}"))?;
 
     let right_objs = sqlx::query(
-        "SELECT type, name, sql FROM rdb.sqlite_master WHERE type IN ('table','view','index','trigger') AND name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        "SELECT type, name, sql FROM rdb.sqlite_master WHERE type IN ('table','view','index','trigger') AND name NOT GLOB 'sqlite_*' ORDER BY type, name"
     ).fetch_all(&mut conn).await.map_err(|e| format!("读取右库对象失败: {e}"))?;
 
     let mut left_map: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
     for row in &left_objs {
-        let ty: String = row.try_get(0).unwrap_or_default();
-        let name: String = row.try_get(1).unwrap_or_default();
-        let sql: String = row.try_get(2).unwrap_or_default();
+        let ty: String = row.try_get(0).map_err(|e| format!("解析对象类型失败: {e}"))?;
+        let name: String = row.try_get(1).map_err(|e| format!("解析对象名称失败: {e}"))?;
+        let sql: String = row.try_get(2).map_err(|e| format!("解析对象定义失败: {e}"))?;
         left_map.insert(format!("{ty}::{name}"), (ty, sql));
     }
     let mut right_map: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
     for row in &right_objs {
-        let ty: String = row.try_get(0).unwrap_or_default();
-        let name: String = row.try_get(1).unwrap_or_default();
-        let sql: String = row.try_get(2).unwrap_or_default();
+        let ty: String = row.try_get(0).map_err(|e| format!("解析对象类型失败: {e}"))?;
+        let name: String = row.try_get(1).map_err(|e| format!("解析对象名称失败: {e}"))?;
+        let sql: String = row.try_get(2).map_err(|e| format!("解析对象定义失败: {e}"))?;
         right_map.insert(format!("{ty}::{name}"), (ty, sql));
     }
 
@@ -1291,70 +1587,23 @@ pub async fn sqlite_db_diff(
             .collect()
     };
 
-    let mut script_lines: Vec<String> = vec!["-- Data diff sync script (apply to LEFT to match RIGHT)".to_string()];
+    let mut counts = Vec::new();
     let mut data_changes = 0u64;
-
-    for tbl in &target_tables {
-        let q_tbl_l = format!("main.\"{}\"", tbl.replace('"', "\"\""));
-        let q_tbl_r = format!("rdb.\"{}\"", tbl.replace('"', "\"\""));
-        let q_tbl = format!("\"{}\"", tbl.replace('"', "\"\""));
-
-        // Get primary key columns
-        let pk_rows = sqlx::query(&format!("PRAGMA main.table_info({})", q_tbl))
-            .fetch_all(&mut conn).await.unwrap_or_default();
-        let pk_cols: Vec<String> = pk_rows.iter()
-            .filter(|r| r.try_get::<i64, _>(5).unwrap_or(0) > 0)
-            .filter_map(|r| r.try_get::<String, _>(1).ok())
-            .collect();
-        let all_cols: Vec<String> = pk_rows.iter()
-            .filter_map(|r| r.try_get::<String, _>(1).ok())
-            .collect();
-        if all_cols.is_empty() { continue }
-
-        let _pk_key = if pk_cols.is_empty() { "rowid".to_string() }
-            else { pk_cols.iter().map(|c| format!("\"{}\"", c.replace('"', "\"\""))) .collect::<Vec<_>>().join("||'|'||") };
-
-        // INSERT rows in right but not in left
-        let insert_sql = if pk_cols.is_empty() {
-            format!("INSERT OR IGNORE INTO {q_tbl} SELECT * FROM {q_tbl_r} AS r WHERE r.rowid NOT IN (SELECT rowid FROM {q_tbl_l});")
-        } else {
-            let pk_cond = pk_cols.iter().map(|c| {
-                let qc = format!("\"{}\"", c.replace('"', "\"\""));
-                format!("l.{qc} = r.{qc}")
-            }).collect::<Vec<_>>().join(" AND ");
-            format!("INSERT OR IGNORE INTO {q_tbl} SELECT r.* FROM {q_tbl_r} r WHERE NOT EXISTS (SELECT 1 FROM {q_tbl_l} l WHERE {pk_cond});")
-        };
-
-        // DELETE rows in left but not in right
-        let delete_sql = if pk_cols.is_empty() {
-            format!("-- DELETE by rowid not supported cross-attach; skipping {tbl}")
-        } else {
-            let pk_cond = pk_cols.iter().map(|c| {
-                let qc = format!("\"{}\"", c.replace('"', "\"\""));
-                format!("l.{qc} = r.{qc}")
-            }).collect::<Vec<_>>().join(" AND ");
-            format!("DELETE FROM {q_tbl} WHERE NOT EXISTS (SELECT 1 FROM {q_tbl_r} r WHERE {pk_cond} );", q_tbl = format!("{q_tbl_l} l"))
-        };
-
-        // COUNT diffs quickly
-        if let Ok(cnt_row) = sqlx::query(&format!(
-            "SELECT (SELECT COUNT(*) FROM {q_tbl_r}) - (SELECT COUNT(*) FROM {q_tbl_l})"
-        )).fetch_one(&mut conn).await {
-            let diff: i64 = cnt_row.try_get(0).unwrap_or(0);
-            if diff != 0 { data_changes += diff.unsigned_abs(); }
-        }
-
-        script_lines.push(format!("-- Table: {tbl}"));
-        script_lines.push(insert_sql);
-        script_lines.push(delete_sql);
-        script_lines.push(String::new());
+    for table in &target_tables {
+        let quoted = table.replace('"', "\"\"");
+        let (left, right): (i64, i64) = sqlx::query_as(&format!("SELECT (SELECT COUNT(*) FROM main.\"{quoted}\"),(SELECT COUNT(*) FROM rdb.\"{quoted}\")"))
+            .fetch_one(&mut conn).await.map_err(|e| format!("读取表 {table} 行数失败，未生成完整报告: {e}"))?;
+        data_changes = data_changes.saturating_add(left.abs_diff(right));
+        counts.push((table.clone(), left, right));
     }
+    let data_script = sqlite_count_only_report(&counts);
+    sqlx::query("ROLLBACK").execute(&mut conn).await.map_err(|e| format!("结束对比快照失败: {e}"))?;
 
     let _ = sqlx::query("DETACH DATABASE rdb").execute(&mut conn).await;
 
     Ok(DbDiffResult {
         ddl_diff,
-        data_script: script_lines.join("\n"),
+        data_script,
         data_changes,
     })
 }
@@ -1377,110 +1626,13 @@ pub async fn sqlite_rescue(
     out_path: String,
     storage: State<'_, StorageState>,
 ) -> Result<RescueResult, String> {
-    use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions, Row};
-    use std::io::Write;
-    use std::str::FromStr;
-
     let config = load_config(&storage, &id)?;
-    let db_path = config.file_path.as_deref().filter(|s| !s.is_empty())
-        .ok_or_else(|| "SQLite 文件路径不能为空".to_string())?;
-
-    if out_path.is_empty() { return Err("输出路径不能为空".to_string()); }
-    if std::path::Path::new(&out_path) == std::path::Path::new(db_path) {
-        return Err("输出路径不能与源文件相同".to_string());
-    }
-
-    // Open source as read-only
-    let src_url = format!("sqlite://{}?mode=ro", db_path);
-    let src_opts = SqliteConnectOptions::from_str(&src_url)
-        .map_err(|e| format!("URL 解析失败: {e}"))?
-        .busy_timeout(std::time::Duration::from_secs(5))
-        .log_statements(log::LevelFilter::Off);
-    let mut src = src_opts.connect().await.map_err(|e| format!("打开源库失败: {e}"))?;
-
-    // Collect table DDLs and names from sqlite_master
-    let master_rows = sqlx::query(
-        "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL ORDER BY rowid"
-    ).fetch_all(&mut src).await.map_err(|e| format!("读取 sqlite_master 失败: {e}"))?;
-
-    // Write output as SQL file (same format as dump)
-    let mut out_file = std::fs::File::create(&out_path)
-        .map_err(|e| format!("创建输出文件失败: {e}"))?;
-    let mut buf = std::io::BufWriter::new(&mut out_file);
-    writeln!(buf, "-- SQLite rescue dump by DBTerm").map_err(|e| e.to_string())?;
-    writeln!(buf, "PRAGMA foreign_keys=OFF;").map_err(|e| e.to_string())?;
-    writeln!(buf, "BEGIN TRANSACTION;").map_err(|e| e.to_string())?;
-    writeln!(buf).map_err(|e| e.to_string())?;
-
-    let mut tables_attempted = 0;
-    let mut tables_rescued = 0;
-    let mut rows_rescued = 0u64;
-    let mut errors: Vec<String> = vec![];
-
-    for row in &master_rows {
-        let name: String = row.try_get(0).unwrap_or_default();
-        let ddl: String = row.try_get(1).unwrap_or_default();
-        tables_attempted += 1;
-
-        // Write DDL (may fail to execute in target but we try)
-        writeln!(buf, "{ddl};").map_err(|e| e.to_string())?;
-        writeln!(buf).map_err(|e| e.to_string())?;
-
-        // Try to read rows from this table
-        let q_name = format!("\"{}\"", name.replace('"', "\"\""));
-        match sqlx::query(&format!("SELECT * FROM {q_name}")).fetch_all(&mut src).await {
-            Err(e) => {
-                errors.push(format!("表 {name} 读取失败: {e}"));
-                writeln!(buf, "-- 表 {name} 读取失败: {e}").map_err(|e2| e2.to_string())?;
-            }
-            Ok(data_rows) => {
-                let col_count = data_rows.first().map(|r| r.len()).unwrap_or(0);
-                let mut table_rows = 0u64;
-                for data_row in &data_rows {
-                    // Try to write each row individually; skip rows that error
-                    write!(buf, "INSERT OR IGNORE INTO {q_name} VALUES(").map_err(|e| e.to_string())?;
-                    for ci in 0..col_count {
-                        if ci > 0 { write!(buf, ",").map_err(|e| e.to_string())?; }
-                        write!(buf, "{}", dump_value_rescue(data_row, ci)).map_err(|e| e.to_string())?;
-                    }
-                    writeln!(buf, ");").map_err(|e| e.to_string())?;
-                    table_rows += 1;
-                }
-                rows_rescued += table_rows;
-                tables_rescued += 1;
-            }
-        }
-    }
-
-    writeln!(buf, "COMMIT;").map_err(|e| e.to_string())?;
-    drop(buf);
-
-    Ok(RescueResult { out_path, tables_attempted, tables_rescued, rows_rescued, errors })
+    rescue_with_config(&config, out_path).await
 }
 
-fn dump_value_rescue(row: &sqlx::sqlite::SqliteRow, idx: usize) -> String {
-    use sqlx::{Row, TypeInfo, ValueRef};
-    let Ok(vr) = row.try_get_raw(idx) else { return "NULL".to_string() };
-    if vr.is_null() { return "NULL".to_string(); }
-    match vr.type_info().name().to_uppercase().as_str() {
-        "INTEGER" | "INT" => {
-            if let Ok(v) = row.try_get::<i64, _>(idx) { return v.to_string(); }
-        }
-        "REAL" => {
-            if let Ok(v) = row.try_get::<f64, _>(idx) { return format!("{v:?}"); }
-        }
-        "BLOB" => {
-            if let Ok(v) = row.try_get::<Vec<u8>, _>(idx) {
-                let hex: String = v.iter().map(|b| format!("{b:02X}")).collect();
-                return format!("X'{hex}'");
-            }
-        }
-        _ => {}
-    }
-    if let Ok(v) = row.try_get::<String, _>(idx) {
-        return format!("'{}'", v.replace('\'', "''"));
-    }
-    "NULL".to_string()
+async fn rescue_with_config(config: &ConnConfig, out_path: String) -> Result<RescueResult, String> {
+    let result = export_sqlite_file(config, &out_path, None, true).await?;
+    Ok(RescueResult { out_path, tables_attempted: result.attempted, tables_rescued: result.tables, rows_rescued: result.rows, errors: result.errors })
 }
 
 // ─── S3.2 整库 SQL dump ───────────────────────────────────────────────────────
@@ -1523,7 +1675,7 @@ fn apply_mask(val: &str, rule: &str) -> String {
             if chars.len() >= 7 {
                 let prefix: String = chars.iter().take(3).collect();
                 let suffix: String = chars.iter().skip(chars.len() - 4).collect();
-                format!("'{}****{}'", prefix, suffix)
+                format!("'{}'", format!("{prefix}****{suffix}").replace('\'', "''"))
             } else {
                 "'***'".to_string()
             }
@@ -1535,7 +1687,7 @@ fn apply_mask(val: &str, rule: &str) -> String {
                 let uc: Vec<char> = user.chars().collect();
                 let masked_user = if uc.len() <= 2 { "*".repeat(uc.len()) }
                     else { format!("{}***", uc.iter().take(2).collect::<String>()) };
-                format!("'{}{}'"  , masked_user, domain)
+                format!("'{}'", format!("{masked_user}{domain}").replace('\'', "''"))
             } else {
                 "'***'".to_string()
             }
@@ -1551,194 +1703,132 @@ pub async fn sqlite_dump_sql(
     masking_rules: Option<Vec<MaskingRule>>,
     storage: State<'_, StorageState>,
 ) -> Result<DumpResult, String> {
-    use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions, Row};
-    use std::io::Write;
-    use std::str::FromStr;
-
     let config = load_config(&storage, &id)?;
-    let db_path = config.file_path.as_deref().filter(|s| !s.is_empty())
-        .ok_or_else(|| "SQLite 文件路径不能为空".to_string())?;
+    dump_sql_with_config(&config, out_path, masking_rules).await
+}
 
-    let url = format!("sqlite://{db_path}");
-    let opts = SqliteConnectOptions::from_str(&url)
-        .map_err(|e| format!("URL 解析失败: {e}"))?
-        .read_only(true)
-        .busy_timeout(std::time::Duration::from_secs(10))
-        .log_statements(log::LevelFilter::Off);
-    let mut conn = opts.connect().await.map_err(|e| format!("连接失败: {e}"))?;
+async fn dump_sql_with_config(config: &ConnConfig, out_path: String, masking_rules: Option<Vec<MaskingRule>>) -> Result<DumpResult, String> {
+    let result = export_sqlite_file(config, &out_path, masking_rules.as_deref(), false).await?;
+    let size_bytes = std::fs::metadata(&out_path).map_err(|e| e.to_string())?.len();
+    Ok(DumpResult { path: out_path, size_bytes, table_count: result.tables, row_count: result.rows })
+}
 
-    // Get all sqlite_master objects in creation order
-    let master_rows = sqlx::query(
-        "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY rowid"
-    ).fetch_all(&mut conn).await.map_err(|e| format!("读取 sqlite_master 失败: {e}"))?;
+struct SqliteFileExport { attempted: usize, tables: usize, rows: u64, errors: Vec<String> }
 
-    // Identify virtual tables (rootpage = 0 for tables)
-    let virtual_tables: std::collections::HashSet<String> = master_rows.iter()
-        .filter(|r| {
-            let ty: String = r.try_get(0).unwrap_or_default();
-            let rp: i64 = r.try_get(3).unwrap_or(1);
-            ty == "table" && rp == 0
-        })
-        .filter_map(|r| r.try_get::<String, _>(1).ok())
-        .collect();
-
-    // Identify shadow tables via PRAGMA table_list (SQLite 3.37+), fallback to name pattern
-    let shadow_tables: std::collections::HashSet<String> = {
-        let mut s = std::collections::HashSet::new();
-        // Try PRAGMA table_list first
-        if let Ok(rows) = sqlx::query("PRAGMA table_list").fetch_all(&mut conn).await {
-            for row in &rows {
-                let schema: String = row.try_get(0).unwrap_or_default();
-                let name: String = row.try_get(1).unwrap_or_default();
-                let kind: String = row.try_get(2).unwrap_or_default();
-                if schema == "main" && kind == "shadow" {
-                    s.insert(name);
-                }
-            }
-        }
-        // Fallback: any table named {vtab}_{suffix} where vtab is virtual
-        if s.is_empty() {
-            for vt in &virtual_tables {
-                for row in &master_rows {
-                    let ty: String = row.try_get(0).unwrap_or_default();
-                    let name: String = row.try_get(1).unwrap_or_default();
-                    if ty == "table" && name.starts_with(&format!("{vt}_")) {
-                        s.insert(name);
-                    }
-                }
-            }
-        }
-        s
-    };
-
-    // Open output file
-    let mut file = std::fs::File::create(&out_path)
-        .map_err(|e| format!("创建输出文件失败: {e}"))?;
-    let mut buf = std::io::BufWriter::new(&mut file);
-
-    writeln!(buf, "-- SQLite dump generated by DBTerm").map_err(|e| e.to_string())?;
-    writeln!(buf, "PRAGMA foreign_keys=OFF;").map_err(|e| e.to_string())?;
-    writeln!(buf, "BEGIN TRANSACTION;").map_err(|e| e.to_string())?;
-    writeln!(buf).map_err(|e| e.to_string())?;
-
-    let mut table_count = 0usize;
-    let mut total_rows = 0u64;
-
-    // Write DDL for all objects
-    for row in &master_rows {
-        let ty: String = row.try_get(0).unwrap_or_default();
-        let name: String = row.try_get(1).unwrap_or_default();
-        let sql: Option<String> = row.try_get(4).ok().flatten();
-        let Some(ddl) = sql else { continue };
-        // Skip shadow table DDL (they'll be created automatically by the virtual table)
-        if shadow_tables.contains(&name) && ty == "table" { continue }
+async fn export_sqlite_file(config: &ConnConfig, out_path: &str, masking: Option<&[MaskingRule]>, rescue: bool) -> Result<SqliteFileExport, String> {
+    use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions, Connection, Row};
+    use futures::TryStreamExt;
+    use std::{io::Write, str::FromStr};
+    let source = config.file_path.as_deref().ok_or("SQLite 文件路径不能为空")?;
+    let mut conn = SqliteConnectOptions::from_str(&super::query::sqlite_url(config)?).map_err(|e| e.to_string())?
+        .read_only(true).busy_timeout(std::time::Duration::from_secs(10)).log_statements(log::LevelFilter::Off).connect().await.map_err(|e| e.to_string())?;
+    // One read transaction covers sqlite_master, every table and sequence.
+    let mut snapshot = conn.begin().await.map_err(|e| e.to_string())?;
+    let objects = sqlx::query("SELECT type,name,sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' AND sql IS NOT NULL ORDER BY rowid")
+        .fetch_all(&mut *snapshot).await.map_err(|e| e.to_string())?;
+    let table_kinds = sqlx::query("PRAGMA main.table_list").fetch_all(&mut *snapshot).await.map_err(|e| format!("无法识别虚拟表及影子表，已停止导出: {e}"))?;
+    if table_kinds.is_empty() { return Err("SQLite 版本缺少 table_list，无法安全识别影子表".into()); }
+    let shadows: std::collections::HashSet<String> = table_kinds.iter().filter(|r| r.try_get::<String,_>(2).ok().as_deref() == Some("shadow")).filter_map(|r| r.try_get(1).ok()).collect();
+    let output = NewSqliteOutput::new(out_path, source)?;
+    let file = std::fs::OpenOptions::new().write(true).open(&output.staged.path).map_err(|e| e.to_string())?;
+    let mut buf = std::io::BufWriter::new(file);
+    writeln!(buf, "-- SQLite {} by DBTerm\nPRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;", if rescue { "rescue (check reported errors)" } else { "dump" }).map_err(|e| e.to_string())?;
+    let mut result = SqliteFileExport { attempted: 0, tables: 0, rows: 0, errors: vec![] };
+    // Recreate tables first. Triggers/indexes/views are replayed only after data.
+    for object in &objects {
+        let kind: String = object.try_get(0).map_err(|e| e.to_string())?;
+        let name: String = object.try_get(1).map_err(|e| e.to_string())?;
+        if kind != "table" || shadows.contains(&name) { continue; }
+        let ddl: String = object.try_get(2).map_err(|e| e.to_string())?;
         writeln!(buf, "{ddl};").map_err(|e| e.to_string())?;
-        writeln!(buf).map_err(|e| e.to_string())?;
     }
-
-    // Write data for regular tables only (not virtual, not shadow)
-    const BATCH: usize = 500;
-    for row in &master_rows {
-        let ty: String = row.try_get(0).unwrap_or_default();
-        let name: String = row.try_get(1).unwrap_or_default();
-        if ty != "table" { continue }
-        if virtual_tables.contains(&name) || shadow_tables.contains(&name) { continue }
-
-        table_count += 1;
-        let q_name = format!("\"{}\"", name.replace('"', "\"\""));
-        let count_row = sqlx::query(&format!("SELECT COUNT(*) FROM {q_name}"))
-            .fetch_one(&mut conn).await.map_err(|e| format!("COUNT 失败: {e}"))?;
-        let row_total: i64 = count_row.try_get(0).unwrap_or(0);
-        if row_total == 0 { continue }
-
-        // Get column names for masking lookup
-        let col_names: Vec<String> = {
-            use sqlx::Row;
-            sqlx::query(&format!("PRAGMA table_info({q_name})"))
-                .fetch_all(&mut conn).await.unwrap_or_default()
-                .iter().filter_map(|r| r.try_get::<String, _>(1).ok()).collect()
-        };
-        // Build masking map: col_index → rule for this table
-        let table_mask: Vec<Option<String>> = col_names.iter().map(|col| {
-            masking_rules.as_deref().and_then(|rules| {
-                rules.iter().find(|r| r.table.eq_ignore_ascii_case(&name) && r.column.eq_ignore_ascii_case(col))
-                    .map(|r| r.rule.clone())
-            })
-        }).collect();
-
-        let mut offset = 0i64;
-        loop {
-            let data_rows = sqlx::query(&format!("SELECT * FROM {q_name} LIMIT {BATCH} OFFSET {offset}"))
-                .fetch_all(&mut conn).await.map_err(|e| format!("SELECT 失败 ({name}): {e}"))?;
-            if data_rows.is_empty() { break }
-
-            // Get column count from first row
-            let col_count = data_rows[0].len();
-            for data_row in &data_rows {
-                write!(buf, "INSERT INTO {q_name} VALUES(").map_err(|e| e.to_string())?;
-                for ci in 0..col_count {
-                    if ci > 0 { write!(buf, ",").map_err(|e| e.to_string())?; }
-                    let raw = dump_value(data_row, ci);
-                    let out = if let Some(Some(rule)) = table_mask.get(ci) {
-                        // Strip surrounding quotes if text value, apply mask
-                        if raw == "NULL" { raw.clone() }
-                        else if raw.starts_with('\'') {
-                            let inner = &raw[1..raw.len().saturating_sub(1)].replace("''", "'");
-                            apply_mask(inner, rule)
-                        } else { raw.clone() }
+    for object in &objects {
+        let kind: String = object.try_get(0).map_err(|e| e.to_string())?;
+        let name: String = object.try_get(1).map_err(|e| e.to_string())?;
+        if kind != "table" || shadows.contains(&name) { continue; }
+        result.attempted += 1;
+        let table_result: Result<u64,String> = async {
+            let table = q_dq_s(&name);
+            let ddl: String = object.try_get(2).map_err(|e| e.to_string())?;
+            let definition = ddl.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
+            if definition.contains("usingfts") && ["content=''", "content=\"\""].iter().any(|option| definition.contains(option)) {
+                return Err("无内容 FTS 表不能通过可见字段还原词项索引；请使用数据库文件备份".into());
+            }
+            let metadata = sqlx::query(&format!("PRAGMA table_xinfo({table})")).fetch_all(&mut *snapshot).await.map_err(|e| e.to_string())?;
+            let mut names: Vec<String> = metadata.iter().filter(|r| r.try_get::<i64,_>(6).ok() == Some(0)).map(|r| r.try_get(1).map_err(|e| e.to_string())).collect::<Result<_,_>>()?;
+            if names.is_empty() { return Err("没有可安全写入的普通字段".into()); }
+            // Preserve anonymous rowids (including FTS rowids) when addressable.
+            let virtual_table = table_kinds.iter().any(|r| r.try_get::<String,_>(1).ok().as_deref() == Some(name.as_str()) && r.try_get::<String,_>(2).ok().as_deref() == Some("virtual"));
+            let without_rowid = table_kinds.iter().any(|r| r.try_get::<String,_>(1).ok().as_deref() == Some(name.as_str()) && r.try_get::<i64,_>(4).ok() == Some(1));
+            if !without_rowid {
+                if let Some(alias) = ["rowid", "_rowid_", "oid"].into_iter().find(|alias| !metadata.iter().any(|r| r.try_get::<String,_>(1).is_ok_and(|name| name.eq_ignore_ascii_case(alias)))) {
+                    // Virtual modules may expose their own rowid; failure is explicit.
+                    names.insert(0, alias.into());
+                } else if virtual_table { return Err("虚拟表 rowid 无法无损读取".into()); }
+            }
+            let columns = names.iter().map(|n| q_dq_s(n)).collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT {columns} FROM {table}");
+            let mut stream = sqlx::query(&sql).fetch(&mut *snapshot);
+            let mut count = 0;
+            while let Some(row) = stream.try_next().await.map_err(|e| e.to_string())? {
+                let mut values = Vec::with_capacity(names.len());
+                for (index,column) in names.iter().enumerate() {
+                    let raw = dump_value(&row,index)?;
+                    let value = if let Some(rule) = masking.and_then(|rules| rules.iter().find(|r| r.table.eq_ignore_ascii_case(&name) && r.column.eq_ignore_ascii_case(column))) {
+                        use sqlx::ValueRef;
+                        if row.try_get_raw(index).map_err(|e| e.to_string())?.is_null() { raw }
+                        else if let Ok(text) = row.try_get::<String,_>(index) { apply_mask(&text,&rule.rule) }
+                        else if rule.rule == "null" { "NULL".into() } else { return Err(format!("字段 {column} 不是文本，无法应用指定脱敏规则")); }
                     } else { raw };
-                    write!(buf, "{out}").map_err(|e| e.to_string())?;
+                    values.push(value);
                 }
-                writeln!(buf, ");").map_err(|e| e.to_string())?;
-                total_rows += 1;
+                writeln!(buf, "INSERT INTO {table}({columns}) VALUES({});", values.join(",")).map_err(|e| e.to_string())?; count += 1;
             }
-            offset += BATCH as i64;
-            if data_rows.len() < BATCH { break }
+            Ok(count)
+        }.await;
+        match table_result {
+            Ok(count) => { result.tables += 1; result.rows += count; },
+            Err(error) if rescue => {
+                let error = format!("{name:?}: {error}");
+                writeln!(buf, "-- Rescue incomplete: {}", error.replace(['\n','\r'], " " )).map_err(|e| e.to_string())?;
+                if result.errors.len() < 100 { result.errors.push(error); }
+            },
+            Err(error) => return Err(format!("导出表 {name:?} 失败，未发布文件: {error}")),
         }
-        writeln!(buf).map_err(|e| e.to_string())?;
     }
-
+    let has_sequence: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name='sqlite_sequence'").fetch_one(&mut *snapshot).await.map_err(|e| e.to_string())?;
+    if has_sequence != 0 {
+        writeln!(buf, "DELETE FROM sqlite_sequence;").map_err(|e| e.to_string())?;
+        let rows = sqlx::query("SELECT name,seq FROM sqlite_sequence").fetch_all(&mut *snapshot).await.map_err(|e| e.to_string())?;
+        for row in rows { writeln!(buf, "INSERT INTO sqlite_sequence(name,seq) VALUES({},{});", dump_value(&row,0)?, dump_value(&row,1)?).map_err(|e| e.to_string())?; }
+    }
+    for object in &objects {
+        let kind: String = object.try_get(0).map_err(|e| e.to_string())?;
+        if kind == "table" { continue; }
+        let ddl: String = object.try_get(2).map_err(|e| e.to_string())?;
+        writeln!(buf, "{ddl};").map_err(|e| e.to_string())?;
+    }
     writeln!(buf, "COMMIT;").map_err(|e| e.to_string())?;
-    drop(buf);
-
-    let size = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
-    Ok(DumpResult { path: out_path, size_bytes: size, table_count, row_count: total_rows })
+    buf.flush().map_err(|e| e.to_string())?; drop(buf);
+    snapshot.commit().await.map_err(|e| e.to_string())?;
+    output.publish()?; Ok(result)
 }
 
-fn dump_value(row: &sqlx::sqlite::SqliteRow, idx: usize) -> String {
+fn dump_value(row: &sqlx::sqlite::SqliteRow, idx: usize) -> Result<String,String> {
     use sqlx::{Row, TypeInfo, ValueRef};
-    let val_ref = row.try_get_raw(idx).ok();
-    if let Some(vr) = val_ref {
-        if vr.is_null() {
-            return "NULL".to_string();
-        }
-        let type_name = vr.type_info().name().to_uppercase();
-        match type_name.as_str() {
-            "INTEGER" | "INT" => {
-                if let Ok(v) = row.try_get::<i64, _>(idx) {
-                    return v.to_string();
-                }
-            }
-            "REAL" => {
-                if let Ok(v) = row.try_get::<f64, _>(idx) {
-                    return format!("{v:?}"); // preserves precision
-                }
-            }
-            "BLOB" => {
-                if let Ok(v) = row.try_get::<Vec<u8>, _>(idx) {
-                    let hex: String = v.iter().map(|b| format!("{b:02X}")).collect();
-                    return format!("X'{hex}'");
-                }
-            }
-            _ => {}
-        }
-        // Fallback: try as text
-        if let Ok(v) = row.try_get::<String, _>(idx) {
-            return format!("'{}'", v.replace('\'', "''"));
-        }
+    let value = row.try_get_raw(idx).map_err(|e| e.to_string())?;
+    if value.is_null() { return Ok("NULL".into()); }
+    match value.type_info().name() {
+        "INTEGER" | "INT" => row.try_get::<i64,_>(idx).map(|v|v.to_string()).map_err(|e|e.to_string()),
+        "REAL" => row.try_get::<f64,_>(idx).map(|v| if v == f64::INFINITY { "9e999".into() } else if v == f64::NEG_INFINITY { "-9e999".into() } else { format!("{v:?}") }).map_err(|e|e.to_string()),
+        "BLOB" => row.try_get::<Vec<u8>,_>(idx).map(|v|format!("X'{}'",hex::encode(v))).map_err(|e|e.to_string()),
+        _ => row.try_get_unchecked::<Vec<u8>,_>(idx).map(|v| format!("CAST(X'{}' AS TEXT)",hex::encode(v))).map_err(|e|format!("无法无损读取字段: {e}")),
     }
-    "NULL".to_string()
 }
+
+#[cfg(test)]
+#[path = "export_safety_tests.rs"]
+mod export_safety_tests;
 
 // ─── S0.3 ATTACH / DETACH 多库 ───────────────────────────────────────────────
 
@@ -1803,6 +1893,8 @@ pub async fn sqlite_list_attached(
 }
 
 // ─── S1.7 ALTER TABLE 向导（SQLite 方言）────────────────────────────────────
+#[path = "sqlite_alter_plan.rs"]
+mod sqlite_alter_plan;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1827,31 +1919,9 @@ pub struct AlterTablePreview {
 
 fn q_dq_s(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }
 
-/// 判断是否可用直接 ALTER (add/rename/drop 无需重建)
-fn classify_changes(cols: &[AlterColDef]) -> &'static str {
-    // 如果只有新增、仅重命名、仅删除列 → simple
-    // 如果有类型修改、约束修改、生成列变化 → rebuild
-    for col in cols {
-        if col.is_deleted { continue; } // drop → handled simply
-        if col.original_name.is_none() { continue; } // add → handled simply
-        let orig = col.original_name.as_deref().unwrap_or(&col.new_name);
-        if orig == col.new_name && col.data_type.is_empty() { continue; } // rename only
-        // type/nullable/default changed or is complex → rebuild
-        // We treat anything other than pure add/delete/rename as rebuild
-        // We can check generated_expr here too
-        if !col.generated_expr.is_empty() { return "rebuild"; }
-    }
-    // Count structural changes: if any column has a type or constraint change, rebuild
-    // For simplicity: if all changes are add/delete/rename, it's simple
-    for col in cols {
-        if col.is_deleted || col.original_name.is_none() { continue; }
-        // Existing column with only name change → simple (RENAME COLUMN)
-        // But if data_type or nullable or default changed → rebuild
-        // Since we don't have the original type here, we need to handle this carefully
-        // The frontend should pass original_data_type too, but for now we assume
-        // if data_type is empty or "unchanged", it's a simple rename
-    }
-    "simple"
+// SQLite live metadata guard for native ALTER and rebuild.
+async fn classify_changes(conn: &mut sqlx::sqlite::SqliteConnection, table: &str, cols: &[AlterColDef]) -> Result<&'static str, String> {
+    sqlite_alter_plan::verify_change_set(conn, table, cols).await
 }
 
 async fn get_table_indexes_triggers(
@@ -1862,7 +1932,7 @@ async fn get_table_indexes_triggers(
     // Indexes (non-autoindex)
     let idx_rows = sqlx::query(
         "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? \
-         AND sql IS NOT NULL AND name NOT LIKE 'sqlite_autoindex_%'"
+         AND sql IS NOT NULL"
     ).bind(table).fetch_all(&mut *conn).await
         .map_err(|e| format!("查询索引失败: {e}"))?;
     let indexes: Vec<String> = idx_rows.iter()
@@ -1910,88 +1980,7 @@ pub async fn build_rebuild_script(
     table: &str,
     cols: &[AlterColDef],
 ) -> Result<String, String> {
-    use sqlx::Row;
-    // Get original DDL for STRICT / WITHOUT ROWID detection
-    let row = sqlx::query("SELECT sql FROM sqlite_master WHERE type='table' AND name=?")
-        .bind(table).fetch_one(&mut *conn).await
-        .map_err(|e| format!("获取表 DDL 失败: {e}"))?;
-    let original_ddl: String = row.try_get(0).unwrap_or_default();
-    let upper_ddl = original_ddl.to_uppercase();
-    let is_strict = upper_ddl.contains("STRICT");
-    let is_without_rowid = upper_ddl.contains("WITHOUT ROWID");
-
-    let (indexes, triggers, views) = get_table_indexes_triggers(conn, table).await?;
-
-    let tmp_name = format!("__rebuild_{}__", table);
-    let tq = q_dq_s(table);
-    let tmpq = q_dq_s(&tmp_name);
-
-    // Build new column list (only non-deleted)
-    let active_cols: Vec<&AlterColDef> = cols.iter().filter(|c| !c.is_deleted).collect();
-
-    // SELECT list: map new column positions from original
-    let select_parts: Vec<String> = active_cols.iter().map(|c| {
-        if let Some(orig) = &c.original_name {
-            q_dq_s(orig) // select from original name
-        } else {
-            // new column: use default value or NULL
-            if !c.default_value.is_empty() { c.default_value.clone() }
-            else { "NULL".to_string() }
-        }
-    }).collect();
-
-    let pk_cols: Vec<String> = active_cols.iter()
-        .filter(|c| c.is_primary_key && c.generated_expr.is_empty())
-        .map(|c| q_dq_s(&c.new_name))
-        .collect();
-
-    let col_defs: Vec<String> = active_cols.iter().map(|c| col_def_sql(c)).collect();
-    let pk_clause = if !pk_cols.is_empty() {
-        format!(",\n  PRIMARY KEY ({})", pk_cols.join(", "))
-    } else { String::new() };
-
-    let mut table_options = String::new();
-    if is_without_rowid { table_options.push_str(" WITHOUT ROWID"); }
-    if is_strict {
-        if is_without_rowid { table_options.push_str(", STRICT"); }
-        else { table_options.push_str(" STRICT"); }
-    }
-
-    let mut script = String::new();
-    if !views.is_empty() {
-        script.push_str(&format!(
-            "-- ⚠ 以下视图引用了此表，重建后可能需要检查：{}\n",
-            views.join(", ")
-        ));
-    }
-    script.push_str("PRAGMA foreign_keys = OFF;\n");
-    script.push_str("BEGIN;\n\n");
-    script.push_str(&format!(
-        "CREATE TABLE {tmpq} (\n  {}{}\n){table_options};\n\n",
-        col_defs.join(",\n  "), pk_clause
-    ));
-    script.push_str(&format!(
-        "INSERT INTO {tmpq} ({}) SELECT {} FROM {tq};\n\n",
-        active_cols.iter().map(|c| q_dq_s(&c.new_name)).collect::<Vec<_>>().join(", "),
-        select_parts.join(", ")
-    ));
-    script.push_str(&format!("DROP TABLE {tq};\n"));
-    script.push_str(&format!("ALTER TABLE {tmpq} RENAME TO {tq};\n\n"));
-
-    for idx in &indexes {
-        script.push_str(idx);
-        script.push_str(";\n");
-    }
-    for trig in &triggers {
-        script.push_str(trig);
-        script.push_str(";\n");
-    }
-
-    script.push_str("\nPRAGMA foreign_key_check;\n");
-    script.push_str("COMMIT;\n");
-    script.push_str("PRAGMA foreign_keys = ON;\n");
-
-    Ok(script)
+    sqlite_alter_plan::build_rebuild_script(conn, table, cols).await
 }
 
 #[tauri::command]
@@ -2014,7 +2003,7 @@ pub async fn sqlite_alter_table_preview(
     let mut conn = opts.connect().await.map_err(|e| format!("连接失败: {e}"))?;
 
     // Determine if simple or rebuild
-    let kind = classify_changes(&cols);
+    let kind = classify_changes(&mut conn, &table, &cols).await?;
     let sql_script = if kind == "simple" {
         build_simple_alter_sql(&table, &cols)
     } else {
@@ -2057,6 +2046,7 @@ pub async fn sqlite_alter_table_execute(
     use std::str::FromStr;
 
     let config = load_config(&storage, &id)?;
+    require_admin_write(&config)?;
     let url = sqlite_url(&config)?;
     let opts = SqliteConnectOptions::from_str(&url)
         .map_err(|e| format!("URL 解析失败: {e}"))?
@@ -2064,50 +2054,49 @@ pub async fn sqlite_alter_table_execute(
         .log_statements(log::LevelFilter::Off);
     let mut conn = opts.connect().await.map_err(|e| format!("连接失败: {e}"))?;
 
-    let kind = classify_changes(&cols);
+    execute_column_changes(&mut conn, &table, &cols).await
+}
 
-    if kind == "simple" {
-        let script = build_simple_alter_sql(&table, &cols);
-        if script == "-- 无变更" { return Ok("无变更".to_string()); }
-        // Execute each statement separately
-        for stmt in script.split('\n').map(str::trim).filter(|s| !s.is_empty() && !s.starts_with("--")) {
-            sqlx::query(stmt).execute(&mut conn).await
-                .map_err(|e| format!("执行失败: {e}\nSQL: {stmt}"))?;
+async fn execute_column_changes(conn: &mut sqlx::SqliteConnection, table: &str, cols: &[AlterColDef]) -> Result<String, String> {
+    use sqlx::Connection;
+    let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(&mut *conn).await.map_err(|e| e.to_string())?;
+    sqlx::query("PRAGMA foreign_keys=OFF").execute(&mut *conn).await.map_err(|e| e.to_string())?;
+    let action = async {
+        // The write reservation precedes metadata classification and planning.
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await.map_err(|e| e.to_string())?;
+        let result = async {
+            let kind = classify_changes(&mut tx, table, cols).await?;
+            if kind == "simple" {
+                let script = build_simple_alter_sql(table, cols);
+                if script == "-- 无变更" { return Ok("无变更".to_string()); }
+                alter_execute::simple(&mut tx, &script).await?;
+            } else {
+                let script = build_rebuild_script(&mut tx, table, cols).await?;
+                execute_rebuild_script(&mut tx, &script).await?;
+            }
+            Ok::<String, String>(kind.to_string())
+        }.await;
+        match result {
+            Ok(kind) => { tx.commit().await.map_err(|e| format!("提交结果未确认，请核实数据库状态，勿盲目重试: {e}"))?; Ok(kind) },
+            Err(error) => { tx.rollback().await.map_err(|rollback| format!("{error}；回滚未确认: {rollback}"))?; Err(error) },
         }
-        Ok("simple".to_string())
-    } else {
-        let script = build_rebuild_script(&mut conn, &table, &cols).await?;
-        // Parse and execute the rebuild script statement by statement
-        // Split on ;\n but handle multi-line statements
-        execute_rebuild_script(&mut conn, &script).await?;
-        Ok("rebuild".to_string())
+    }.await;
+    let restored = sqlx::query(if foreign_keys == 0 { "PRAGMA foreign_keys=OFF" } else { "PRAGMA foreign_keys=ON" }).execute(&mut *conn).await;
+    match (action, restored) {
+        (result, Ok(_)) => result,
+        (result, Err(error)) => Err(format!("{}；恢复外键设置失败: {error}", result.err().unwrap_or_else(|| "结构修改已提交".into()))),
     }
 }
 
-async fn execute_rebuild_script(
-    conn: &mut sqlx::sqlite::SqliteConnection,
-    script: &str,
-) -> Result<(), String> {
-    // Execute each non-empty, non-comment statement
-    // Handle PRAGMA foreign_key_check specially (it returns rows)
-    for stmt in script.split(";\n") {
-        let stmt = stmt.trim().trim_start_matches("-- ").trim();
-        if stmt.is_empty() || stmt.starts_with("--") { continue; }
-        // Reconstruct statement by adding back the semicolon context
-        let normalized = stmt.trim_end_matches(';');
-        if normalized.is_empty() { continue; }
-        let result = sqlx::query(normalized).execute(&mut *conn).await;
-        match result {
-            Err(e) => {
-                // Try to rollback on error
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                let _ = sqlx::query("PRAGMA foreign_keys = ON").execute(&mut *conn).await;
-                return Err(format!("重建失败: {e}\nSQL: {normalized}"));
-            }
-            Ok(_) => {}
-        }
-    }
-    Ok(())
+#[cfg(test)]
+#[path = "sqlite_alter_atomicity_tests.rs"]
+mod sqlite_alter_atomicity_tests;
+
+#[path = "sqlite_alter_execute.rs"]
+mod alter_execute;
+
+async fn execute_rebuild_script(conn: &mut sqlx::SqliteConnection, script: &str) -> Result<(), String> {
+    alter_execute::rebuild(conn, script).await
 }
 
 // ── 可选增强 S1.6: EXPLAIN 字节码视图 ────────────────────────────────────────
@@ -2222,6 +2211,7 @@ pub async fn sqlite_sequence_reset(
         return Err("表名不能为空".to_string());
     }
     let config = load_config(&storage, &id)?;
+    require_admin_write(&config)?;
     // 只读模式禁止重置
     if config.read_only == Some(true) {
         return Err("只读模式下不允许修改 sqlite_sequence".to_string());

@@ -15,6 +15,33 @@ use futures::StreamExt;
 use klickhouse::{Client, ClientOptions, Value};
 
 use crate::models::{ColumnInfo, ConnConfig, QueryResult, TableInfo};
+use super::query::pool_identity as connection_identity;
+
+#[cfg(test)]
+mod pool_identity_tests {
+    #[test]
+    fn same_id_changed_endpoint_or_credentials_never_matches() {
+        let base: crate::models::ConnConfig = serde_json::from_value(serde_json::json!({
+            "id": "pool-identity", "name": "test", "type": "clickHouse",
+            "host": "server-a", "port": 9000, "username": "user",
+            "database": "db-a", "useSsl": false, "createdAt": 0, "updatedAt": 0
+        })).unwrap();
+        let original = super::connection_identity(&base, Some("password-a"), "ssh-a").unwrap();
+        assert_eq!(original, super::connection_identity(&base, Some("password-a"), "ssh-a").unwrap());
+        for field in ["host", "database", "username", "port", "extraJson", "readOnly", "useSsl"] {
+            let mut value = serde_json::to_value(&base).unwrap();
+            value[field] = match field {
+                "readOnly" | "useSsl" => serde_json::json!(true),
+                "port" => serde_json::json!(9001),
+                _ => serde_json::json!("changed"),
+            };
+            let changed = serde_json::from_value(value).unwrap();
+            assert_ne!(original, super::connection_identity(&changed, Some("password-a"), "ssh-a").unwrap(), "{field}");
+        }
+        assert_ne!(original, super::connection_identity(&base, Some("password-b"), "ssh-a").unwrap());
+        assert_ne!(original, super::connection_identity(&base, Some("password-a"), "ssh-b").unwrap());
+    }
+}
 
 // ── 协议选择 ────────────────────────────────────────────────────────────────
 
@@ -30,8 +57,8 @@ pub fn use_tcp(config: &ConnConfig) -> bool {
 
 // ── 连接池 ──────────────────────────────────────────────────────────────────
 
-fn pool() -> &'static Mutex<HashMap<String, Client>> {
-    static P: std::sync::OnceLock<Mutex<HashMap<String, Client>>> = std::sync::OnceLock::new();
+fn pool() -> &'static Mutex<HashMap<String, ([u8; 32], Client)>> {
+    static P: std::sync::OnceLock<Mutex<HashMap<String, ([u8; 32], Client)>>> = std::sync::OnceLock::new();
     P.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -40,16 +67,19 @@ pub fn invalidate(id: &str) {
 }
 
 async fn get_or_connect(config: &ConnConfig, password: Option<&str>) -> Result<Client, String> {
+    let identity = connection_identity(config, password, "")?;
+    let build_lock = super::query::pool_build_lock(&config.id).await;
+    let _building = build_lock.lock().await;
     // 先查池（clone 廉价，共享底层 TCP channel）
     if let Ok(m) = pool().lock() {
-        if let Some(c) = m.get(&config.id) {
-            return Ok(c.clone());
+        if let Some((cached_identity, c)) = m.get(&config.id) {
+            if cached_identity == &identity { return Ok(c.clone()); }
         }
     }
     // 建新连接
     let client = do_connect(config, password).await?;
     if let Ok(mut m) = pool().lock() {
-        m.insert(config.id.clone(), client.clone());
+        m.insert(config.id.clone(), (identity, client.clone()));
     }
     Ok(client)
 }
@@ -164,16 +194,20 @@ async fn fetch(client: &Client, sql: &str) -> Result<(Vec<String>, Vec<Vec<Optio
         .map_err(|e| format!("ClickHouse 查询失败：{e}"))?;
     let mut columns: Vec<String> = Vec::new();
     let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+    let mut budget = super::query_result_budget::ResultBudget::default();
     while let Some(block) = stream.next().await {
         let block = block.map_err(|e| format!("ClickHouse 读取数据块失败：{e}"))?;
         if columns.is_empty() && !block.column_types.is_empty() {
             columns = block.column_types.keys().cloned().collect();
         }
         for i in 0..block.rows as usize {
+            budget.start_row()?;
             let mut row = Vec::with_capacity(columns.len());
             for col in &columns {
                 let cell = block.column_data.get(col).and_then(|vals| vals.get(i));
-                row.push(cell.and_then(value_to_string));
+                let value = cell.and_then(value_to_string);
+                budget.cell(value.as_deref())?;
+                row.push(value);
             }
             rows.push(row);
         }

@@ -15,7 +15,7 @@ import { wid } from './utils/windowTag'
 import { onConnectionsChanged, openNewAppWindow, takeAdoptedTab, takeAdoptPayload, onReattach, type AdoptPayload } from './utils/multiWindow'
 import { publishWindowRect, removeWindowRect } from './utils/windowRegistry'
 import { markAdopt, setAdoptSnapshot } from './utils/adopt'
-import { useQueryStore } from './stores/queryStore'
+import { flushQueryStorePersistence, useQueryStore } from './stores/queryStore'
 import { attachGlobalWheelScroll } from './utils/wheelScroll'
 
 const ConnectionForm = lazy(() => import('./components/ConnectionForm'))
@@ -152,6 +152,17 @@ export default function App() {
   // 多开：其它窗口增删改连接后，本窗口重新加载连接列表
   useEffect(() => onConnectionsChanged(() => { void loadConnections() }), [loadConnections])
   useEffect(() => attachGlobalWheelScroll(), [])
+
+  // 应用退出前立即写入最后一段 SQL 草稿；平时由 queryStore 防抖写入。
+  useEffect(() => {
+    const flush = () => flushQueryStorePersistence()
+    window.addEventListener('pagehide', flush)
+    window.addEventListener('beforeunload', flush)
+    return () => {
+      window.removeEventListener('pagehide', flush)
+      window.removeEventListener('beforeunload', flush)
+    }
+  }, [])
 
   // 全局代理设置同步到后端（启动时 + 变更时）；连接级未配置代理时生效
   const proxyType        = useSettingsStore((s) => s.proxyType)

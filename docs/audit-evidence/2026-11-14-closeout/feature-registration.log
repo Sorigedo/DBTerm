@@ -1,0 +1,5 @@
+
+> dbterm@0.1.23 audit:db-features
+> node scripts/audit-db-features.mjs
+
+Wrote docs/db-feature-audit.md

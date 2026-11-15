@@ -58,11 +58,24 @@ use sha2::{Digest, Sha256};
 use tauri::Emitter;
 use tauri::Manager;
 
+#[cfg(test)]
+mod sqlite_security_version_tests {
+    #[test]
+    fn linked_sqlite_contains_the_wal_memory_disclosure_fix() {
+        let compile_time = libsqlite3_sys::SQLITE_VERSION_NUMBER;
+        let runtime = unsafe { libsqlite3_sys::sqlite3_libversion_number() };
+        assert!(compile_time >= 3_054_000, "bundled SQLite headers are too old: {compile_time}");
+        assert!(runtime >= 3_054_000, "linked SQLite runtime is too old: {runtime}");
+        assert_eq!(runtime, compile_time, "SQLite headers and linked runtime differ");
+    }
+}
+
 mod commands;
+mod connection_import;
 mod db_tunnel;
 mod keychain;
 mod logging;
-mod models;
+pub mod models;
 mod pool_manager;
 mod pty;
 mod ssh;
@@ -476,14 +489,34 @@ async fn download_converter_package(
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    let src_meta = std::fs::symlink_metadata(src)
+        .map_err(|e| format!("读取源路径失败 {:?}: {e}", src))?;
+    if src_meta.file_type().is_symlink() {
+        return Err(format!("拒绝复制符号链接源路径: {:?}", src));
+    }
+    if let Ok(dst_meta) = std::fs::symlink_metadata(dst) {
+        if dst_meta.file_type().is_symlink() {
+            return Err(format!("拒绝写入符号链接目标路径: {:?}", dst));
+        }
+    }
     std::fs::create_dir_all(dst).map_err(|e| format!("创建目录失败：{e}"))?;
     for entry in std::fs::read_dir(src).map_err(|e| format!("读取目录失败：{e}"))? {
         let entry = entry.map_err(|e| format!("遍历目录失败：{e}"))?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
+        let metadata = std::fs::symlink_metadata(&src_path)
+            .map_err(|e| format!("读取源条目失败 {:?}: {e}", src_path))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("拒绝复制符号链接条目: {:?}", src_path));
+        }
+        if metadata.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
-        } else if src_path.is_file() {
+        } else if metadata.is_file() {
+            if let Ok(dst_meta) = std::fs::symlink_metadata(&dst_path) {
+                if dst_meta.file_type().is_symlink() {
+                    return Err(format!("拒绝覆盖符号链接目标: {:?}", dst_path));
+                }
+            }
             if let Some(parent) = dst_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{e}"))?;
             }
@@ -492,6 +525,49 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod copy_dir_recursive_tests {
+    use super::copy_dir_recursive;
+    use std::{fs, os::unix::fs::symlink, path::PathBuf};
+
+    fn test_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("dbterm-copy-{label}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn rejects_symlink_source_without_copying_outside_tree() {
+        let root = test_root("source-link");
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), b"secret").unwrap();
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        symlink(&outside, source.join("linked")).unwrap();
+        let result = copy_dir_recursive(&source, &root.join("destination"));
+        assert!(result.is_err());
+        assert!(!root.join("destination/linked/secret.txt").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_symlink_destination_before_overwrite() {
+        let root = test_root("destination-link");
+        let source = root.join("source");
+        let outside = root.join("outside");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(source.join("payload.txt"), b"payload").unwrap();
+        let destination = root.join("destination");
+        symlink(&outside, &destination).unwrap();
+        let result = copy_dir_recursive(&source, &destination);
+        assert!(result.is_err());
+        assert!(!outside.join("payload.txt").exists());
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -622,7 +698,6 @@ fn install_libreoffice_package(_package: &Path, _target_dir: &Path, _work_dir: &
 
 #[cfg(target_os = "windows")]
 fn install_poppler_package(package: &Path, target_dir: &Path) -> Result<(), String> {
-    use std::io::Read;
     let file = std::fs::File::open(package).map_err(|e| format!("打开 Poppler 包失败：{e}"))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("读取 Poppler zip 失败：{e}"))?;
     let staging = target_dir.with_file_name("windows-staging");
@@ -631,11 +706,13 @@ fn install_poppler_package(package: &Path, target_dir: &Path) -> Result<(), Stri
     }
     std::fs::create_dir_all(&staging).map_err(|e| format!("创建 Poppler 解压目录失败：{e}"))?;
 
+    const MAX_EXTRACTED_BYTES: u64 = 256 * 1024 * 1024;
+    let mut extracted_bytes = 0u64;
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
             .map_err(|e| format!("读取 Poppler 压缩条目失败：{e}"))?;
-        let raw_name = entry.name().replace('\\', "/");
+        let raw_name = entry.name().map_err(|e| format!("读取 Poppler 条目名称失败：{e}"))?.replace('\\', "/");
         let Some((_, rel)) = raw_name.split_once("/Library/bin/").or_else(|| {
             raw_name
                 .strip_prefix("Library/bin/")
@@ -647,11 +724,25 @@ fn install_poppler_package(package: &Path, target_dir: &Path) -> Result<(), Stri
             continue;
         }
         let out_path = staging.join(rel);
-        let mut bytes = Vec::new();
-        entry
-            .read_to_end(&mut bytes)
-            .map_err(|e| format!("读取 Poppler 文件失败：{e}"))?;
-        std::fs::write(&out_path, bytes).map_err(|e| format!("写出 Poppler 文件失败：{e}"))?;
+        if let Ok(metadata) = std::fs::symlink_metadata(&out_path) {
+            if metadata.file_type().is_symlink() {
+                return Err(format!("Poppler 输出路径是符号链接，已拒绝写入: {:?}", out_path));
+            }
+        }
+        let entry_size = entry.size();
+        extracted_bytes = extracted_bytes
+            .checked_add(entry_size)
+            .ok_or_else(|| "Poppler 解压大小溢出".to_string())?;
+        if extracted_bytes > MAX_EXTRACTED_BYTES {
+            return Err("Poppler 解压内容超过 256 MB，已中止".to_string());
+        }
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&out_path)
+            .map_err(|e| format!("写出 Poppler 文件失败：{e}"))?;
+        std::io::copy(&mut entry, &mut output)
+            .map_err(|e| format!("写出 Poppler 文件失败：{e}"))?;
     }
 
     if !staging.join("pdftotext.exe").exists() {
@@ -918,14 +1009,6 @@ mod macos_quit {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        .build(),
-                )?;
-            }
-
             // 连接配置存储 & 密码文件存储
             // debug 构建用独立的 -dev 子目录，与 release 数据隔离，避免测试连接污染生产包
             let prod_dir = app.path().app_data_dir().expect("无法获取应用数据目录");
@@ -941,12 +1024,14 @@ pub fn run() {
                 prod_dir
             };
             keychain::init(&data_dir);
-            if let Err(e) = logging::init_with_app_dir(&data_dir) {
-                log::warn!("初始化结构化日志失败，将继续使用应用日志插件: {e}");
-            }
+            // Tauri may already own the global `log` logger before setup.
+            // Structured logging is best-effort; never register a second
+            // logger as a fallback because that makes startup panic.
+            let _ = logging::init_with_app_dir(&data_dir);
             ssh::init_known_hosts(&data_dir);
             commands::redis::slowlog_store::init(&data_dir);
             let storage = Storage::new(data_dir.clone()).expect("无法初始化配置存储");
+            connection_import::recover(&data_dir, &storage).expect("连接导入恢复失败，已停止启动以保护连接和密码数据");
             app.manage(Mutex::new(storage) as StorageState);
 
             // SSH 会话状态
@@ -963,11 +1048,13 @@ pub fn run() {
             // 每 5 分钟扫描一次，回收空闲超过 30 分钟的事务（移除后 SQLx 自动 ROLLBACK 释放锁）。
             {
                 let tx_state_bg = tx_state.clone();
+                let cleanup_app = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     let mut tick = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
                     loop {
                         tick.tick().await;
-                        let n = commands::db_tx::cleanup_stale_txns(&tx_state_bg).await;
+                        let Some(oracle_pool) = cleanup_app.try_state::<commands::oracle::OracleTxPool>() else { continue; };
+                        let n = commands::db_tx::cleanup_stale_txns_with_oracle(&tx_state_bg, &oracle_pool).await;
                         if n > 0 {
                             log::info!("已回收 {n} 个僵尸事务（释放 DB 锁）");
                         }
@@ -1122,9 +1209,11 @@ pub fn run() {
             commands::query::table_columns,
             commands::query::schema_columns,
             commands::query::update_cell,
+            commands::query::update_cells,
             commands::query::list_routines,
             commands::query::list_tables_meta,
             commands::query::get_table_ddl,
+            commands::query::get_mysql_archive_object_sql,
             commands::query::get_routine_ddl,
             commands::query::sqlite_list_objects,
             commands::query::sqlite_table_flags,
@@ -1238,8 +1327,10 @@ pub fn run() {
             commands::db_export::db_cancel_export,
             commands::db_export::reveal_in_folder,
             commands::db_export::read_file_first_line,
+            commands::db_export::read_delimited_file_header,
             // 高级数据库操作
             commands::db_extra::db_insert_rows,
+            commands::db_extra::db_insert_drafts,
             commands::db_extra::db_delete_rows,
             commands::db_extra::db_truncate_table,
             commands::db_extra::db_drop_table,
@@ -1250,6 +1341,8 @@ pub fn run() {
             commands::db_extra::db_import_csv,
             commands::db_extra::db_exec_sql_file,
             commands::db_extra::db_diff_structure,
+            commands::db_extra::db_diff_database_definition,
+            commands::db_extra::db_diff_schema_snapshot,
             commands::db_extra::db_migrate_table,
             commands::db_extra::db_logical_backup,
             commands::db_extra::db_process_list,
@@ -1440,6 +1533,7 @@ pub fn run() {
             // DuckDB 命令（DD1.x）
             commands::duckdb::duckdb_disconnect,
             commands::duckdb::duckdb_query,
+            commands::duckdb::duckdb_alter_table_atomic,
             commands::duckdb::duckdb_list_schemas,
             commands::duckdb::duckdb_list_tables,
             commands::duckdb::duckdb_list_columns,

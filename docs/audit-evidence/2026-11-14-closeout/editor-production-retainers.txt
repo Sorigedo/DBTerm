@@ -1,0 +1,10 @@
+Synthetic result heap retaining-path summary; no user data.
+Snapshot full file stays in /tmp; only scoped references persisted.
+RESULT object:Object
+transition_info @ code:system / AllocationSite <- 8 @ code:system / FeedbackVector <- value @ code:system / FeedbackCell <- feedback_cell @ closure:invoke
+RESULT object:Object
+result @ object:system / Context / scope @62253 <- context @ closure:run <- run @ object:Object <- 0 @ object:Array
+result @ object:system / Context / scope @62253 <- context @ closure:run <- run @ object:Object <- 0 @ array:(object elements)
+result @ object:system / Context / scope @62253 <- context @ closure: <- 0 @ object:Array <- memoizedState @ object:Object
+result @ object:system / Context / scope @62253 <- context @ closure: <- 0 @ object:Array <- memoizedState @ object:Object
+result @ object:system / Context / scope @62253 <- context @ closure: <- 0 @ object:Array <- memoizedState @ object:Object

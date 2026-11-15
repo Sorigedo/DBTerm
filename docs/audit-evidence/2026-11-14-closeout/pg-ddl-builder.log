@@ -1,0 +1,1 @@
+PASS actual PostgreSQL ALTER builder: combined rename/type/null/default, default removal, unchanged definition, quoted identifiers and comments.

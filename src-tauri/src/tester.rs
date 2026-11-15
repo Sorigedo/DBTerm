@@ -18,6 +18,20 @@ struct DbExtraCfg {
     #[serde(rename = "sshPassword", default)] ssh_password:  String,
     #[serde(rename = "sshKeyPath",  default)] ssh_key_path:  String,
 }
+impl DbExtraCfg {
+    fn from_config(c:&ConnConfig)->Result<Self,String>{
+        let Some(raw)=c.extra_json.as_deref().filter(|s|!s.trim().is_empty())else{return Ok(Self::default())};
+        let value:serde_json::Value=serde_json::from_str(raw).map_err(|_|"数据库连接配置格式错误，已拒绝连接".to_string())?;
+        if !value.is_object(){return Err("数据库连接配置格式错误，已拒绝连接".into())}
+        serde_json::from_value(value).map_err(|_|"数据库连接配置格式错误，已拒绝连接".to_string())
+    }
+    fn tunnel_config_with(&self,id:&str,lookup:impl FnOnce(&str)->Result<Option<String>,String>)->Result<crate::db_tunnel::DbTunnelCfg,String>{
+        let password=if matches!(self.ssh_auth_type.as_str(),"agent"|"none"){String::new()}else if !self.ssh_password.is_empty(){self.ssh_password.clone()}else{
+            lookup(&format!("{id}::ssh-tunnel")).map_err(|_|"读取数据库 SSH 隧道凭据失败，已拒绝连接".to_string())?.unwrap_or_default()
+        };
+        Ok(crate::db_tunnel::DbTunnelCfg{host:self.ssh_host.clone(),port:self.ssh_port,user:self.ssh_user.clone(),auth_type:self.ssh_auth_type.clone(),password,key_path:self.ssh_key_path.clone()})
+    }
+}
 /// 展开路径中的 ~ (HOME)
 pub fn expand_home(p: &str) -> std::path::PathBuf {
     if let Some(rest) = p.strip_prefix("~/") {
@@ -129,9 +143,9 @@ async fn test_mongo(config: &ConnConfig, password: Option<&str>) -> Result<Strin
 
 async fn test_mysql(config: &ConnConfig, password: Option<&str>) -> Result<String, String> {
     use sqlx::ConnectOptions;
-    use sqlx::mysql::{MySqlConnectOptions, MySqlSslMode};
+    use sqlx::mysql::{MySqlConnectOptions};
     use crate::commands::query::MySqlPwdExt;
-    use crate::db_tunnel::{DbTunnel, DbTunnelCfg};
+    use crate::db_tunnel::DbTunnel;
 
     let host = config.host.as_deref().unwrap_or("127.0.0.1");
     let port = config.port.unwrap_or(3306);
@@ -139,21 +153,13 @@ async fn test_mysql(config: &ConnConfig, password: Option<&str>) -> Result<Strin
     let db   = config.database.as_deref().unwrap_or("");
     let pwd  = password.unwrap_or("");
 
-    let extra: DbExtraCfg = config.extra_json.as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
+    let extra = DbExtraCfg::from_config(config)?;
+    let tls_mode = crate::commands::query::mysql_tls_mode(config, &extra.ssl_mode)?;
 
     // ── SSH 隧道（如果启用，先建隧道，连接改到本地端口）──
     let _tunnel: Option<DbTunnel>;
     let (conn_host, conn_port) = if extra.ssh_tunnel {
-        let tcfg = DbTunnelCfg {
-            host:      extra.ssh_host.clone(),
-            port:      extra.ssh_port,
-            user:      extra.ssh_user.clone(),
-            auth_type: extra.ssh_auth_type.clone(),
-            password:  extra.ssh_password.clone(),
-            key_path:  extra.ssh_key_path.clone(),  // ~ 展开统一在 DbTunnel::open 内处理
-        };
+        let tcfg = extra.tunnel_config_with(&config.id,crate::keychain::get_password)?;
         let t = DbTunnel::open(&tcfg, host, port).await?;
         let p = t.local_port;
         _tunnel = Some(t);
@@ -169,12 +175,7 @@ async fn test_mysql(config: &ConnConfig, password: Option<&str>) -> Result<Strin
 
     if !db.is_empty() { opts = opts.database(db); }
 
-    opts = opts.ssl_mode(match extra.ssl_mode.as_str() {
-        "require"     => MySqlSslMode::Required,
-        "verify-ca"   => MySqlSslMode::VerifyCa,
-        "verify-full" => MySqlSslMode::VerifyIdentity,
-        _             => MySqlSslMode::Disabled,
-    });
+    opts = opts.ssl_mode(tls_mode);
     if !extra.ssl_ca.is_empty()   { opts = opts.ssl_ca(expand_home(&extra.ssl_ca)); }
     if !extra.ssl_cert.is_empty() { opts = opts.ssl_client_cert(expand_home(&extra.ssl_cert)); }
     if !extra.ssl_key.is_empty()  { opts = opts.ssl_client_key(expand_home(&extra.ssl_key)); }
@@ -199,8 +200,8 @@ async fn test_mysql(config: &ConnConfig, password: Option<&str>) -> Result<Strin
 
 async fn test_postgres(config: &ConnConfig, password: Option<&str>) -> Result<String, String> {
     use sqlx::ConnectOptions;
-    use sqlx::postgres::{PgConnectOptions, PgSslMode};
-    use crate::db_tunnel::{DbTunnel, DbTunnelCfg};
+    use sqlx::postgres::{PgConnectOptions};
+    use crate::db_tunnel::DbTunnel;
 
     let host = config.host.as_deref().unwrap_or("127.0.0.1");
     let port = config.port.unwrap_or(5432);
@@ -208,21 +209,13 @@ async fn test_postgres(config: &ConnConfig, password: Option<&str>) -> Result<St
     let db   = config.database.as_deref().unwrap_or("postgres");
     let pwd  = password.unwrap_or("");
 
-    let extra: DbExtraCfg = config.extra_json.as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
+    let extra = DbExtraCfg::from_config(config)?;
+    let tls_mode = crate::commands::query::pg_tls_mode(config, &extra.ssl_mode)?;
 
     // ── SSH 隧道 ──────────────────────────────────────────
     let _tunnel: Option<DbTunnel>;
     let (conn_host, conn_port) = if extra.ssh_tunnel {
-        let tcfg = DbTunnelCfg {
-            host:      extra.ssh_host.clone(),
-            port:      extra.ssh_port,
-            user:      extra.ssh_user.clone(),
-            auth_type: extra.ssh_auth_type.clone(),
-            password:  extra.ssh_password.clone(),
-            key_path:  extra.ssh_key_path.clone(),  // ~ 展开统一在 DbTunnel::open 内处理
-        };
+        let tcfg = extra.tunnel_config_with(&config.id,crate::keychain::get_password)?;
         let t = DbTunnel::open(&tcfg, host, port).await?;
         let p = t.local_port;
         _tunnel = Some(t);
@@ -236,12 +229,7 @@ async fn test_postgres(config: &ConnConfig, password: Option<&str>) -> Result<St
     let mut opts = PgConnectOptions::new()
         .host(&conn_host).port(conn_port).username(user).password(pwd).database(db);
 
-    opts = opts.ssl_mode(match extra.ssl_mode.as_str() {
-        "require"     => PgSslMode::Require,
-        "verify-ca"   => PgSslMode::VerifyCa,
-        "verify-full" => PgSslMode::VerifyFull,
-        _             => PgSslMode::Disable,
-    });
+    opts = opts.ssl_mode(tls_mode);
     if !extra.ssl_ca.is_empty()   { opts = opts.ssl_root_cert(expand_home(&extra.ssl_ca)); }
     if !extra.ssl_cert.is_empty() { opts = opts.ssl_client_cert(expand_home(&extra.ssl_cert)); }
     if !extra.ssl_key.is_empty()  { opts = opts.ssl_client_key(expand_home(&extra.ssl_key)); }
@@ -393,6 +381,14 @@ fn friendly_err(e: impl std::fmt::Display) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn tester_sql_tls_unknown_mode_fails_before_network() {
+        let mut config: ConnConfig = serde_json::from_value(serde_json::json!({"id":"tester-tls","name":"test","type":"mysql","host":"127.0.0.1","port":1,"useSsl":false,"extraJson":"{\"sslMode\":\"typo\"}","createdAt":0,"updatedAt":0})).unwrap();
+        assert!(super::test_mysql(&config, None).await.unwrap_err().contains("TLS 模式"));
+        config.conn_type = ConnType::Postgres;
+        assert!(super::test_postgres(&config, None).await.unwrap_err().contains("TLS 模式"));
+    }
+
     #[test]
     fn test_expand_home_with_tilde() {
         std::env::set_var("HOME", "/home/testuser");
@@ -453,5 +449,37 @@ mod tests {
         assert_eq!(cfg.ssl_ca, "/path/to/ca.pem");
         assert_eq!(cfg.ssl_cert, "/path/to/cert.pem");
         assert_eq!(cfg.ssl_key, "/path/to/key.pem");
+    }
+}
+
+#[cfg(test)]
+mod connection_policy_audit_tests {
+    use super::*;
+    #[test]
+    fn saved_tunnel_password_is_restored_and_lookup_failures_reject(){
+        let cfg=DbExtraCfg{ssh_auth_type:"password".into(),..Default::default()};
+        let tunnel=cfg.tunnel_config_with("r20",|key|{assert_eq!(key,"r20::ssh-tunnel");Ok(Some("fixture secret".into()))}).unwrap();
+        assert!(tunnel.password=="fixture secret");
+        assert!(cfg.tunnel_config_with("r20",|_|Err("sensitive backend failure".into())).is_err());
+    }
+    #[test]
+    fn agent_authentication_has_no_credential_dependency(){
+        for kind in ["agent","none"]{let cfg=DbExtraCfg{ssh_auth_type:kind.into(),..Default::default()};assert!(cfg.tunnel_config_with("r20",|_|panic!("unused credential lookup")).unwrap().password.is_empty());}
+    }
+    fn fixture(raw:&str)->ConnConfig{serde_json::from_value(serde_json::json!({"id":"r20-fixture","name":"fixture","type":"mysql","host":"127.0.0.1","port":1,"useSsl":false,"extraJson":raw,"createdAt":0,"updatedAt":0})).unwrap()}
+    #[tokio::test]
+    async fn malformed_tunnel_policy_never_becomes_direct_connection(){
+        for raw in [r#"{"sshTunnel":true,"sshPort":"bad"}"#,r#"{"sshTunnel":true,"sshPassword":42}"#]{
+            let c=fixture(raw);
+            let mysql=test_mysql(&c,None).await.err().expect("malformed MySQL policy accepted");
+            assert!(mysql.contains("配置格式错误"),"must reject before networking: {mysql}");
+            let pg=test_postgres(&c,None).await.err().expect("malformed test_postgres policy accepted");
+            assert!(pg.contains("配置格式错误"),"must reject before networking: {pg}");
+        }
+    }
+    #[test]
+    fn malformed_policy_objects_reject_without_losing_valid_defaults(){
+        for raw in ["[]","null","{",r#"{"sshTunnel":"true"}"#]{assert!(DbExtraCfg::from_config(&fixture(raw)).is_err());}
+        for raw in ["","  ","{}"]{assert!(DbExtraCfg::from_config(&fixture(raw)).is_ok());}
     }
 }

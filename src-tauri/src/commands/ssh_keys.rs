@@ -1,5 +1,5 @@
 // SSH 密钥管理命令（列出/生成/导入/删除/读取公钥）
-use russh_keys::PublicKeyBase64;
+use russh::keys::PublicKeyBase64;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
@@ -114,8 +114,8 @@ pub fn list_ssh_keys() -> Result<Vec<SshKeyInfo>, String> {
             "DSA".to_string()
         } else if content.contains("PRIVATE KEY") {
             // PKCS8 / OpenSSH 通用格式 —— 尝试解析确认算法
-            russh_keys::load_secret_key(&path, None)
-                .map(|k| k.name().to_string())
+            russh::keys::load_secret_key(&path, None)
+                .map(|k| k.algorithm().to_string())
                 .unwrap_or_else(|_| "Unknown".to_string())
         } else {
             "Ed25519".to_string()
@@ -173,17 +173,14 @@ pub fn generate_ssh_key(
     }
 
     let algo_lower = algo.to_lowercase();
-    let key_pair = if algo_lower == "rsa" {
-        russh_keys::key::KeyPair::generate_rsa(4096, russh_keys::key::SignatureHash::SHA2_512)
-            .ok_or_else(|| "生成 RSA 密钥失败".to_string())?
-    } else {
-        russh_keys::key::KeyPair::generate_ed25519()
-    };
+    let algorithm = if algo_lower == "rsa" { russh::keys::Algorithm::Rsa { hash: None } } else { russh::keys::Algorithm::Ed25519 };
+    let key_pair = russh::keys::PrivateKey::random(&mut russh::keys::key::safe_rng(), algorithm)
+        .map_err(|e| format!("生成 SSH 密钥失败: {e}"))?;
 
     // 写私钥（PKCS8 PEM 格式）
     {
         let mut pem = Vec::new();
-        russh_keys::encode_pkcs8_pem(&key_pair, &mut pem)
+        russh::keys::encode_pkcs8_pem(&key_pair, &mut pem)
             .map_err(|e| format!("编码私钥失败: {e}"))?;
         fs::write(&priv_path, &pem).map_err(|e| format!("写私钥失败: {e}"))?;
         crate::keychain::restrict_permissions(&priv_path);
@@ -191,8 +188,8 @@ pub fn generate_ssh_key(
 
     // 写公钥（OpenSSH authorized_keys 格式）
     let pub_str = {
-        let pub_key = key_pair.clone_public_key().map_err(|e| format!("获取公钥失败: {e}"))?;
-        let typ = pub_key.name();
+        let pub_key = key_pair.public_key();
+        let typ = pub_key.algorithm().to_string();
         let blob = pub_key.public_key_base64();
         let cmt = if comment.is_empty() { "dbterm".to_string() } else { comment.clone() };
         format!("{typ} {blob} {cmt}\n")

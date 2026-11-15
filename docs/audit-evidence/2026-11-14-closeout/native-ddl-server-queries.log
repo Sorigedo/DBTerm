@@ -1,0 +1,111 @@
+SHOW CREATE TABLE `dbterm_native_export`.`mc_pos_settlement_company`
+SHOW CREATE TABLE `dbterm_native_export`.`mc_pos_settlement_company`
+SHOW CREATE TABLE `dbterm_native_export`.`typed`
+SHOW CREATE TABLE `dbterm_native_export`.`typed`
+SHOW CREATE DATABASE `dbterm_native_export`
+SHOW CREATE DATABASE `dbterm_native_export`
+SELECT @@SESSION.sql_mode
+SELECT @@SESSION.sql_mode
+SET time_zone = '+00:00'
+SET time_zone = '+00:00'
+SHOW CREATE TABLE `dbterm_native_export`.`mc_pos_settlement_company`
+SHOW CREATE TABLE `dbterm_native_export`.`mc_pos_settlement_company`
+SELECT @@SESSION.sql_mode
+SELECT @@SESSION.sql_mode
+SET time_zone = '+00:00'
+SET time_zone = '+00:00'
+SHOW CREATE TABLE `dbterm_native_export`.`typed`
+SHOW CREATE TABLE `dbterm_native_export`.`typed`
+SHOW CREATE DATABASE `dbterm_native_export`
+SHOW CREATE DATABASE `dbterm_native_export`
+SELECT @@SESSION.sql_mode
+SELECT @@SESSION.sql_mode
+SET time_zone = '+00:00'
+SET time_zone = '+00:00'
+SHOW CREATE TABLE `dbterm_native_export`.`mc_pos_settlement_company`
+SHOW CREATE TABLE `dbterm_native_export`.`mc_pos_settlement_company`
+SHOW FULL COLUMNS FROM `dbterm_native_export`.`mc_pos_settlement_company`
+SHOW FULL COLUMNS FROM `dbterm_native_export`.`mc_pos_settlement_company`
+SET time_zone = '+00:00'
+/* DBTerm */ SELECT `id`, `plan_name`, `company_name`, `pos_type`, `pos_model`, `country_code`, `status`, `remark`, `created_by`, `create_time`, `update_time`, `delete_time`, `plan_code` FROM `dbterm_native_export`.`mc_pos_settlement_company`
+/* DBTerm */ SELECT `id`, `plan_name`, `company_name`, `pos_type`, `pos_model`, `country_code`, `status`, `remark`, `created_by`, `create_time`, `update_time`, `delete_time`, `plan_code` FROM `dbterm_native_export`.`mc_pos_settlement_company`
+SELECT @@SESSION.sql_mode
+SELECT @@SESSION.sql_mode
+SET time_zone = '+00:00'
+SET time_zone = '+00:00'
+SHOW CREATE TABLE `dbterm_native_export`.`typed`
+SHOW CREATE TABLE `dbterm_native_export`.`typed`
+SHOW FULL COLUMNS FROM `dbterm_native_export`.`typed`
+SHOW FULL COLUMNS FROM `dbterm_native_export`.`typed`
+SET time_zone = '+00:00'
+/* DBTerm */ SELECT `id`, `txt`, `payload`, `amount`, `flags`, CAST(`choices` AS UNSIGNED) AS `choices`, CAST(`kind` AS UNSIGNED) AS `kind`, `hidden_value` FROM `dbterm_native_export`.`typed`
+/* DBTerm */ SELECT `id`, `txt`, `payload`, `amount`, `flags`, CAST(`choices` AS UNSIGNED) AS `choices`, CAST(`kind` AS UNSIGNED) AS `kind`, `hidden_value` FROM `dbterm_native_export`.`typed`
+SELECT @@SESSION.sql_mode
+SELECT @@SESSION.sql_mode
+SET time_zone = '+00:00'
+SET time_zone = '+00:00'
+SELECT id,txt,payload,amount,flags,CAST(choices AS UNSIGNED) AS choices,CAST(kind AS UNSIGNED) AS kind,hidden_value FROM typed ORDER BY id
+SELECT id,txt,payload,amount,flags,CAST(choices AS UNSIGNED) AS choices,CAST(kind AS UNSIGNED) AS kind,hidden_value FROM typed ORDER BY id
+SELECT @@SESSION.sql_mode
+SELECT @@SESSION.sql_mode
+SET time_zone = '+00:00'
+SET time_zone = '+00:00'
+SELECT @@SESSION.sql_mode
+SELECT @@SESSION.sql_mode
+SET time_zone = '+00:00'
+SET time_zone = '+00:00'
+SELECT id,txt,payload,amount,flags,CAST(choices AS UNSIGNED) AS choices,CAST(kind AS UNSIGNED) AS kind,hidden_value FROM typed ORDER BY id
+SELECT id,txt,payload,amount,flags,CAST(choices AS UNSIGNED) AS choices,CAST(kind AS UNSIGNED) AS kind,hidden_value FROM typed ORDER BY id
+USE `dbterm_native_export`
+/* DBTerm */ ALTER TABLE `ddl_subject` ADD COLUMN `audit_note` varchar(37) NOT NULL DEFAULT '' COMMENT '验收新增字段'
+/* DBTerm */ ALTER TABLE `ddl_subject` ADD COLUMN `audit_note` varchar(37) NOT NULL DEFAULT '' COMMENT '验收新增字段'
+SHOW CREATE TABLE `dbterm_native_export`.`ddl_subject`
+SHOW CREATE TABLE `dbterm_native_export`.`ddl_subject`
+USE `dbterm_native_export`
+/* DBTerm */ ALTER TABLE `ddl_subject` RENAME COLUMN `plan_name` TO `plan_title`
+/* DBTerm */ ALTER TABLE `ddl_subject` RENAME COLUMN `plan_name` TO `plan_title`
+SHOW CREATE TABLE `dbterm_native_export`.`ddl_subject`
+SHOW CREATE TABLE `dbterm_native_export`.`ddl_subject`
+USE `dbterm_native_export`
+/* DBTerm */ ALTER TABLE `ddl_subject` ALTER COLUMN `remark` SET DEFAULT '新的默认值'
+/* DBTerm */ ALTER TABLE `ddl_subject` ALTER COLUMN `remark` SET DEFAULT '新的默认值'
+SHOW CREATE TABLE `dbterm_native_export`.`ddl_subject`
+SHOW CREATE TABLE `dbterm_native_export`.`ddl_subject`
+USE `dbterm_native_export`
+/* DBTerm */ ALTER TABLE `ddl_subject` MODIFY COLUMN `plan_title` varchar(160) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '' COMMENT '明确修改的定义'
+/* DBTerm */ ALTER TABLE `ddl_subject` MODIFY COLUMN `plan_title` varchar(160) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '' COMMENT '明确修改的定义'
+SHOW CREATE TABLE `dbterm_native_export`.`ddl_subject`
+SHOW CREATE TABLE `dbterm_native_export`.`ddl_subject`
+USE `dbterm_native_export`
+/* DBTerm */ ALTER TABLE `ddl_subject` DROP COLUMN `audit_note`
+/* DBTerm */ ALTER TABLE `ddl_subject` DROP COLUMN `audit_note`
+SHOW CREATE TABLE `dbterm_native_export`.`ddl_subject`
+SHOW CREATE TABLE `dbterm_native_export`.`ddl_subject`
+SHOW CREATE TABLE `dbterm_native_export`.`ddl_subject`
+SHOW CREATE TABLE `dbterm_native_export`.`ddl_subject`
+USE `dbterm_native_export`
+/* DBTerm */ ALTER TABLE ddl_subject ADD COLUMN must_not_exist int, DROP COLUMN nonexistent_column
+/* DBTerm */ ALTER TABLE ddl_subject ADD COLUMN must_not_exist int, DROP COLUMN nonexistent_column
+SHOW CREATE TABLE `dbterm_native_export`.`ddl_subject`
+SHOW CREATE TABLE `dbterm_native_export`.`ddl_subject`
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+select @@version_comment limit 1
+SET GLOBAL general_log=OFF

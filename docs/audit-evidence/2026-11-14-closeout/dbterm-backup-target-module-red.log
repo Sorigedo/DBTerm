@@ -1,0 +1,6 @@
+PASS backup resolves exact database/schema; DDL and row stream share target; restore context emitted. Synthetic catalogs/source contract only.
+Traceback (most recent call last):
+  File "/Users/Nico/workSpace/claude/DBterm/scripts/acceptance/sqlserver-backup-target.py", line 24, in <module>
+    assert 'resolve_backup_module' in module_block, 'view/function/procedure backups must resolve the same explicit object schema'
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: view/function/procedure backups must resolve the same explicit object schema

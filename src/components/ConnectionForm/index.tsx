@@ -226,7 +226,7 @@ const DEFAULT_DB_EXTRA: DbExtra = {
   pgSearchPath: '', pgAppName: '',
   mongoAuthSource: '',
   duckAccessMode: 'read_write', duckThreads: 0, duckMemoryLimit: '', duckTempDir: '',
-  ssInstance: '', ssEncrypt: true, ssTrustCert: true, ssAppIntent: 'ReadWrite',
+  ssInstance: '', ssEncrypt: true, ssTrustCert: false, ssAppIntent: 'ReadWrite',
   keySeparator: ':',
   chProtocol: 'http',
   oraConnMode: 'service', oraServiceName: '', oraSid: '', oraTnsAlias: '',
@@ -1461,7 +1461,7 @@ function DbForm({ form, patch, selType, password, setPassword, showPwd,
                           <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>SQL Server 2022 默认必须加密</span>
                         </label>
                         <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, cursor: 'pointer' }}>
-                          <input type="checkbox" checked={extra.ssTrustCert ?? true}
+                          <input type="checkbox" checked={extra.ssTrustCert ?? false}
                             onChange={e => patchExtra({ ssTrustCert: e.target.checked })} />
                           <span>信任服务器证书（TrustServerCertificate=true）</span>
                           <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>测试/内网可开启；生产建议关闭并配置证书</span>
@@ -2308,7 +2308,6 @@ function SshForm({ form, patch, password, setPassword, showPwd, extra, patchExtr
                 {([
                   ['enableSftp',        '启用 SFTP',  '文件管理走 SFTP 协议（推荐）'],
                   ['sftpSudo',          'SFTP-SUDO',  '以 sudo 启动 sftp-server，可管理 root 文件'],
-                  ['enableCompression', '传输压缩',    'zlib 压缩，慢速链路提速'],
                   ['recordLog',         '录制日志',    '会话输出落盘到 logs 目录'],
                   ['agentForwarding',   'Agent 转发',  '将本地 SSH Agent 转发到远端，支持免密二次跳转'],
                 ] as [keyof SshExtra, string, string][]).map(([k, l, hint]) => (
@@ -2321,6 +2320,10 @@ function SshForm({ form, patch, password, setPassword, showPwd, extra, patchExtr
                     </span>
                   </label>
                 ))}
+                <label className="adv-toggle" title="当前 SSH 协议库的压缩解码存在远程内存耗尽风险，升级并完成回归前强制关闭">
+                  <span>传输压缩（安全策略关闭）</span>
+                  <span className="toggle-sw"><input type="checkbox" checked={false} disabled readOnly /><span className="toggle-track" /></span>
+                </label>
               </div>
             </div>
 

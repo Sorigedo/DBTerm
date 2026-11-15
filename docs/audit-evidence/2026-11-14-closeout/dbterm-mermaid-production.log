@@ -1,0 +1,1 @@
+PASS production dist loads and renders in a fresh browser; no runtime errors, failed assets or external traffic; all native commands are simulated or rejected. Desktop installation and hardware remain untested.

@@ -1,0 +1,1 @@
+PASS backup uses structured post-data DDL after all table streams; no expression rewriting.

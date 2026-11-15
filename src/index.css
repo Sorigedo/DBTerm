@@ -4149,14 +4149,49 @@ body.tab-dragging .tab.active:hover {
   align-items: center;
   gap: 12px;
 }
-.docconvert-action-row__hint {
+.docconvert-output {
   min-width: 0;
   flex: 1;
+  display: grid;
+  gap: 3px;
+}
+.docconvert-action-row__hint {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text-muted);
   font-size: 11.5px;
+}
+.docconvert-output__path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 12px;
+}
+.docconvert-path-btn {
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.docconvert-path-btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--text-bright);
+}
+.docconvert-path-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 .docconvert-action-row .docconvert-run-btn {
   width: 116px;
@@ -4191,8 +4226,15 @@ body.tab-dragging .tab.active:hover {
   .docconvert-action-row .docconvert-run-btn {
     width: 100%;
   }
+  .docconvert-path-btn {
+    width: 100%;
+  }
   .docconvert-action-row__hint {
     white-space: normal;
+  }
+  .docconvert-output__path {
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 }
 .tool-result {
@@ -9417,6 +9459,22 @@ body.column-dragging .result-th:hover { background: var(--surface); }
   height: 100%;
   overflow: hidden;
   background: var(--bg);
+  /*
+   * xterm paints its own selection on the screen canvas.  Keep the host
+   * outside the browser's native selection model so a macOS trackpad click
+   * followed by movement cannot start a WebKit text selection in the host.
+   */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* xterm's accessibility mirror opts into text selection by default.  It is
+ * pointer-transparent, but WebKit can still select its text while dragging;
+ * the terminal canvas remains responsible for normal terminal selection. */
+.term-outer .xterm .xterm-accessibility-tree {
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 /* ── 右下角操作按钮（hover 才显示） ── */
@@ -9654,6 +9712,54 @@ body.column-dragging .result-th:hover { background: var(--surface); }
   background: color-mix(in srgb, #dc2626 8%, transparent);
   border-top: 1px solid var(--border-subtle);
 }
+.date-quick-pop {
+  position: fixed;
+  z-index: 10000;
+  width: 204px;
+  padding: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 14px 34px color-mix(in srgb, var(--bg) 42%, transparent);
+  animation: slideUp 0.14s ease-out;
+}
+.date-quick-pop__title {
+  padding: 2px 4px 7px;
+  color: var(--text-muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.date-quick-pop__actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.date-quick-pop__item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-height: 30px;
+  padding: 5px 8px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.date-quick-pop__item:hover {
+  background: var(--surface-hover);
+  color: var(--text-bright);
+}
+.date-quick-pop__item svg {
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.date-quick-pop__item--muted svg { color: var(--text-muted); }
 .result-editable-hint {
   display: inline-flex;
   align-items: center;
@@ -11213,6 +11319,8 @@ body.resizing {
 }
 .migrate-table-progress__name { font-size: 12px; font-weight: var(--fw-semibold); margin-bottom: 6px; }
 .migrate-table-progress__detail { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+@keyframes migrationProgressIndeterminate { from { transform: translateX(-120%); } to { transform: translateX(320%); } }
+.migration-progress-indeterminate { animation: migrationProgressIndeterminate 1.4s ease-in-out infinite; }
 
 /* ── 备份面板 (G1) ───────────────────────────────────────────── */
 .backup-panel { width: 500px; }

@@ -1,0 +1,49 @@
+warning: use of deprecated method `futures_channel::mpsc::UnboundedReceiver::<T>::try_next`: please use `try_recv` instead
+   --> vendor/sqlx-postgres/src/listener.rs:335:56
+    |
+335 |         if let Ok(Some(notification)) = self.buffer_rx.try_next() {
+    |                                                        ^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: variant `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/mod.rs:78:5
+   |
+70 | pub enum FrontendMessageFormat {
+   |          --------------------- variant in this enum
+...
+78 |     Flush = b'H',
+   |     ^^^^^
+   |
+   = note: `FrontendMessageFormat` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/flush.rs:11:12
+   |
+11 | pub struct Flush;
+   |            ^^^^^
+
+warning: `sqlx-postgres` (lib) generated 3 warnings
+   Compiling app v0.1.23 (/Users/Nico/workSpace/claude/DBterm/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.06s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/app_lib-ee4d343f2bc414c7)
+
+running 1 test
+
+thread 'commands::import_excel::tests::truncated_ole_directory_returns_error_instead_of_panicking' (731487) panicked at /Users/Nico/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/calamine-0.26.1/src/cfb.rs:302:44:
+range end index 64 out of range for slice of length 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'commands::import_excel::tests::truncated_ole_directory_returns_error_instead_of_panicking' (731487) panicked at src/commands/import_excel.rs:122:9:
+malformed XLS must return an error, not panic
+test commands::import_excel::tests::truncated_ole_directory_returns_error_instead_of_panicking ... FAILED
+
+failures:
+
+failures:
+    commands::import_excel::tests::truncated_ole_directory_returns_error_instead_of_panicking
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 522 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

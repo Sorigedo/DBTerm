@@ -1,8 +1,9 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { X, GitCompare, Loader2 } from 'lucide-react'
 import { useAppStore } from '../../stores/appStore'
 import SearchableSelect from './SearchableSelect'
+import { createDiffRequestOwner } from './dataDiffState'
 
 interface Props {
   connectionId: string
@@ -33,7 +34,18 @@ export default function DuckDbDiffPanel({ connectionId, onClose }: Props) {
   const selfName = connections.find(c => c.id === connectionId)?.name ?? connectionId
 
   const [otherId, setOtherId] = useState('')
-  const [result, setResult] = useState<DiffResult | null>(null)
+  const [storedResult, setResult] = useState<DiffResult | null>(null)
+  const [diffOwner] = useState(() => createDiffRequestOwner())
+  const [diffResultKey, setDiffResultKey] = useState<string | null>(null)
+  const diffSelectionKey = JSON.stringify([connectionId, otherId])
+  const diffSelectionRef = useRef(diffSelectionKey)
+  diffSelectionRef.current = diffSelectionKey
+  const result = diffResultKey === diffSelectionKey ? storedResult : null
+  useEffect(() => {
+    diffOwner.invalidate()
+    setResult(null); setError('')
+    return () => { diffOwner.invalidate() }
+  }, [diffOwner, diffSelectionKey])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
@@ -45,15 +57,18 @@ export default function DuckDbDiffPanel({ connectionId, onClose }: Props) {
 
   const run = async () => {
     if (!otherId) { setError('请选择对比目标库'); return }
+    const epoch = diffOwner.begin()
+    if (epoch === null) return
+    const current = () => diffOwner.current(epoch) && diffSelectionRef.current === diffSelectionKey
     setLoading(true); setError(''); setResult(null)
     try {
       const { invoke } = await import('@tauri-apps/api/core')
       const res = await invoke<DiffResult>('duckdb_db_diff', { leftId: connectionId, rightId: otherId })
-      setResult(res)
+      if (current()) { setResult(res); setDiffResultKey(diffSelectionKey) }
     } catch (e) {
-      setError(String(e))
+      if (current()) setError(String(e))
     } finally {
-      setLoading(false)
+      if (diffOwner.finish(epoch)) setLoading(false)
     }
   }
 
@@ -65,7 +80,7 @@ export default function DuckDbDiffPanel({ connectionId, onClose }: Props) {
         style={{ width: 820, maxHeight: '86vh', display: 'flex', flexDirection: 'column', borderRadius: 14, overflow: 'hidden' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '14px 16px', borderBottom: '1px solid var(--border)', flexShrink: 0 }}>
           <GitCompare size={15} color="var(--accent)" />
-          <span style={{ fontWeight: 600, color: 'var(--text-bright)', fontSize: 14 }}>DuckDB 双库 schema 对比</span>
+          <span style={{ fontWeight: 600, color: 'var(--text-bright)', fontSize: 14 }}>DuckDB 表名及字段类型摘要对比</span>
           <div style={{ marginLeft: 'auto' }}>
             <button onClick={onClose} style={{ color: 'var(--text-muted)', lineHeight: 0 }}><X size={15} /></button>
           </div>
@@ -99,7 +114,7 @@ export default function DuckDbDiffPanel({ connectionId, onClose }: Props) {
               <div>
                 <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-bright)', marginBottom: 6 }}>表差异（{diffTables.length}）</div>
                 {diffTables.length === 0 ? (
-                  <div style={{ fontSize: 12, color: 'var(--success)' }}>两库表集合一致 ✓</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>未发现表名差异，未验证完整结构</div>
                 ) : (
                   <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
                     <thead style={{ background: 'var(--surface-2)' }}>
@@ -123,7 +138,7 @@ export default function DuckDbDiffPanel({ connectionId, onClose }: Props) {
               <div>
                 <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-bright)', marginBottom: 6 }}>共有表的列差异（{result.columns.length}）</div>
                 {result.columns.length === 0 ? (
-                  <div style={{ fontSize: 12, color: 'var(--success)' }}>共有表的列一致 ✓</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>未发现列名或类型差异；列顺序、默认值、约束、索引、视图及数据未比较</div>
                 ) : (
                   <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
                     <thead style={{ background: 'var(--surface-2)' }}>
@@ -149,7 +164,7 @@ export default function DuckDbDiffPanel({ connectionId, onClose }: Props) {
               </div>
             </div>
           ) : (
-            <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 12, padding: 32 }}>选择右库后点击「对比」查看 schema 差异（仅结构对比，不含数据）</div>
+            <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 12, padding: 32 }}>选择右库后查看表名与列名/类型摘要差异；不提供完整结构或数据一致结论</div>
           )}
         </div>
       </div>

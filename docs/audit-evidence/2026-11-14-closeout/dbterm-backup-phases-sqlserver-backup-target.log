@@ -1,0 +1,3 @@
+PASS backup resolves exact database/schema; DDL and row stream share target; restore context emitted. Synthetic catalogs/source contract only.
+PASS module archive target and restore context contract.
+PASS actual module target SELECT schema filtering and rejection of table objects; synthetic catalogs only.

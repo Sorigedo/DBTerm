@@ -1,0 +1,19 @@
+✔ renaming a MySQL column uses RENAME COLUMN without rewriting its attributes (0.810167ms)
+✔ changing a MySQL column type fails closed when original attributes are not fully known (0.074ms)
+✔ changing MariaDB invisible status fails closed instead of rebuilding generated columns (0.053791ms)
+✔ unchanged MySQL column emits no ALTER clause (0.0505ms)
+✔ view migration changes only its declared identifier (1.639292ms)
+✔ routine migration retains its DEFINER, body, and character clauses (0.513542ms)
+✔ object migration rejects a declaration for a different source (0.4105ms)
+✔ object migration rejects replace semantics and unknown header syntax (0.08925ms)
+✔ object editor preserves full header security qualifiers body and literal text (0.382125ms)
+✔ saving routine or sqlite view never injects destructive DROP (0.10075ms)
+✔ object save invokes only the edited SQL without automatic routine or view deletion (0.627334ms)
+ℹ tests 11
+ℹ suites 0
+ℹ pass 11
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 89.94

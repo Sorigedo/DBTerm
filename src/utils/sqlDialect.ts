@@ -29,15 +29,12 @@ export function dialectFamily(connType: ConnType | string): DialectFamily {
 
 /**
  * 支持「数据迁移向导」的连接类型单一真源（前端入口过滤 + 向导连接列表共用）。
- * MySQL 族 / PG 族 / SQLite / DuckDB 可互迁；Oracle / SQL Server / ClickHouse 仅同引擎迁移。
+ * 目前仅 MySQL 族通过后端的完整 SHOW CREATE TABLE 定义复制与校验。
  * 须与后端 db_extra.rs db_migrate_table 的支持范围保持一致。
  */
 export const MIGRATABLE_DB_TYPES: ConnType[] = [
-  'mysql', 'mariadb', 'tidb', 'oceanBase', 'postgres', 'kingBase', 'openGauss',
-  'sqlite', 'duckdb', 'oracle', 'sqlServer', 'clickHouse',
+  'mysql', 'mariadb', 'tidb', 'oceanBase',
 ]
-/** 仅支持「同引擎」迁移（源与目标须为相同类型）的连接类型，须与后端 matches! 分支一致 */
-export const SAME_ENGINE_ONLY_MIGRATE: ConnType[] = ['oracle', 'sqlServer', 'clickHouse']
 
 export const isMysqlFamily = (c: ConnType | string) => dialectFamily(c) === 'mysql'
 export const isPgFamily    = (c: ConnType | string) => dialectFamily(c) === 'postgres'
@@ -67,12 +64,19 @@ export function sqlStr(s: string): string {
   return "'" + s.replace(/'/g, "''") + "'"
 }
 
+/** schema 参数在 SQL Server 中表示数据库；对象名参数内各段仍需标识符引用。 */
+export function sqlServerRename(database: string, table: string, newName: string, column?: string, ssSchema?: string): string {
+  const q = (name: string) => qid('sqlServer', name)
+  const object = (ssSchema ? `${q(ssSchema)}.` : '') + q(table) + (column === undefined ? '' : `.${q(column)}`)
+  return `EXEC ${database ? `${q(database)}.` : ''}sys.sp_rename N${sqlStr(object)}, N${sqlStr(newName)}, N'${column === undefined ? 'OBJECT' : 'COLUMN'}';`
+}
+
 /**
  * 按方言生成「查看某表索引」的 SQL。返回 null 表示该方言不支持。
  * 各方言系统表不同：MySQL=SHOW INDEX / PG=pg_indexes / Oracle=ALL_INDEXES /
  * SQLite=PRAGMA / DuckDB=duckdb_indexes() / ClickHouse=system.data_skipping_indices / MSSQL=sys.indexes。
  */
-export function buildIndexSql(connType: ConnType | string, schema: string, table: string): string | null {
+export function buildIndexSql(connType: ConnType | string, schema: string, table: string, ssSchema?: string): string | null {
   const esc = (s: string) => s.replace(/'/g, "''")
   const sd = schema || (connType === 'duckdb' ? 'main' : connType === 'sqlServer' ? 'dbo' : 'public')
   if (isMysqlFamily(connType)) return `SHOW INDEX FROM ${tableRef(connType, schema, table)}`
@@ -98,14 +102,15 @@ export function buildIndexSql(connType: ConnType | string, schema: string, table
       + `WHERE database='${esc(schema)}' AND table='${esc(table)}'`
   }
   if (connType === 'sqlServer') {
-    // schema=数据库名：用三段式 [库].sys.* 引用该库的目录视图，按表名过滤（默认 dbo）
+    // schema=数据库名；目录与对象schema分别限定，避免跨库或同名对象混用。
     const db = schema ? `${qid(connType, schema)}.` : ''
     return `SELECT i.name, i.type_desc, CASE WHEN i.is_unique=1 THEN 'YES' ELSE 'NO' END is_unique, `
       + `CASE WHEN i.is_primary_key=1 THEN 'YES' ELSE 'NO' END is_pk, c.name column_name `
       + `FROM ${db}sys.indexes i JOIN ${db}sys.tables t ON i.object_id=t.object_id `
+      + `JOIN ${db}sys.schemas s ON s.schema_id=t.schema_id `
       + `LEFT JOIN ${db}sys.index_columns ic ON i.object_id=ic.object_id AND i.index_id=ic.index_id `
       + `LEFT JOIN ${db}sys.columns c ON ic.object_id=c.object_id AND ic.column_id=c.column_id `
-      + `WHERE t.name='${esc(table)}' ORDER BY i.name, ic.key_ordinal`
+      + `WHERE t.name=N'${esc(table)}'${ssSchema ? ` AND s.name=N'${esc(ssSchema)}'` : ''} ORDER BY i.name, ic.key_ordinal`
   }
   return null
 }

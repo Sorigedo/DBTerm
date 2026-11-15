@@ -466,6 +466,7 @@ export default function Workspace() {
                         connType={conn?.type ?? 'mysql'}
                         schema={t.meta?.schema ?? ''}
                         table={t.meta?.table ?? ''}
+                        ssSchema={t.meta?.ssSchema}
                         embedded
                         active={isTabVisible(t.id)}
                       />

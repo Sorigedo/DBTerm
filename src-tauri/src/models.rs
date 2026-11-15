@@ -278,13 +278,13 @@ pub struct DiskEntry {
 ///
 /// - `hostname` - Server hostname
 /// - `username` - Current user
-/// - `cpu_usage` - CPU usage percentage (0.0-100.0)
+/// - `cpu_total` - Overall CPU usage percentage (0.0-100.0)
 /// - `mem_total` - Total physical memory in bytes
 /// - `mem_used` - Used memory in bytes
 /// - `disks` - List of mounted filesystems (see [`DiskEntry`])
 /// - `net_rx` - Network receive bytes
 /// - `net_tx` - Network transmit bytes
-/// - `uptime_secs` - System uptime in seconds
+/// - `uptime` - Human-readable system uptime
 ///
 /// # Examples
 ///
@@ -294,9 +294,18 @@ pub struct DiskEntry {
 /// let perf = ServerPerf {
 ///     hostname: "web-01".to_string(),
 ///     username: "appuser".to_string(),
-///     cpu_usage: 23.5,
+///     uptime: "10 days".to_string(),
+///     os: "Linux".to_string(),
+///     ip: "192.0.2.10".to_string(),
+///     cpu_total: 23.5,
+///     cpu_cores: vec![20.0, 27.0],
+///     cpu_count: 2,
 ///     mem_total: 16_000_000_000, // 16GB
 ///     mem_used: 8_000_000_000,   // 8GB
+///     swap_total: 0,
+///     swap_used: 0,
+///     disk_total: 500_000_000_000,
+///     disk_used: 200_000_000_000,
 ///     disks: vec![
 ///         DiskEntry {
 ///             mount: "/".to_string(),
@@ -306,7 +315,7 @@ pub struct DiskEntry {
 ///     ],
 ///     net_rx: 1_024_000_000, // 1GB received
 ///     net_tx: 512_000_000,   // 512MB sent
-///     uptime_secs: 864_000,  // 10 days
+///     processes: vec![],
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]

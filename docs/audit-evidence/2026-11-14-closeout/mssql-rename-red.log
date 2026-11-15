@@ -1,0 +1,21 @@
+Re-optimizing dependencies because vite config has changed
+node:internal/modules/run_main:107
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
++ actual - expected
+
++ "EXEC sp_rename 'db']name.table.'name].old.'name]', 'new'; SELECT 1;--中文', 'COLUMN';"
+- "EXEC [db']]name].sys.sp_rename N'[table.''name]]].[old.''name]]]', N'new''; SELECT 1;--中文', N'COLUMN';"
+
+    at file:///Users/Nico/workSpace/claude/DBterm/scripts/acceptance/alter-column-order.mjs:35:9 {
+  generatedMessage: true,
+  code: 'ERR_ASSERTION',
+  actual: "EXEC sp_rename 'db']name.table.'name].old.'name]', 'new'; SELECT 1;--中文', 'COLUMN';",
+  expected: "EXEC [db']]name].sys.sp_rename N'[table.''name]]].[old.''name]]]', N'new''; SELECT 1;--中文', N'COLUMN';",
+  operator: 'strictEqual',
+  diff: 'simple'
+}
+
+Node.js v26.8.2

@@ -9,6 +9,42 @@ use tauri::{Emitter, State};
 use super::{MongoPool, load_conn, get_client};
 use crate::storage::StorageState;
 
+const MAX_IMPORT_FILE_BYTES: u64 = 128 * 1024 * 1024;
+
+fn read_import_file(path: &str) -> Result<Vec<u8>, String> {
+    read_import_file_limited(path, MAX_IMPORT_FILE_BYTES)
+}
+
+fn read_import_file_limited(path: &str, limit: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("读取导入文件失败: {e}"))?;
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("读取导入文件失败: {e}"))?;
+    if bytes.len() as u64 > limit {
+        return Err(format!(
+            "导入文件超过{}MiB上限，已拒绝读取，数据库尚未写入",
+            limit / 1024 / 1024
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod import_file_limit_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_reader_accepts_limit_and_rejects_the_first_byte_over_it() {
+        let path = std::env::temp_dir().join(format!("dbterm-mongo-import-limit-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"12345").unwrap();
+        assert_eq!(read_import_file_limited(path.to_str().unwrap(), 5).unwrap(), b"12345");
+        assert!(read_import_file_limited(path.to_str().unwrap(), 4).unwrap_err().contains("上限"));
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
 fn doc_to_ejson(d: &Document) -> String {
     // Extended JSON: 直接用 serde_json 序列化 bson::Document
     serde_json::to_string(d).unwrap_or_else(|_| "{}".to_string())
@@ -212,6 +248,7 @@ pub async fn mongo_import_collection(
     storage: State<'_, StorageState>,
     pool: State<'_, MongoPool>,
 ) -> Result<serde_json::Value, String> {
+    let input = read_import_file(&input_path)?;
     let (config, password) = load_conn(&id, &storage)?;
     if config.read_only == Some(true) {
         return Err("当前连接为只读模式，写操作已被禁止".to_string());
@@ -221,10 +258,10 @@ pub async fn mongo_import_collection(
 
     let docs: Vec<Document> = match format.as_str() {
         // Excel 为二进制，单独按路径读取
-        "excel" | "xlsx" | "xls" => parse_xlsx_to_docs(&input_path)?,
+        "excel" | "xlsx" | "xls" => parse_xlsx_to_docs(input)?,
         other => {
-            let content = std::fs::read_to_string(&input_path)
-                .map_err(|e| format!("读取文件失败: {e}"))?;
+            let content = String::from_utf8(input)
+                .map_err(|e| format!("读取导入文件失败，必须是UTF-8文本: {e}"))?;
             match other {
                 "csv" => parse_csv_to_docs(&content)?,
                 "tsv" => parse_tsv_to_docs(&content)?,
@@ -357,9 +394,10 @@ fn parse_tsv_to_docs(content: &str) -> Result<Vec<Document>, String> {
     Ok(docs)
 }
 
-fn parse_xlsx_to_docs(path: &str) -> Result<Vec<Document>, String> {
-    use calamine::{Reader, open_workbook_auto, Data};
-    let mut wb = open_workbook_auto(path).map_err(|e| format!("打开 Excel 失败: {e}"))?;
+fn parse_xlsx_to_docs(bytes: Vec<u8>) -> Result<Vec<Document>, String> {
+    use calamine::{Reader, Data};
+    let mut wb = calamine::open_workbook_auto_from_rs(std::io::Cursor::new(bytes))
+        .map_err(|e| format!("打开 Excel 失败: {e}"))?;
     let range = wb.worksheet_range_at(0)
         .ok_or("Excel 无工作表")?
         .map_err(|e| format!("读取工作表失败: {e}"))?;

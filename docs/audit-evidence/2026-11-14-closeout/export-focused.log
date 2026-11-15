@@ -1,0 +1,39 @@
+    Blocking waiting for file lock on build directory
+warning: use of deprecated method `futures_channel::mpsc::UnboundedReceiver::<T>::try_next`: please use `try_recv` instead
+   --> vendor/sqlx-postgres/src/listener.rs:335:56
+    |
+335 |         if let Ok(Some(notification)) = self.buffer_rx.try_next() {
+    |                                                        ^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: variant `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/mod.rs:78:5
+   |
+70 | pub enum FrontendMessageFormat {
+   |          --------------------- variant in this enum
+...
+78 |     Flush = b'H',
+   |     ^^^^^
+   |
+   = note: `FrontendMessageFormat` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/flush.rs:11:12
+   |
+11 | pub struct Flush;
+   |            ^^^^^
+
+warning: `sqlx-postgres` (lib) generated 3 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.72s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/app_lib-bccc94f7de71602a)
+
+running 4 tests
+test commands::db_export::archive_tests::mysql_sql_export_preserves_enum_and_set_internal_members ... ok
+test commands::db_export::archive_tests::mysql_sql_export_round_trips_typed_values ... ok
+test commands::db_export::archive_tests::mysql_tabular_exports_never_silently_turn_decode_errors_into_null ... ok
+test commands::db_export::archive_tests::mysql_xlsx_large_ids_and_decimals_are_text_with_exact_digits ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 450 filtered out; finished in 0.03s
+

@@ -1,0 +1,2 @@
+PASS production DDL SELECT retrieves computed expression, persistence, collation, named defaults, qualified type and identity replication attributes; source contract only.
+PASS production column SELECT joins, target isolation and expression/default/collation values; SQLite synthetic catalog only.

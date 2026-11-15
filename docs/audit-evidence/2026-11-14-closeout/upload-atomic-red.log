@@ -1,0 +1,48 @@
+warning: use of deprecated method `futures_channel::mpsc::UnboundedReceiver::<T>::try_next`: please use `try_recv` instead
+   --> vendor/sqlx-postgres/src/listener.rs:335:56
+    |
+335 |         if let Ok(Some(notification)) = self.buffer_rx.try_next() {
+    |                                                        ^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: variant `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/mod.rs:78:5
+   |
+70 | pub enum FrontendMessageFormat {
+   |          --------------------- variant in this enum
+...
+78 |     Flush = b'H',
+   |     ^^^^^
+   |
+   = note: `FrontendMessageFormat` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/flush.rs:11:12
+   |
+11 | pub struct Flush;
+   |            ^^^^^
+
+warning: `sqlx-postgres` (lib) generated 3 warnings
+   Compiling app v0.1.23 (/Users/Nico/workSpace/claude/DBterm/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.02s
+     Running unittests src/lib.rs (target/debug/deps/app_lib-bccc94f7de71602a)
+
+running 1 test
+
+thread 'ssh::exec_integration_tests::local_fallback_upload_failure_preserves_original_file' (191076) panicked at src/ssh/exec_integration_tests.rs:19:5:
+assertion `left == right` failed: interrupted upload changed original; stderr=
+  left: [112, 97, 114, 116, 105, 97, 108]
+ right: [111, 114, 105, 103, 105, 110, 97, 108, 32, 99, 111, 109, 112, 108, 101, 116, 101, 32, 98, 121, 116, 101, 115]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test ssh::exec_integration_tests::local_fallback_upload_failure_preserves_original_file ... FAILED
+
+failures:
+
+failures:
+    ssh::exec_integration_tests::local_fallback_upload_failure_preserves_original_file
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 462 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--lib`

@@ -57,24 +57,9 @@ type FnColumnCount  = unsafe extern "C" fn(*mut DuckRawResult) -> u64;
 type FnRowCount     = unsafe extern "C" fn(*mut DuckRawResult) -> u64;
 type FnRowsChanged  = unsafe extern "C" fn(*mut DuckRawResult) -> u64;
 type FnColumnName   = unsafe extern "C" fn(*mut DuckRawResult, u64) -> *const c_char;
-type FnColumnType   = unsafe extern "C" fn(*mut DuckRawResult, u64) -> i32; // duckdb_type enum
-type FnValueVarchar = unsafe extern "C" fn(*mut DuckRawResult, u64, u64) -> *mut c_char;
-type FnFree         = unsafe extern "C" fn(*mut c_void);
+type FnFree = unsafe extern "C" fn(*mut c_void);
 
-/// duckdb_blob 结构体（与 DuckDB C API 完全一致：{const void*, idx_t}，16 字节）
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct DuckBlob {
-    data: *const c_void,
-    size: u64,
-}
-// Safety: DuckBlob 只含指针，不跨线程持有；使用后立即转换为 Vec<u8>
-unsafe impl Send for DuckBlob {}
-
-type FnValueBlob    = unsafe extern "C" fn(*mut DuckRawResult, u64, u64) -> DuckBlob;
-
-// DuckDB 列类型 ID（subset，v1.x C API）
-const DUCKDB_TYPE_BLOB: i32 = 18;
+mod vector_reader;
 
 // ── 已加载的函数指针集合 ─────────────────────────────────────────────────────
 
@@ -93,9 +78,6 @@ struct DuckFns {
     row_count:      FnRowCount,
     rows_changed:   FnRowsChanged,
     column_name:    FnColumnName,
-    column_type:    Option<FnColumnType>,
-    value_varchar:  FnValueVarchar,
-    value_blob:     Option<FnValueBlob>,
     free:           FnFree,
 }
 
@@ -114,11 +96,6 @@ impl DuckFns {
                 *s
             }};
         }
-        macro_rules! sym_opt {
-            ($name:literal, $ty:ty) => {{
-                lib.get::<$ty>($name).ok().map(|s| *s)
-            }};
-        }
         Ok(DuckFns {
             create_config:  sym!(b"duckdb_create_config\0",  FnCreateConfig),
             set_config:     sym!(b"duckdb_set_config\0",     FnSetConfig),
@@ -134,9 +111,6 @@ impl DuckFns {
             row_count:      sym!(b"duckdb_row_count\0",      FnRowCount),
             rows_changed:   sym!(b"duckdb_rows_changed\0",   FnRowsChanged),
             column_name:    sym!(b"duckdb_column_name\0",    FnColumnName),
-            column_type:    sym_opt!(b"duckdb_column_type\0", FnColumnType),
-            value_varchar:  sym!(b"duckdb_value_varchar\0",  FnValueVarchar),
-            value_blob:     sym_opt!(b"duckdb_value_blob\0",  FnValueBlob),
             free:           sym!(b"duckdb_free\0",           FnFree),
         })
     }
@@ -145,6 +119,7 @@ impl DuckFns {
 // ── 连接状态 ─────────────────────────────────────────────────────────────────
 
 pub struct DuckConnState {
+    config_identity: String,
     _lib: Arc<Library>,
     fns: Arc<DuckFns>,
     db:   *mut c_void,
@@ -212,10 +187,18 @@ async fn get_or_open(
     pool: &DuckPool,
     lib_path: &str,
 ) -> Result<Arc<Mutex<DuckConnState>>, String> {
-    {
-        let guard = pool.lock().await;
-        if let Some(c) = guard.get(conn_id) { return Ok(c.clone()); }
+    let identity = duck_connection_identity(config, lib_path)?;
+    // One cache lock covers lookup/validation/build/insert. A stale concurrent
+    // opener must not overwrite a newer config. Do not acquire a connection lock
+    // while blocking the runtime thread; Tokio awaits preserve lock ordering.
+    let mut pool_guard = pool.lock().await;
+    if let Some(cached) = pool_guard.get(conn_id) {
+        if cached.lock().await.config_identity == identity { return Ok(Arc::clone(cached)); }
+        ensure_cached_handle_idle(cached)?;
     }
+    // Drop the sole idle cache owner before opening the same file with changed
+    // access mode. Outstanding transaction/query Arcs instead fail above.
+    drop(pool_guard.remove(conn_id));
 
     // DR2.5: 建连前驱动可加载性预检（驱动失效时立即给出友好提示，不进入 spawn_blocking）
     verify_dylib_loadable(lib_path)?;
@@ -284,13 +267,24 @@ async fn get_or_open(
                 (fns.close)(&mut db);
                 return Err("duckdb_connect 失败".to_string());
             }
-            Ok(DuckConnState { _lib: lib, fns, db, conn })
+            Ok(DuckConnState { config_identity: identity, _lib: lib, fns, db, conn })
         }
     }).await.map_err(|e| format!("DuckDB 线程错误: {e}"))??;
 
     let entry = Arc::new(Mutex::new(state));
-    pool.lock().await.insert(id_str, entry.clone());
+    pool_guard.insert(id_str, entry.clone());
     Ok(entry)
+}
+
+fn duck_connection_identity(config: &ConnConfig, lib_path: &str) -> Result<String, String> {
+    serde_json::to_string(&(config, lib_path)).map_err(|e| format!("编码 DuckDB 连接身份失败: {e}"))
+}
+
+fn ensure_cached_handle_idle<T>(cached: &Arc<T>) -> Result<(), String> {
+    if Arc::strong_count(cached) != 1 {
+        return Err("DuckDB 连接配置已变更，但旧连接仍有查询或事务持有；请结束原事务/查询后重试，已拒绝复用旧库或重定向事务".into());
+    }
+    Ok(())
 }
 
 // ── 核心查询（阻塞，只在 spawn_blocking 内调用） ─────────────────────────────
@@ -298,6 +292,64 @@ async fn get_or_open(
 pub fn run_query_sync_pub(state: &DuckConnState, sql: &str, limit: usize) -> Result<QueryResult, String> {
     run_query_sync(state, sql, limit)
 }
+
+/// The native result is already materialized by duckdb_query. Bound the second,
+/// Rust-owned representation before allocating each decoded cell.
+struct DuckDecodeBudget { rows: usize, bytes: usize, max_bytes: usize }
+impl Default for DuckDecodeBudget {
+    fn default() -> Self { Self { rows: 0, bytes: 0, max_bytes: super::query_result_budget::MAX_RESULT_BYTES } }
+}
+impl DuckDecodeBudget {
+    fn error() -> String { "查询结果超过内存安全上限（100000 行或 32 MiB），已停止读取，未返回部分结果。请缩小查询范围或使用流式导出。".into() }
+    fn charge(&mut self, size: usize) -> Result<(), String> {
+        self.bytes = self.bytes.checked_add(size).ok_or_else(Self::error)?;
+        if self.bytes > self.max_bytes { return Err(Self::error()); }
+        Ok(())
+    }
+    fn start_row(&mut self) -> Result<(), String> {
+        self.rows += 1;
+        if self.rows > super::query_result_budget::MAX_RESULT_ROWS { return Err(Self::error()); }
+        self.charge(std::mem::size_of::<Vec<Option<String>>>())
+    }
+    fn cell(&mut self, size: usize) -> Result<(), String> {
+        self.charge(std::mem::size_of::<Option<String>>())?;
+        self.charge(size)
+    }
+}
+
+struct DuckAllocation { pointer: *mut c_void, free: FnFree }
+impl Drop for DuckAllocation {
+    fn drop(&mut self) { if !self.pointer.is_null() { unsafe { (self.free)(self.pointer); } } }
+}
+
+fn duck_blob_display_len(bytes: usize) -> Result<usize, String> {
+    bytes.checked_mul(2).and_then(|n| n.checked_add(2)).ok_or_else(DuckDecodeBudget::error)
+}
+
+fn encode_blob_display(bytes: &[u8]) -> Result<String, String> {
+    let mut out = String::with_capacity(duck_blob_display_len(bytes.len())?);
+    out.push_str("0x");
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes { out.push(HEX[(byte >> 4) as usize] as char); out.push(HEX[(byte & 15) as usize] as char); }
+    Ok(out)
+}
+
+fn lossy_utf8_len(mut bytes: &[u8]) -> Result<usize, String> {
+    let mut length = 0usize;
+    loop {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => return length.checked_add(text.len()).ok_or_else(DuckDecodeBudget::error),
+            Err(error) => {
+                length = length.checked_add(error.valid_up_to()).and_then(|n| n.checked_add(3)).ok_or_else(DuckDecodeBudget::error)?;
+                match error.error_len() {
+                    Some(invalid) => bytes = &bytes[error.valid_up_to() + invalid..],
+                    None => return Ok(length),
+                }
+            }
+        }
+    }
+}
+
 fn run_query_sync(state: &DuckConnState, sql: &str, limit: usize) -> Result<QueryResult, String> {
     let t0 = Instant::now();
     unsafe {
@@ -325,40 +377,11 @@ fn run_query_sync(state: &DuckConnState, sql: &str, limit: usize) -> Result<Quer
             else { CStr::from_ptr(ptr).to_string_lossy().to_string() }
         }).collect();
 
-        // 检测 BLOB 列（可选符号，旧版 DuckDB 可能无 column_type）
-        let blob_cols: Vec<bool> = (0..ncols).map(|c| {
-            if let (Some(fn_type), Some(_)) = (state.fns.column_type, state.fns.value_blob) {
-                fn_type(&mut res, c as u64) == DUCKDB_TYPE_BLOB
-            } else {
-                false
-            }
-        }).collect();
-
         let take = if limit > 0 { nrows.min(limit) } else { nrows };
-        let rows: Vec<Vec<Option<String>>> = (0..take).map(|r| {
-            (0..ncols).map(|c| {
-                if blob_cols[c] {
-                    // BLOB 列：用 value_blob 取原始字节，转为 0x… hex 表示
-                    let blob = (state.fns.value_blob.unwrap())(&mut res, c as u64, r as u64);
-                    if blob.data.is_null() || blob.size == 0 { return None; }
-                    let bytes = std::slice::from_raw_parts(blob.data as *const u8, blob.size as usize);
-                    let s = format!("0x{}", hex::encode(bytes));
-                    // duckdb_value_blob 的 .data 由 DuckDB malloc 分配，调用方须用 duckdb_free 释放
-                    (state.fns.free)(blob.data as *mut c_void);
-                    Some(s)
-                } else {
-                    let ptr = (state.fns.value_varchar)(&mut res, c as u64, r as u64);
-                    if ptr.is_null() { None }
-                    else {
-                        let s = CStr::from_ptr(ptr).to_string_lossy().to_string();
-                        (state.fns.free)(ptr as *mut c_void);
-                        Some(s)
-                    }
-                }
-            }).collect()
-        }).collect();
+        let decoded = vector_reader::decode(state, &mut res, ncols, take);
 
         (state.fns.destroy_result)(&mut res);
+        let rows = decoded?;
         Ok(QueryResult {
             is_select: !columns.is_empty(),
             columns,
@@ -793,6 +816,60 @@ pub async fn dispatch_duck_query(
     dispatch_duck_query_with_cancel(id, config, sql, pool, registry, None).await
 }
 
+fn validate_alter_batch(statements: &[String]) -> Result<(), String> {
+    use sqlparser::{ast::Statement, dialect::DuckDbDialect, parser::Parser};
+    if statements.is_empty() || statements.len() > 1000 { return Err("ALTER 批次为空或超过1000条".into()); }
+    for sql in statements {
+        let parsed = Parser::parse_sql(&DuckDbDialect {}, sql).map_err(|e| format!("无法安全解析 ALTER，原 SQL 未修改: {e}"))?;
+        if parsed.len() != 1 || !matches!(&parsed[0], Statement::AlterTable { .. }) {
+            return Err("此入口仅允许单条 ALTER TABLE，禁止夹带事务控制或其他语句".into());
+        }
+    }
+    Ok(())
+}
+
+fn run_alter_batch_sync(state: &DuckConnState, statements: &[String]) -> Result<(), String> {
+    validate_alter_batch(statements)?;
+    run_query_sync(state, "BEGIN", 0)?;
+    for sql in statements {
+        if let Err(error) = run_query_sync(state, sql, 0) {
+            return match run_query_sync(state, "ROLLBACK", 0) {
+                Ok(_) => Err(format!("{error}；本批次已回滚")),
+                Err(rollback) => Err(format!("{error}；回滚未获确认: {rollback}；结果不确定，勿重复执行")),
+            };
+        }
+    }
+    run_query_sync(state, "COMMIT", 0).map(|_| ()).map_err(|e| format!("提交未获确认: {e}；结果不确定，勿重复执行"))
+}
+
+fn run_isolated_alter_sync(state: &DuckConnState, statements: &[String]) -> Result<(), String> {
+    // 新建会话但复用相同原生库，兼容 :memory:；不加入普通查询的未提交事务。
+    let mut connection = std::ptr::null_mut();
+    if unsafe { (state.fns.connect)(state.db, &mut connection) } != 0 {
+        return Err("创建 ALTER 专用会话失败".into());
+    }
+    let dedicated = DuckConnState { config_identity: state.config_identity.clone(), _lib: Arc::clone(&state._lib), fns: Arc::clone(&state.fns), db: std::ptr::null_mut(), conn: connection };
+    run_alter_batch_sync(&dedicated, statements)
+}
+
+/// 向导独占连接；不注册到手动事务表，其他窗口无法提交或加入本批次。
+#[tauri::command]
+pub async fn duckdb_alter_table_atomic(
+    id: String, statements: Vec<String>, storage: State<'_, StorageState>, pool: State<'_, DuckPool>, registry: State<'_, DriverRegistry>,
+) -> Result<(), String> {
+    validate_alter_batch(&statements)?;
+    let config = load_conn_config(&id, &storage)?;
+    if config.conn_type != crate::models::ConnType::Duckdb || config.read_only == Some(true) {
+        return Err("此操作仅支持可写 DuckDB 连接".into());
+    }
+    let library = get_duck_lib_path(&registry).await?;
+    let handle = get_or_open(&id, &config, &pool, &library).await?;
+    tokio::task::spawn_blocking(move || {
+        let guard = handle.blocking_lock();
+        run_isolated_alter_sync(&guard, &statements)
+    }).await.map_err(|e| format!("ALTER 线程未正常返回: {e}；结果不确定，勿重复执行"))?
+}
+
 pub async fn dispatch_duck_query_with_cancel(
     id: &str,
     config: &ConnConfig,
@@ -801,27 +878,79 @@ pub async fn dispatch_duck_query_with_cancel(
     registry: &DriverRegistry,
     cancel_token: Option<&str>,
 ) -> Result<QueryResult, String> {
+    dispatch_duck_query_with_target(id, config, sql, pool, registry, cancel_token, None).await
+}
+
+pub async fn dispatch_duck_query_with_target(
+    id: &str, config: &ConnConfig, sql: &str, pool: &DuckPool,
+    registry: &DriverRegistry, cancel_token: Option<&str>, catalog: Option<&str>,
+) -> Result<QueryResult, String> {
     let lib_path = get_duck_lib_path(registry).await?;
     let conn = get_or_open(id, config, pool, &lib_path).await?;
+    execute_retained_target_inner(conn, sql.to_string(), cancel_token, id, catalog.map(str::to_string)).await
+}
+
+fn selected_catalog_sql(catalog: &str, catalogs: &[String]) -> Result<String, String> {
+    if catalog.is_empty() || catalog.len() > 128 || catalog.chars().any(char::is_control) {
+        return Err("DuckDB catalog 标识符无效".into());
+    }
+    if !catalogs.iter().any(|name| name == catalog) { return Err("选中的 DuckDB catalog 不存在于当前连接，已拒绝执行".into()); }
+    Ok(format!("USE \"{}\"", catalog.replace('"', "\"\"")))
+}
+
+pub(crate) fn select_catalog_on_connection(state: &DuckConnState, catalog: &str) -> Result<(), String> {
+    let result = run_query_sync(state, "SELECT database_name FROM duckdb_databases()", 0)?;
+    let names: Vec<String> = result.rows.into_iter().filter_map(|row| row.into_iter().next().flatten()).collect();
+    let command = selected_catalog_sql(catalog, &names)?;
+    run_query_sync(state, &command, 0).map(|_| ())
+}
+
+/// 事务专用连接在 BEGIN 前设置目标，之后不与普通查询共享。
+pub async fn select_retained_catalog(conn: Arc<Mutex<DuckConnState>>, catalog: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let guard = conn.blocking_lock();
+        select_catalog_on_connection(&guard, &catalog)
+    }).await.map_err(|e| format!("线程错误: {e}"))?
+}
+
+/// Execute on the exact connection selected at BEGIN. The Arc keeps both native
+/// handles and their loaded library alive, independent of later config saves.
+pub async fn execute_retained(
+    conn: Arc<Mutex<DuckConnState>>,
+    sql: String,
+    cancel_token: Option<&str>,
+) -> Result<QueryResult, String> {
+    execute_retained_inner(conn, sql, cancel_token, "retained").await
+}
+
+async fn execute_retained_inner(
+    conn: Arc<Mutex<DuckConnState>>, sql: String, cancel_token: Option<&str>, owner_id: &str,
+) -> Result<QueryResult, String> {
+    execute_retained_target_inner(conn, sql, cancel_token, owner_id, None).await
+}
+
+async fn execute_retained_target_inner(
+    conn: Arc<Mutex<DuckConnState>>, sql: String, cancel_token: Option<&str>, owner_id: &str, catalog: Option<String>,
+) -> Result<QueryResult, String> {
     let token = cancel_token.map(str::to_string);
-    let abort_rx = token.as_ref().map(|t| crate::commands::query::abort_register(t));
-    let sql_owned = sql.to_string();
+    let registration = token.as_ref().map(|t| crate::commands::query::abort_register_for(t, owner_id)).transpose()?;
+    let (_abort_guard, abort_rx) = registration.map_or((None, None), |(guard, rx)| (Some(guard), Some(rx)));
 
     let handle = tokio::task::spawn_blocking(move || {
         let guard = conn.blocking_lock();
-        run_query_sync(&guard, &sql_owned, 1000)
+        if let Some(catalog) = catalog { select_catalog_on_connection(&guard, &catalog)?; }
+        run_query_sync(&guard, &sql, 0)
     });
 
     let result = if let Some(rx) = abort_rx {
         tokio::select! {
             r = handle => r.map_err(|e| format!("线程错误: {e}"))?,
-            _ = rx => Err("查询已取消".to_string()),
+            _ = rx => Err("已停止等待 DuckDB 查询；原生执行仍可能继续，写入结果需核查，勿自动重试".to_string()),
         }
     } else {
         handle.await.map_err(|e| format!("线程错误: {e}"))?
     };
 
-    if let Some(ref t) = token { crate::commands::query::abort_unregister(t); }
     result
 }
 
@@ -1796,24 +1925,34 @@ pub struct DuckDiffResult {
 
 /// DD7.4: 对比两个 DuckDB 库的 schema（表/列差异）。
 /// left 连接内 ATTACH right 库文件（只读），用 duckdb_tables/columns 对比，完成后 DETACH。
+fn duck_diff_file_path(config: &ConnConfig) -> Result<&str, String> {
+    if config.conn_type != crate::models::ConnType::Duckdb { return Err("仅支持 DuckDB 文件连接".into()); }
+    config.file_path.as_deref().filter(|p| !p.is_empty() && *p != ":memory:")
+        .ok_or_else(|| "对比必须使用 DuckDB 文件库，不支持内存库".into())
+}
+
+fn duck_diff_table_identity(schema: &str, table: &str) -> String {
+    format!("\"{}\".\"{}\"", schema.replace('"', "\"\""), table.replace('"', "\"\""))
+}
+
 #[tauri::command]
 pub async fn duckdb_db_diff(
     left_id: String,
     right_id: String,
     storage: State<'_, StorageState>,
-    pool: State<'_, DuckPool>,
+    _pool: State<'_, DuckPool>,
     registry: State<'_, DriverRegistry>,
 ) -> Result<DuckDiffResult, String> {
     use std::collections::BTreeMap;
 
-    let left_cfg = load_conn_config(&left_id, &storage)?;
+    let mut left_cfg = load_conn_config(&left_id, &storage)?;
     let right_cfg = load_conn_config(&right_id, &storage)?;
-    let right_path = right_cfg.host.clone().unwrap_or_default();
-    if right_path.is_empty() || right_path == ":memory:" {
-        return Err("对比目标必须是 DuckDB 文件库（不支持内存库）".to_string());
-    }
+    duck_diff_file_path(&left_cfg)?;
+    let right_path = duck_diff_file_path(&right_cfg)?.to_string();
+    left_cfg.read_only = Some(true);
     let lib_path = get_duck_lib_path(&registry).await?;
-    let conn = get_or_open(&left_id, &left_cfg, &pool, &lib_path).await?;
+    let isolated: DuckPool = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let conn = get_or_open(&left_id, &left_cfg, &isolated, &lib_path).await?;
 
     let r_esc = right_path.replace('\'', "''");
     // 在一个阻塞会话内完成 ATTACH → 查询 → DETACH
@@ -1824,19 +1963,23 @@ pub async fn duckdb_db_diff(
             .map_err(|e| format!("ATTACH 目标库失败: {e}"))?;
 
         let q = |sql: &str| run_query_sync(&guard, sql, 100_000);
-        let lt = q("SELECT table_name FROM duckdb_tables() WHERE database_name = current_database() ORDER BY table_name");
-        let rt = q("SELECT table_name FROM duckdb_tables() WHERE database_name = '__dbdiff_r' ORDER BY table_name");
-        let lc = q("SELECT table_name, column_name, data_type FROM duckdb_columns() WHERE database_name = current_database()");
-        let rc = q("SELECT table_name, column_name, data_type FROM duckdb_columns() WHERE database_name = '__dbdiff_r'");
+        run_query_sync(&guard, "BEGIN TRANSACTION", 0)?;
+        let lt = q("SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = current_database() ORDER BY schema_name,table_name");
+        let rt = q("SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = '__dbdiff_r' ORDER BY schema_name,table_name");
+        let lc = q("SELECT schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE database_name = current_database()");
+        let rc = q("SELECT schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE database_name = '__dbdiff_r'");
+        run_query_sync(&guard, "ROLLBACK", 0)?;
 
         let _ = run_query_sync(&guard, "DETACH __dbdiff_r", 0);  // 尽力 DETACH
 
-        Ok((lt?, rt?, lc?, rc?))
+        let values = (lt?, rt?, lc?, rc?);
+        if [&values.0, &values.1, &values.2, &values.3].iter().any(|r| r.truncated || r.rows.len() >= 100_000) { return Err("对比元数据达到读取上限，已拒绝给出完整结果".into()); }
+        Ok(values)
     }).await.map_err(|e| format!("线程错误: {e}"))??;
 
     // 表集合
     let to_set = |r: &QueryResult| -> Vec<String> {
-        r.rows.iter().filter_map(|row| row.first().and_then(|c| c.clone())).collect()
+        r.rows.iter().filter_map(|row| Some(duck_diff_table_identity(row.first()?.as_deref()?, row.get(1)?.as_deref()?))).collect()
     };
     let lt: Vec<String> = to_set(&l_tables);
     let rt: Vec<String> = to_set(&r_tables);
@@ -1863,9 +2006,9 @@ pub async fn duckdb_db_diff(
     let col_map = |r: &QueryResult| -> BTreeMap<(String, String), String> {
         let mut m = BTreeMap::new();
         for row in &r.rows {
-            let t = row.first().and_then(|c| c.clone()).unwrap_or_default();
-            let c = row.get(1).and_then(|c| c.clone()).unwrap_or_default();
-            let ty = row.get(2).and_then(|c| c.clone()).unwrap_or_default();
+            let t = duck_diff_table_identity(row.first().and_then(|c| c.as_deref()).unwrap_or_default(), row.get(1).and_then(|c| c.as_deref()).unwrap_or_default());
+            let c = row.get(2).and_then(|c| c.clone()).unwrap_or_default();
+            let ty = row.get(3).and_then(|c| c.clone()).unwrap_or_default();
             m.insert((t, c), ty);
         }
         m
@@ -1901,7 +2044,7 @@ pub async fn duckdb_db_diff(
     let only_l = tables.iter().filter(|t| t.status == "only_left").count();
     let only_r = tables.iter().filter(|t| t.status == "only_right").count();
     let summary = format!(
-        "表：左独有 {only_l}，右独有 {only_r}，共有 {}；共有表中列差异 {} 处",
+        "仅表名及列名/类型摘要：左独有 {only_l}，右独有 {only_r}，共有 {}；共有表字段摘要差异 {} 处。未比较列顺序、默认值、约束、索引、视图或数据，不代表结构完整一致",
         common.len(), columns.len()
     );
 
@@ -1915,4 +2058,311 @@ fn load_conn_config(id: &str, storage: &StorageState) -> Result<ConnConfig, Stri
     let list = guard.load()?;
     list.into_iter().find(|c| c.id == *id)
         .ok_or_else(|| format!("连接 {id} 不存在"))
+}
+
+#[cfg(test)]
+mod memory_tests {
+    #[test]
+    fn alter_batch_rejects_transaction_control_and_keeps_quoted_semicolons() {
+        assert!(validate_alter_batch(&[]).is_err());
+        assert!(validate_alter_batch(&["ALTER TABLE t ADD COLUMN v INTEGER; COMMIT".into()]).is_err());
+        assert!(validate_alter_batch(&["BEGIN".into()]).is_err());
+        assert!(validate_alter_batch(&["DROP TABLE t".into()]).is_err());
+        assert!(validate_alter_batch(&[r#"ALTER TABLE "t;name" ADD COLUMN v VARCHAR DEFAULT 'a;b'"#.into()]).is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires verified local DBTERM_TEST_DUCKDB_LIBRARY"]
+    async fn real_duckdb_alter_batch_rollback_preserves_original_definition() {
+        use super::*;
+        let library = std::env::var("DBTERM_TEST_DUCKDB_LIBRARY").unwrap();
+        let pool: DuckPool = Arc::new(Mutex::new(HashMap::new()));
+        let mut config = connection_config(); config.file_path = Some(":memory:".into());
+        let handle = get_or_open_pub("alter-batch", &config, &pool, &library).await.unwrap();
+        let run = |sql: &str| execute_retained(Arc::clone(&handle), sql.to_owned(), None);
+        run("CREATE TABLE old_loop(v VARCHAR DEFAULT 'kept'); INSERT INTO old_loop VALUES(NULL)").await.unwrap();
+        run("ALTER TABLE old_loop RENAME COLUMN v TO renamed").await.unwrap();
+        assert!(run("ALTER TABLE old_loop ALTER COLUMN renamed SET NOT NULL").await.is_err());
+        assert_eq!(run("SELECT column_name FROM information_schema.columns WHERE table_name='old_loop'").await.unwrap().rows[0][0].as_deref(), Some("renamed"), "old autocommit loop retains partial rename");
+        run("CREATE TABLE atomic_batch(v VARCHAR DEFAULT 'kept'); INSERT INTO atomic_batch VALUES(NULL)").await.unwrap();
+        {
+            let guard = handle.lock().await;
+            let error = run_isolated_alter_sync(&guard, &["ALTER TABLE atomic_batch RENAME COLUMN v TO renamed".into(), "ALTER TABLE atomic_batch ALTER COLUMN renamed SET NOT NULL".into()]).unwrap_err();
+            assert!(error.contains("本批次已回滚"));
+        }
+        let definition = run("SELECT column_name,is_nullable,column_default FROM information_schema.columns WHERE table_name='atomic_batch'").await.unwrap();
+        assert_eq!(definition.rows[0][0].as_deref(), Some("v"));
+        assert_eq!(definition.rows[0][1].as_deref(), Some("YES"));
+        assert!(definition.rows[0][2].as_deref().unwrap().contains("kept"));
+        run("UPDATE atomic_batch SET v='existing'").await.unwrap();
+        {
+            let guard = handle.lock().await;
+            run_isolated_alter_sync(&guard, &["ALTER TABLE atomic_batch RENAME COLUMN v TO renamed".into(), "ALTER TABLE atomic_batch ALTER COLUMN renamed SET NOT NULL".into(), "ALTER TABLE atomic_batch ALTER COLUMN renamed SET DEFAULT 'next'".into()]).unwrap();
+            assert!(validate_alter_batch(&["ALTER TABLE atomic_batch ADD COLUMN forbidden INT; COMMIT".into()]).is_err());
+        }
+        run("INSERT INTO atomic_batch DEFAULT VALUES").await.unwrap();
+        let rows = run("SELECT renamed FROM atomic_batch ORDER BY renamed").await.unwrap().rows;
+        assert_eq!(rows, vec![vec![Some("existing".into())], vec![Some("next".into())]]);
+        run("CREATE TABLE pending(v INTEGER); BEGIN; INSERT INTO pending VALUES(7)").await.unwrap();
+        {
+            let guard = handle.lock().await;
+            run_isolated_alter_sync(&guard, &["ALTER TABLE atomic_batch ADD COLUMN extra INTEGER".into()]).unwrap();
+        }
+        run("ROLLBACK").await.unwrap();
+        assert_eq!(run("SELECT count(*) FROM pending").await.unwrap().rows[0][0].as_deref(), Some("0"), "wizard must not commit the other session's pending data");
+        assert_eq!(run("SELECT count(*) FROM information_schema.columns WHERE table_name='atomic_batch' AND column_name='extra'").await.unwrap().rows[0][0].as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn selected_duck_catalog_requires_exact_existing_name_and_safe_quoting() {
+        let names = vec!["a\"b; SELECT 1".to_string(), "main".into()];
+        assert_eq!(super::selected_catalog_sql("a\"b; SELECT 1", &names).unwrap(), "USE \"a\"\"b; SELECT 1\"");
+        assert!(super::selected_catalog_sql("missing", &names).is_err());
+        assert!(super::selected_catalog_sql("MAIN", &names).is_err());
+        assert!(super::selected_catalog_sql("bad\nname", &names).is_err());
+    }
+    use super::*;
+
+    #[test]
+    fn duck_diff_uses_file_path_and_distinguishes_schema_identity() {
+        let config: ConnConfig = serde_json::from_value(serde_json::json!({"id":"diff","name":"diff","type":"duckdb","host":"wrong-file","filePath":"/tmp/right.duckdb","useSsl":false,"createdAt":0,"updatedAt":0})).unwrap();
+        assert_eq!(super::duck_diff_file_path(&config).unwrap(), "/tmp/right.duckdb");
+        assert_ne!(super::duck_diff_table_identity("a", "same"), super::duck_diff_table_identity("b", "same"));
+        assert!(super::duck_diff_table_identity("schema.with.dot", "table").contains("\"schema.with.dot\""));
+    }
+
+    #[test]
+    fn decoded_cells_are_charged_before_allocation() {
+        let mut budget = DuckDecodeBudget { max_bytes: 40, ..DuckDecodeBudget::default() };
+        budget.start_row().unwrap();
+        assert!(budget.cell(100_000_000).is_err());
+        assert!(duck_blob_display_len(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn blob_display_encodes_in_one_exact_buffer() {
+        assert_eq!(encode_blob_display(&[]).unwrap(), "0x");
+        assert_eq!(encode_blob_display(&[0, 0xab, 0xff]).unwrap(), "0x00abff");
+    }
+
+    #[test]
+    fn utf8_preflight_matches_lossy_output_without_allocating_a_copy() {
+        for bytes in [b"plain".as_slice(), "中文".as_bytes(), &[0xff, 0xff, b'a'], &[0xe4, 0xb8]] {
+            assert_eq!(lossy_utf8_len(bytes).unwrap(), String::from_utf8_lossy(bytes).len());
+        }
+    }
+
+    #[test]
+    fn native_allocations_are_freed_when_preflight_rejects_a_cell() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static FREED: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn free_mock(_: *mut c_void) { FREED.fetch_add(1, Ordering::SeqCst); }
+        let before = FREED.load(Ordering::SeqCst);
+        let result = (|| -> Result<(), String> {
+            let _allocation = DuckAllocation { pointer: std::ptr::dangling_mut::<u8>() as *mut c_void, free: free_mock };
+            DuckDecodeBudget::default().cell(usize::MAX)?;
+            Ok(())
+        })();
+        assert!(result.is_err());
+        assert_eq!(FREED.load(Ordering::SeqCst), before + 1);
+    }
+
+    fn connection_config() -> ConnConfig {
+        serde_json::from_value(serde_json::json!({
+            "id":"same-id", "name":"local", "type":"duckdb", "filePath":"/tmp/a.duckdb",
+            "useSsl":false, "createdAt":0, "updatedAt":0
+        })).unwrap()
+    }
+
+    #[test]
+    fn duck_cache_identity_includes_file_read_only_extra_and_driver() {
+        let config = connection_config();
+        let original = duck_connection_identity(&config, "/tmp/duck.dylib").unwrap();
+        for field in ["file", "readonly", "extra", "driver"] {
+            let mut changed = config.clone();
+            let mut driver = "/tmp/duck.dylib";
+            match field {
+                "file" => changed.file_path = Some("/tmp/b.duckdb".into()),
+                "readonly" => changed.read_only = Some(true),
+                "extra" => changed.extra_json = Some(r#"{"duckMemoryLimit":"128MB"}"#.into()),
+                _ => driver = "/tmp/new-driver.dylib",
+            }
+            assert_ne!(original, duck_connection_identity(&changed, driver).unwrap(), "{field}");
+        }
+        assert_eq!(original, duck_connection_identity(&config, "/tmp/duck.dylib").unwrap());
+    }
+
+    #[test]
+    fn duck_cache_refuses_replacement_until_retained_handle_is_released() {
+        let cached = Arc::new(());
+        let transaction = Arc::clone(&cached);
+        assert!(ensure_cached_handle_idle(&cached).unwrap_err().contains("事务"));
+        drop(transaction);
+        assert!(ensure_cached_handle_idle(&cached).is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires verified local DBTERM_TEST_DUCKDB_LIBRARY"]
+    async fn real_duckdb_preserves_empty_blob_and_null_as_distinct_values() {
+        let library = std::env::var("DBTERM_TEST_DUCKDB_LIBRARY").expect("local DuckDB library required");
+        let pool: DuckPool = Arc::new(Mutex::new(HashMap::new()));
+        let mut config = connection_config();
+        config.file_path = Some(":memory:".into());
+        let connection = get_or_open_pub("blob-fidelity", &config, &pool, &library).await.unwrap();
+        let result = execute_retained(connection, "SELECT ''::BLOB AS empty_blob, NULL::BLOB AS null_blob, from_hex('00abff') AS binary_blob".into(), None).await.unwrap();
+        assert_eq!(result.rows, vec![vec![Some("0x".into()), None, Some("0x00abff".into())]]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires verified local DBTERM_TEST_DUCKDB_LIBRARY"]
+    async fn real_duckdb_vector_scalar_parity_and_cross_chunk_validity() {
+        let library = std::env::var("DBTERM_TEST_DUCKDB_LIBRARY").expect("local DuckDB library required");
+        let pool: DuckPool = Arc::new(Mutex::new(HashMap::new()));
+        let mut config = connection_config();
+        config.file_path = Some(":memory:".into());
+        let connection = get_or_open_pub("scalar-parity", &config, &pool, &library).await.unwrap();
+        let expressions = [
+            "true", "(-128)::TINYINT", "(-32768)::SMALLINT", "(-2147483648)::INTEGER",
+            "(-9223372036854775808)::BIGINT", "255::UTINYINT", "65535::USMALLINT",
+            "4294967295::UINTEGER", "18446744073709551615::UBIGINT", "1.25::FLOAT", "1.25::DOUBLE",
+            "TIMESTAMP '2026-11-14 12:34:56.123456'", "DATE '1970-01-01'", "TIME '12:34:56.123456'",
+            "INTERVAL '2 months 3 days 4 microseconds'", "170141183460469231731687303715884105727::HUGEINT",
+            "340282366920938463463374607431768211455::UHUGEINT",
+            "(-12.34)::DECIMAL(4,2)", "1234567.89::DECIMAL(9,2)", "1234567890123456.78::DECIMAL(18,2)",
+            "(-123456789012345678901234567890.12345678)::DECIMAL(38,8)",
+            "TIMESTAMP_S '2026-11-14 12:34:56'", "TIMESTAMP_MS '2026-11-14 12:34:56.123'",
+            "TIMESTAMP_NS '2026-11-14 12:34:56.123456789'",
+            "UUID '00112233-4455-6677-8899-aabbccddeeff'",
+            "'green'::ENUM('red','green')", "[1,NULL,3]", "[1,2]::INTEGER[2]",
+            "{'number':42, 'text':'中文'}", "DATE 'infinity'", "TIMESTAMP '-infinity'",
+            "'NaN'::DOUBLE", "'Infinity'::FLOAT",
+            "TIME WITH TIME ZONE '12:34:56+02'",
+            "TIMESTAMPTZ '2026-11-14 12:34:56+02'",
+            "MAP(['first','second'],[1,NULL])", "union_value(number := 42)", "'101001'::BIT",
+            "[('a' || chr(0) || '中文')]",
+        ];
+        for expression in expressions {
+            let sql = format!("SELECT v, CAST(v AS VARCHAR) FROM (SELECT {expression} AS v)");
+            let result = execute_retained(Arc::clone(&connection), sql, None).await.unwrap_or_else(|e| panic!("{expression}: {e}"));
+            assert_eq!(result.rows[0][0], result.rows[0][1], "{expression}");
+        }
+        let result = execute_retained(Arc::clone(&connection), "SELECT i, CASE WHEN i % 3 = 0 THEN NULL ELSE repeat('中', 10) || chr(0) || i::VARCHAR END FROM range(4105) t(i) ORDER BY i".into(), None).await.unwrap();
+        assert_eq!(result.rows.len(), 4105);
+        for (i, row) in result.rows.iter().enumerate() {
+            assert_eq!(row[0], Some(i.to_string()));
+            assert_eq!(row[1], if i % 3 == 0 { None } else { Some(format!("{}\0{i}", "中".repeat(10))) });
+        }
+        let error = execute_retained(Arc::clone(&connection), "SELECT i FROM range(100001) t(i)".into(), None).await.unwrap_err();
+        assert!(error.contains("未返回部分结果"));
+        assert_eq!(execute_retained(connection, "SELECT 42".into(), None).await.unwrap().rows[0][0].as_deref(), Some("42"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires verified local DBTERM_TEST_DUCKDB_LIBRARY"]
+    async fn real_duckdb_nested_formatting_preserves_transaction_and_reports_cost() {
+        let library = std::env::var("DBTERM_TEST_DUCKDB_LIBRARY").expect("local DuckDB library required");
+        let pool: DuckPool = Arc::new(Mutex::new(HashMap::new()));
+        let mut config = connection_config();
+        config.file_path = Some(":memory:".into());
+        let connection = get_or_open_pub("nested-transaction", &config, &pool, &library).await.unwrap();
+        execute_retained(Arc::clone(&connection), "CREATE TABLE marker(v INTEGER); INSERT INTO marker VALUES (1); BEGIN; INSERT INTO marker VALUES (2)".into(), None).await.unwrap();
+        let start = Instant::now();
+        let result = execute_retained(Arc::clone(&connection), "SELECT i, [i,NULL], {'v':i}, TIMESTAMPTZ '2026-11-14 12:34:56+02' FROM range(2049) t(i)".into(), None).await.unwrap();
+        eprintln!("DBTERM_NESTED_2049_ROWS_MS={}", start.elapsed().as_millis());
+        assert_eq!(result.rows.len(), 2049);
+        assert_eq!(result.rows[2048][1].as_deref(), Some("[2048, NULL]"));
+        let complex = execute_retained(Arc::clone(&connection), "SELECT CASE WHEN i % 3 = 0 THEN NULL ELSE [i,NULL] END AS v, CAST(CASE WHEN i % 3 = 0 THEN NULL ELSE [i,NULL] END AS VARCHAR) AS expected FROM range(4105) t(i) ORDER BY i".into(), None).await.unwrap();
+        assert_eq!(complex.rows.len(), 4105);
+        for row in complex.rows { assert_eq!(row[0], row[1]); }
+        let returned = execute_retained(Arc::clone(&connection), "INSERT INTO marker VALUES (7) RETURNING [v], {'v':v}".into(), None).await.unwrap();
+        assert_eq!(returned.rows[0][0].as_deref(), Some("[7]"));
+        execute_retained(Arc::clone(&connection), "ROLLBACK".into(), None).await.unwrap();
+        assert_eq!(execute_retained(Arc::clone(&connection), "SELECT count(*) FROM marker".into(), None).await.unwrap().rows[0][0].as_deref(), Some("1"));
+        execute_retained(Arc::clone(&connection), "BEGIN; INSERT INTO marker VALUES (3)".into(), None).await.unwrap();
+        execute_retained(Arc::clone(&connection), "SELECT [v] FROM marker ORDER BY v".into(), None).await.unwrap();
+        execute_retained(Arc::clone(&connection), "COMMIT".into(), None).await.unwrap();
+        assert_eq!(execute_retained(connection, "SELECT sum(v) FROM marker".into(), None).await.unwrap().rows[0][0].as_deref(), Some("4"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires verified local DBTERM_TEST_DUCKDB_LIBRARY"]
+    async fn real_duckdb_preserves_embedded_zero_text_and_recovers_after_budget_error() {
+        let library = std::env::var("DBTERM_TEST_DUCKDB_LIBRARY").expect("local DuckDB library required");
+        let pool: DuckPool = Arc::new(Mutex::new(HashMap::new()));
+        let mut config = connection_config();
+        config.file_path = Some(":memory:".into());
+        let connection = get_or_open_pub("text-fidelity", &config, &pool, &library).await.unwrap();
+        let result = execute_retained(Arc::clone(&connection), "SELECT 'a' || chr(0) || '中文' AS embedded_zero, '' AS empty_text, NULL::VARCHAR AS null_text".into(), None).await.unwrap();
+        assert_eq!(result.rows, vec![vec![Some("a\0中文".into()), Some("".into()), None]]);
+        let error = execute_retained(Arc::clone(&connection), "SELECT repeat('x', 1024 * 1024) FROM range(34)".into(), None).await.unwrap_err();
+        assert!(error.contains("未返回部分结果"));
+        let recovered = execute_retained(connection, "SELECT 42".into(), None).await.unwrap();
+        assert_eq!(recovered.rows[0][0].as_deref(), Some("42"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires verified local DBTERM_TEST_DUCKDB_LIBRARY"]
+    async fn real_duckdb_repeated_results_and_budget_failures_release_native_memory() {
+        let library = std::env::var("DBTERM_TEST_DUCKDB_LIBRARY").expect("local DuckDB library required");
+        let pool: DuckPool = Arc::new(Mutex::new(HashMap::new()));
+        let mut config = connection_config();
+        config.file_path = Some(":memory:".into());
+        let connection = get_or_open_pub("memory-stress", &config, &pool, &library).await.unwrap();
+        let mut retained_memory = Vec::new();
+        for cycle in 0..24 {
+            let result = execute_retained(Arc::clone(&connection), "SELECT i, repeat(md5(i::VARCHAR), 1024) AS payload FROM range(192) t(i)".into(), None).await.unwrap();
+            assert_eq!(result.rows.len(), 192);
+            assert_eq!(result.rows[191][1].as_ref().unwrap().len(), 32768);
+            drop(result);
+            let error = execute_retained(Arc::clone(&connection), "SELECT repeat('x', 1024 * 1024) FROM range(34)".into(), None).await.unwrap_err();
+            assert!(error.contains("未返回部分结果"));
+            let result = execute_retained(Arc::clone(&connection), "SELECT [i,NULL], {'payload':md5(i::VARCHAR)} FROM range(256) t(i)".into(), None).await.unwrap();
+            assert_eq!(result.rows.len(), 256);
+            drop(result);
+            let memory = execute_retained(Arc::clone(&connection), "SELECT coalesce(sum(memory_usage_bytes),0) FROM duckdb_memory()".into(), None).await.unwrap();
+            let bytes: u64 = memory.rows[0][0].as_ref().unwrap().parse().unwrap();
+            retained_memory.push(bytes);
+            #[cfg(target_os = "macos")]
+            {
+                let rss = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output().unwrap();
+                eprintln!("DBTERM_MEMORY_CYCLE={cycle} ENGINE_BYTES={bytes} RSS_KIB={}", String::from_utf8_lossy(&rss.stdout).trim());
+            }
+        }
+        // The workload creates no tables; destroyed results must not remain
+        // registered as growing engine buffers after each complete cycle.
+        assert!(retained_memory.iter().all(|bytes| *bytes == 0), "native buffers retained: {retained_memory:?}");
+        assert_eq!(execute_retained(connection, "SELECT 42".into(), None).await.unwrap().rows[0][0].as_deref(), Some("42"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires verified local DBTERM_TEST_DUCKDB_LIBRARY"]
+    async fn real_duckdb_cache_changes_files_without_redirecting_retained_transaction() {
+        let library = std::env::var("DBTERM_TEST_DUCKDB_LIBRARY").expect("local DuckDB library required");
+        let directory = std::env::temp_dir().join(format!("dbterm-duck-cache-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let pool: DuckPool = Arc::new(Mutex::new(HashMap::new()));
+        let dedicated: DuckPool = Arc::new(Mutex::new(HashMap::new()));
+        let mut a = connection_config();
+        a.file_path = Some(directory.join("a.duckdb").to_string_lossy().into_owned());
+        let mut b = a.clone();
+        b.file_path = Some(directory.join("b.duckdb").to_string_lossy().into_owned());
+        let ordinary = get_or_open_pub("same-id", &a, &pool, &library).await.unwrap();
+        execute_retained(Arc::clone(&ordinary), "CREATE TABLE marker(v VARCHAR); INSERT INTO marker VALUES ('A')".into(), None).await.unwrap();
+        let transaction = get_or_open_pub("same-id", &a, &dedicated, &library).await.unwrap();
+        execute_retained(Arc::clone(&transaction), "BEGIN".into(), None).await.unwrap();
+        execute_retained(Arc::clone(&transaction), "INSERT INTO marker VALUES ('tx')".into(), None).await.unwrap();
+        let visible = execute_retained(Arc::clone(&ordinary), "SELECT COUNT(*) FROM marker".into(), None).await.unwrap();
+        assert_eq!(visible.rows[0][0].as_deref(), Some("1"));
+        assert!(get_or_open_pub("same-id", &b, &pool, &library).await.err().unwrap().contains("事务"));
+        drop(ordinary);
+        let ordinary_b = get_or_open_pub("same-id", &b, &pool, &library).await.unwrap();
+        execute_retained(Arc::clone(&ordinary_b), "CREATE TABLE marker(v VARCHAR); INSERT INTO marker VALUES ('B')".into(), None).await.unwrap();
+        execute_retained(Arc::clone(&transaction), "COMMIT".into(), None).await.unwrap();
+        let retained = execute_retained(Arc::clone(&transaction), "SELECT COUNT(*) FROM marker".into(), None).await.unwrap();
+        let target = execute_retained(Arc::clone(&ordinary_b), "SELECT v FROM marker".into(), None).await.unwrap();
+        assert_eq!(retained.rows[0][0].as_deref(), Some("2"));
+        assert_eq!(target.rows[0][0].as_deref(), Some("B"));
+        drop(transaction); drop(ordinary_b); drop(dedicated); drop(pool);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

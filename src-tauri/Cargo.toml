@@ -4,7 +4,7 @@ version = "0.1.23"
 description = "DBTerm - SSH 和数据库管理工具"
 authors = ["DBTerm"]
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.88"
 
 [lib]
 name = "app_lib"
@@ -28,7 +28,7 @@ tauri-build = { version = "2", features = [] }
 tauri          = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-log = "2"
 serde          = { version = "1", features = ["derive"] }
-serde_json     = "1"
+serde_json     = { version = "1", features = ["raw_value"] }
 log            = "0.4"
 tracing        = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
@@ -45,11 +45,13 @@ sqlx = { version = "0.8", default-features = false, features = [
     "json",
 ] }
 chrono = { version = "0.4", features = ["serde"] }
+# Reuse SQLx's exact SQLite binding for sqlite3_complete (trigger-safe import splitting).
+libsqlite3-sys = { version = "=0.39.1", default-features = false }
+same-file = "1.0"
 # tokio-rustls-comp：TLS(rediss://) 支持；tls-rustls-insecure：允许"加密不验证"模式（require）
 redis            = { version = "0.26", features = ["tokio-rustls-comp", "tls-rustls-insecure"] }
 uuid     = { version = "1", features = ["v4"] }
-russh        = { version = "0.46", features = [] }
-russh-keys   = "0.46"
+russh        = { version = "=0.63.1", features = ["async-trait"] }
 async-trait  = "0.1"
 base64       = "0.22"
 tokio-socks  = "0.5"
@@ -57,23 +59,27 @@ portable-pty = "0.8"
 tauri-plugin-dialog = "2"
 russh-sftp = "2.3.0"
 encoding_rs = "0.8.35"
-calamine = "0.26"
+calamine = "0.38"
+quick-xml = "0.41"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 futures = "0.3"
+rand = "0.9"
 mongodb = "3"
 bson = { version = "2", features = ["chrono-0_4"] }
 urlencoding = "2"
 libloading = "0.8"
 sha2 = "0.10"
+aes-gcm = "0.11"
+argon2 = "0.6"
 # MS0.0: SQL Server 驱动（纯 Rust，无需外部驱动文件）
 # tds73：启用 date/time/datetime2/datetimeoffset 等新类型解析（SQL Server 2008+）
 # rust_decimal：正确读取 decimal/numeric/money 列（否则这些列会读为 NULL）
-tiberius = { version = "0.12", default-features = false, features = ["tokio", "chrono", "rustls", "rust_decimal", "tds73"] }
+tiberius = { version = "0.13", default-features = false, features = ["tokio", "chrono", "rustls", "rust_decimal", "tds73"] }
 rust_decimal = "1"
 tokio-util = { version = "0.7", features = ["compat"] }
 notify = "6"   # SQLite 文件外部变更监控（db/-wal mtime → Tauri 事件）
 hex = "0.4"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.5.1", default-features = false, features = ["deflate"] }
 csv = "1"
 sqlparser = { version = "0.53", default-features = false }
 # CH0: ClickHouse 原生 TCP（9000）。启用 compression(LZ4 按块压缩，大结果集更省带宽)，
@@ -88,6 +94,7 @@ webview2-com = "0.38"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",   # DPAPI CryptProtectData/CryptUnprotectData
+    "Win32_Storage_FileSystem",      # durable replace-existing rename for atomic file publication
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -96,3 +103,8 @@ objc2 = "0.6"
 
 [dev-dependencies]
 serial_test = "3"
+
+# Exact upstream driver plus private session-authenticated CancelRequest support.
+[patch.crates-io]
+sqlx-postgres = { path = "vendor/sqlx-postgres" }
+sqlx-sqlite = { path = "vendor/sqlx-sqlite" }

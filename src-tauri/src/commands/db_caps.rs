@@ -28,10 +28,29 @@ struct DbConnCfg {
     #[serde(rename = "sshKeyPath",  default)] ssh_key_path: String,
 }
 impl DbConnCfg {
-    fn from_config(c: &ConnConfig) -> Self {
-        c.extra_json.as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default()
+    fn from_config(c: &ConnConfig) -> Result<Self, String> {
+        match c.extra_json.as_deref().filter(|raw| !raw.trim().is_empty()) {
+            Some(raw) => serde_json::from_str(raw)
+                .map_err(|_| "连接扩展配置损坏，已拒绝连接".to_string()),
+            None => Ok(Self::default()),
+        }
+    }
+    fn tunnel_config_with(
+        &self, conn_id: &str, lookup: impl FnOnce(&str) -> Result<Option<String>, String>,
+    ) -> Result<crate::db_tunnel::DbTunnelCfg, String> {
+        let password = if matches!(self.ssh_auth_type.as_str(), "agent" | "none") {
+            String::new()
+        } else if !self.ssh_password.is_empty() {
+            self.ssh_password.clone()
+        } else {
+            lookup(&format!("{conn_id}::ssh-tunnel"))
+                .map_err(|_| "读取数据库 SSH 隧道凭据失败，已拒绝连接；请检查凭据存储后重试".to_string())?
+                .unwrap_or_default()
+        };
+        Ok(crate::db_tunnel::DbTunnelCfg {
+            host: self.ssh_host.clone(), port: self.ssh_port, user: self.ssh_user.clone(),
+            auth_type: self.ssh_auth_type.clone(), password, key_path: self.ssh_key_path.clone(),
+        })
     }
     fn timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
@@ -130,6 +149,51 @@ fn version_ge(major: u32, minor: u32, patch: u32, req_maj: u32, req_min: u32, re
 mod tests {
     use super::*;
 
+    fn test_config(extra: &str) -> ConnConfig {
+        serde_json::from_value(serde_json::json!({
+            "id":"caps-fixture","name":"caps","type":"mysql",
+            "host":"127.0.0.1","port":1,"useSsl":false,"extraJson":extra,
+            "createdAt":0,"updatedAt":0
+        })).unwrap()
+    }
+
+    #[test]
+    fn malformed_tunnel_configuration_fails_before_direct_connection() {
+        let config = test_config(r#"{"sshTunnel":true,"sshPort":"bad"}"#);
+        assert!(DbConnCfg::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn tunnel_credentials_restore_persisted_secret_without_exposing_lookup_errors() {
+        let cfg: DbConnCfg = serde_json::from_str(r#"{"sshTunnel":true,"sshAuthType":"password","sshHost":"jump","sshUser":"user"}"#).unwrap();
+        let tunnel = cfg.tunnel_config_with("caps-fixture", |key| {
+            assert_eq!(key, "caps-fixture::ssh-tunnel");
+            Ok(Some("persisted-secret".into()))
+        }).unwrap();
+        assert_eq!(tunnel.password, "persisted-secret");
+        let error = cfg.tunnel_config_with("caps-fixture", |_| Err("private-store-error".into())).err().unwrap();
+        assert!(!error.contains("private-store-error"));
+    }
+
+    #[test]
+    fn agent_and_none_tunnels_do_not_require_password_store() {
+        for auth in ["agent", "none"] {
+            let cfg = DbConnCfg { ssh_auth_type: auth.into(), ..Default::default() };
+            let tunnel = cfg.tunnel_config_with("caps-fixture", |_| panic!("password store must not be read")).unwrap();
+            assert!(tunnel.password.is_empty());
+        }
+    }
+
+    #[test]
+    fn legacy_tunnel_password_and_key_passphrase_are_preserved() {
+        let old = DbConnCfg { ssh_password: "legacy".into(), ..Default::default() };
+        assert_eq!(old.tunnel_config_with("caps-fixture", |_| panic!("legacy must bypass lookup")).unwrap().password, "legacy");
+        let key = DbConnCfg { ssh_auth_type: "key".into(), ssh_key_path: "/tmp/fixture-key".into(), ..Default::default() };
+        let tunnel = key.tunnel_config_with("caps-fixture", |_| Ok(Some("key-passphrase".into()))).unwrap();
+        assert_eq!(tunnel.password, "key-passphrase");
+        assert_eq!(tunnel.key_path, "/tmp/fixture-key");
+    }
+
     #[test]
     fn test_parse_semver() {
         assert_eq!(parse_semver("10.11.4-MariaDB"), (10, 11, 4));
@@ -162,23 +226,20 @@ mod tests {
 // ── 各方言探测函数 ────────────────────────────────────────────────────────────
 
 async fn detect_mysql_caps(config: &ConnConfig, password: Option<&str>) -> Result<DbCapabilities, String> {
-    use sqlx::{ConnectOptions, mysql::{MySqlConnectOptions, MySqlSslMode}, Row};
+    use sqlx::{ConnectOptions, mysql::MySqlConnectOptions, Row};
     use crate::commands::query::MySqlPwdExt;
-    use crate::db_tunnel::{DbTunnel, DbTunnelCfg};
+    use crate::db_tunnel::DbTunnel;
     use crate::tester::expand_home;
 
-    let cfg  = DbConnCfg::from_config(config);
+    let cfg  = DbConnCfg::from_config(config)?;
+    let tls_mode = crate::commands::query::mysql_tls_mode(config, &cfg.ssl_mode)?;
     let user = config.username.as_deref().unwrap_or("root");
     let db   = config.database.as_deref().unwrap_or("");
     let pwd  = password.unwrap_or("");
 
     let tunnel: Option<std::sync::Arc<DbTunnel>>;
     let (h, p) = if cfg.ssh_tunnel {
-        let tcfg = DbTunnelCfg {
-            host: cfg.ssh_host.clone(), port: cfg.ssh_port,
-            user: cfg.ssh_user.clone(), auth_type: cfg.ssh_auth_type.clone(),
-            password: cfg.ssh_password.clone(), key_path: cfg.ssh_key_path.clone(),
-        };
+        let tcfg = cfg.tunnel_config_with(&config.id, crate::keychain::get_password)?;
         let t = DbTunnel::open_shared(&config.id, &tcfg,
             config.host.as_deref().unwrap_or("127.0.0.1"),
             config.port.unwrap_or(3306)).await?;
@@ -192,12 +253,7 @@ async fn detect_mysql_caps(config: &ConnConfig, password: Option<&str>) -> Resul
 
     let mut opts = MySqlConnectOptions::new().host(&h).port(p).username(user).password_opt(pwd);
     if !db.is_empty() { opts = opts.database(db); }
-    opts = opts.ssl_mode(match cfg.ssl_mode.as_str() {
-        "require"     => MySqlSslMode::Required,
-        "verify-ca"   => MySqlSslMode::VerifyCa,
-        "verify-full" => MySqlSslMode::VerifyIdentity,
-        _             => MySqlSslMode::Disabled,
-    });
+    opts = opts.ssl_mode(tls_mode);
     if !cfg.ssl_ca.is_empty()   { opts = opts.ssl_ca(expand_home(&cfg.ssl_ca)); }
     if !cfg.ssl_cert.is_empty() { opts = opts.ssl_client_cert(expand_home(&cfg.ssl_cert)); }
     if !cfg.ssl_key.is_empty()  { opts = opts.ssl_client_key(expand_home(&cfg.ssl_key)); }
@@ -277,22 +333,19 @@ async fn detect_mysql_caps(config: &ConnConfig, password: Option<&str>) -> Resul
 }
 
 async fn detect_pg_caps(config: &ConnConfig, password: Option<&str>) -> Result<DbCapabilities, String> {
-    use sqlx::{ConnectOptions, postgres::{PgConnectOptions, PgSslMode}};
-    use crate::db_tunnel::{DbTunnel, DbTunnelCfg};
+    use sqlx::{ConnectOptions, postgres::PgConnectOptions};
+    use crate::db_tunnel::DbTunnel;
     use crate::tester::expand_home;
 
-    let cfg  = DbConnCfg::from_config(config);
+    let cfg  = DbConnCfg::from_config(config)?;
+    let tls_mode = crate::commands::query::pg_tls_mode(config, &cfg.ssl_mode)?;
     let user = config.username.as_deref().unwrap_or("postgres");
     let db   = config.database.as_deref().unwrap_or("postgres");
     let pwd  = password.unwrap_or("");
 
     let tunnel: Option<std::sync::Arc<DbTunnel>>;
     let (h, p) = if cfg.ssh_tunnel {
-        let tcfg = DbTunnelCfg {
-            host: cfg.ssh_host.clone(), port: cfg.ssh_port,
-            user: cfg.ssh_user.clone(), auth_type: cfg.ssh_auth_type.clone(),
-            password: cfg.ssh_password.clone(), key_path: cfg.ssh_key_path.clone(),
-        };
+        let tcfg = cfg.tunnel_config_with(&config.id, crate::keychain::get_password)?;
         let t = DbTunnel::open_shared(&config.id, &tcfg,
             config.host.as_deref().unwrap_or("127.0.0.1"),
             config.port.unwrap_or(5432)).await?;
@@ -307,12 +360,7 @@ async fn detect_pg_caps(config: &ConnConfig, password: Option<&str>) -> Result<D
     // 不在启动参数里设 application_name（兼容 PG 8.x，9.0 之前会拒绝该参数）
     let mut opts = PgConnectOptions::new()
         .host(&h).port(p).username(user).password(pwd).database(db);
-    opts = opts.ssl_mode(match cfg.ssl_mode.as_str() {
-        "require"     => PgSslMode::Require,
-        "verify-ca"   => PgSslMode::VerifyCa,
-        "verify-full" => PgSslMode::VerifyFull,
-        _             => PgSslMode::Disable,
-    });
+    opts = opts.ssl_mode(tls_mode);
     if !cfg.ssl_ca.is_empty()   { opts = opts.ssl_root_cert(expand_home(&cfg.ssl_ca)); }
     if !cfg.ssl_cert.is_empty() { opts = opts.ssl_client_cert(expand_home(&cfg.ssl_cert)); }
     if !cfg.ssl_key.is_empty()  { opts = opts.ssl_client_key(expand_home(&cfg.ssl_key)); }

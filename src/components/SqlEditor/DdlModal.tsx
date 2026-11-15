@@ -8,6 +8,7 @@ import { formatBytes } from '../../utils/format'
 interface Props {
   schema: string
   table: string
+  ssSchema?: string
   ddl: string
   loading: boolean
   error: string
@@ -17,7 +18,7 @@ interface Props {
   onClose: () => void
 }
 
-export default function DdlModal({ schema, table, ddl, loading, error, connType, connectionId, onClose }: Props) {
+export default function DdlModal({ schema, table, ssSchema, ddl, loading, error, connType, connectionId, onClose }: Props) {
   const [size, setSize] = useState<string>('')
 
   useEffect(() => {
@@ -27,21 +28,23 @@ export default function DdlModal({ schema, table, ddl, loading, error, connType,
   }, [onClose])
 
   useEffect(() => {
+    setSize('')
     if (!connectionId) return
     let alive = true
     ;(async () => {
       try {
         const { invoke } = await import('@tauri-apps/api/core')
         const list = await invoke<{ name: string; rowCount: number; dataLength: number; indexLength: number }[]>(
-          'list_tables_meta', { id: connectionId, schema })
-        const m = list.find(t => t.name === table)
+          'list_tables_meta', { id: connectionId, schema, ssSchema })
+        const matches = list.filter(t => t.name === table)
+        const m = matches.length === 1 ? matches[0] : undefined
         if (alive && m && (m.dataLength + m.indexLength) > 0) {
           setSize(`${formatBytes(m.dataLength + m.indexLength)} · ${m.rowCount.toLocaleString()} 行`)
         }
       } catch { /* 大小展示为可选信息，失败忽略 */ }
     })()
     return () => { alive = false }
-  }, [connectionId, schema, table])
+  }, [connectionId, schema, table, ssSchema])
 
   return createPortal(
     <div className="modal-overlay">
@@ -49,7 +52,7 @@ export default function DdlModal({ schema, table, ddl, loading, error, connType,
         <div className="modal-header">
           <span className="modal-title">
             <FileCode2 size={14} style={{ marginRight: 6, verticalAlign: -2 }} />
-            {schema ? `${schema}.` : ''}{table} — DDL
+            {schema ? `${schema}.` : ''}{ssSchema ? ssSchema + '.' : ''}{table} — DDL
             {size && (
               <span style={{ marginLeft: 10, fontSize: 11, color: 'var(--text-muted)', fontWeight: 'normal', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                 <HardDrive size={11} style={{ color: 'var(--accent)' }} />{size}

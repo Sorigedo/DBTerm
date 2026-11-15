@@ -1,0 +1,33 @@
+use super::*;
+use std::time::Duration;
+#[tokio::test]
+async fn queued_transaction_request_can_cancel_without_touching_active_transaction(){
+ use sqlx::Connection;
+ let state:TxState=Arc::new(AsyncMutex::new(HashMap::new()));let mut conn=sqlx::SqliteConnection::connect("sqlite::memory:").await.unwrap();sqlx::raw_sql("CREATE TABLE t(id INT);BEGIN;INSERT INTO t VALUES(1)").execute(&mut conn).await.unwrap();let now=Instant::now();state.lock().await.insert("queued-cancel".into(),Arc::new(AsyncMutex::new(ActiveTx{conn:TxConn::Sqlite(conn),started_at:now,last_used:now,read_only:false,_tunnel_guard:None})));
+ let gate=transaction_gate("queued-cancel");let held=gate.lock().await;let worker=state.clone();let token=uuid::Uuid::new_v4().simple().to_string();let worker_token=token.clone();let task=tokio::spawn(async move{execute_transaction("queued-cancel".into(),"INSERT INTO t VALUES(2)".into(),Some(worker_token),None,&worker,&OracleTxPool::new()).await});
+ let mut cancelled=false;for _ in 0..50{if super::super::query::cancel_abort_for(&token,"queued-cancel"){cancelled=true;break}tokio::time::sleep(Duration::from_millis(2)).await;}
+ if !cancelled{task.abort();drop(held);let _=task.await;panic!("queued request never registered cancellation before waiting for transaction gate")}
+ let result=tokio::time::timeout(Duration::from_secs(1),task).await.unwrap().unwrap();assert!(result.unwrap_err().contains("取消"));assert!(state.lock().await.contains_key("queued-cancel"));drop(held);
+ finish_transaction("queued-cancel",&state,&OracleTxPool::new(),true).await.unwrap();
+}
+#[tokio::test]
+#[ignore="requires disposable DBTERM_TEST_PG_PORT"]
+async fn postgres_running_cancel_invalidates_client_and_eventually_releases_server_locks(){
+ use sqlx::Connection;
+ let port:u16=std::env::var("DBTERM_TEST_PG_PORT").unwrap().parse().unwrap();let url=format!("postgres://postgres@127.0.0.1:{port}/postgres");let mut admin=sqlx::PgConnection::connect(&url).await.unwrap();let schema=format!("cancel_{}",uuid::Uuid::new_v4().simple());sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&mut admin).await.unwrap();sqlx::query(&format!("CREATE TABLE {schema}.t(id INT PRIMARY KEY,v TEXT);" )).execute(&mut admin).await.unwrap();sqlx::query(&format!("INSERT INTO {schema}.t VALUES(1,'original')")).execute(&mut admin).await.unwrap();
+ let mut conn=sqlx::PgConnection::connect(&url).await.unwrap();let pid:i32=sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut conn).await.unwrap();sqlx::query("BEGIN").execute(&mut conn).await.unwrap();sqlx::query(&format!("UPDATE {schema}.t SET v='pending' WHERE id=1")).execute(&mut conn).await.unwrap();let now=Instant::now();let state:TxState=Arc::new(AsyncMutex::new(HashMap::new()));state.lock().await.insert("running-cancel".into(),Arc::new(AsyncMutex::new(ActiveTx{conn:TxConn::Pg(conn),started_at:now,last_used:now,read_only:false,_tunnel_guard:None})));
+ let worker=state.clone();let token=uuid::Uuid::new_v4().simple().to_string();let wt=token.clone();let task=tokio::spawn(async move{execute_transaction("running-cancel".into(),"SELECT pg_sleep(0.5)".into(),Some(wt),None,&worker,&OracleTxPool::new()).await});
+ let mut started=false;for _ in 0..100{let active:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND query LIKE '%pg_sleep%' AND state='active')").bind(pid).fetch_one(&mut admin).await.unwrap();if active{started=true;break}tokio::time::sleep(Duration::from_millis(5)).await;}assert!(started);assert!(super::super::query::cancel_abort_for(&token,"running-cancel"));let result=tokio::time::timeout(Duration::from_secs(2),task).await.unwrap().unwrap();assert!(result.unwrap_err().contains("取消"));assert!(!state.lock().await.contains_key("running-cancel"));
+ sqlx::query("SET lock_timeout='2s'").execute(&mut admin).await.unwrap();let update=sqlx::query(&format!("UPDATE {schema}.t SET v='after' WHERE id=1 AND v='original'")).execute(&mut admin).await;let cleanup=sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&mut admin).await;assert_eq!(update.unwrap().rows_affected(),1);cleanup.unwrap();
+}
+
+#[tokio::test]
+#[ignore="requires disposable DBTERM_TEST_PG_PORT"]
+async fn postgres_authenticated_cancel_stops_long_query_and_releases_locks(){
+ use sqlx::Connection;
+ let port:u16=std::env::var("DBTERM_TEST_PG_PORT").unwrap().parse().unwrap();let url=format!("postgres://postgres@127.0.0.1:{port}/postgres");let mut admin=sqlx::PgConnection::connect(&url).await.unwrap();let schema=format!("cancel_{}",uuid::Uuid::new_v4().simple());sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&mut admin).await.unwrap();sqlx::query(&format!("CREATE TABLE {schema}.t(id INT PRIMARY KEY,v TEXT);" )).execute(&mut admin).await.unwrap();sqlx::query(&format!("INSERT INTO {schema}.t VALUES(1,'original')")).execute(&mut admin).await.unwrap();
+ let mut conn=sqlx::PgConnection::connect(&url).await.unwrap();let pid:i32=sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut conn).await.unwrap();sqlx::query("BEGIN").execute(&mut conn).await.unwrap();sqlx::query(&format!("UPDATE {schema}.t SET v='pending' WHERE id=1")).execute(&mut conn).await.unwrap();let now=Instant::now();let state:TxState=Arc::new(AsyncMutex::new(HashMap::new()));state.lock().await.insert("running-cancel".into(),Arc::new(AsyncMutex::new(ActiveTx{conn:TxConn::Pg(conn),started_at:now,last_used:now,read_only:false,_tunnel_guard:None})));
+ let worker=state.clone();let token=uuid::Uuid::new_v4().simple().to_string();let wt=token.clone();let task=tokio::spawn(async move{execute_transaction("running-cancel".into(),"SELECT pg_sleep(30)".into(),Some(wt),None,&worker,&OracleTxPool::new()).await});
+ let mut started=false;for _ in 0..100{let active:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND query LIKE '%pg_sleep%' AND state='active')").bind(pid).fetch_one(&mut admin).await.unwrap();if active{started=true;break}tokio::time::sleep(Duration::from_millis(5)).await;}assert!(started);assert!(super::super::query::cancel_abort_for(&token,"running-cancel"));let result=tokio::time::timeout(Duration::from_secs(2),task).await.unwrap().unwrap();assert!(result.unwrap_err().contains("取消"));assert!(!state.lock().await.contains_key("running-cancel"));
+ sqlx::query("SET lock_timeout='1s'").execute(&mut admin).await.unwrap();let update=sqlx::query(&format!("UPDATE {schema}.t SET v='after' WHERE id=1 AND v='original'")).execute(&mut admin).await;let cleanup=sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&mut admin).await;assert_eq!(update.unwrap().rows_affected(),1);cleanup.unwrap();
+}

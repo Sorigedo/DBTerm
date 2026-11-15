@@ -1,0 +1,1 @@
+PASS table DDL reads table/column extended-property identity, value and SQL_VARIANT type metadata.

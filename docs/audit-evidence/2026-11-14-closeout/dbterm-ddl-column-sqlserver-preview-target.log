@@ -1,0 +1,1 @@
+PASS actual AssetPanel creates distinct same-name schema tabs; actual grid SELECT/count/header, empty-result metadata, field/index/DDL properties and update/delete/draft-insert requests retain target. Synthetic IPC; Workspace rendering and native service execution are not exercised.

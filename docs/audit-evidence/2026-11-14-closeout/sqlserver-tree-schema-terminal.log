@@ -1,0 +1,3 @@
+Re-optimizing dependencies because vite config has changed
+Port 5173 is in use, trying another one...
+PASS actual xterm: baseline reproduces lost-release selection; recovery stops unpressed movement; pressed drag, release and blur behave correctly

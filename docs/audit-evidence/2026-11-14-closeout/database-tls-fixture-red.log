@@ -1,0 +1,115 @@
+warning: use of deprecated method `futures_channel::mpsc::UnboundedReceiver::<T>::try_next`: please use `try_recv` instead
+   --> vendor/sqlx-postgres/src/listener.rs:335:56
+    |
+335 |         if let Ok(Some(notification)) = self.buffer_rx.try_next() {
+    |                                                        ^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: variant `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/mod.rs:78:5
+   |
+70 | pub enum FrontendMessageFormat {
+   |          --------------------- variant in this enum
+...
+78 |     Flush = b'H',
+   |     ^^^^^
+   |
+   = note: `FrontendMessageFormat` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `Flush` is never constructed
+  --> vendor/sqlx-postgres/src/message/flush.rs:11:12
+   |
+11 | pub struct Flush;
+   |            ^^^^^
+
+warning: `sqlx-postgres` (lib) generated 3 warnings
+   Compiling app v0.1.23 (/Users/Nico/workSpace/claude/DBterm/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.37s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/app_lib-bccc94f7de71602a)
+
+running 62 tests
+test commands::db_diff::tests::mysql_comparison_decodes_numbers_dates_and_nulls_without_loss ... ok
+test commands::db_diff::tests::real_mysql_comparison_distinguishes_adjacent_floats ... ok
+test commands::db_diff::tests::real_mysql_comparison_distinguishes_empty_set_and_enum_members ... ok
+test commands::db_diff::tests::real_mysql_comparison_preserves_unicode_despite_connection_encoding ... ok
+test commands::db_diff::tests::real_mysql_comparison_snapshots_pagination_and_exact_values ... ok
+test commands::db_diff::tests::real_mysql_full_merge_counts_composite_keys_and_capped_samples ... ok
+test commands::db_diff::tests::real_mysql_keyset_keeps_adjacent_i64_u64_limits_across_pages ... ok
+test commands::db_export::archive_tests::mysql_sql_export_preserves_enum_and_set_internal_members ... ok
+test commands::db_export::archive_tests::mysql_sql_export_round_trips_typed_values ... ok
+test commands::db_export::archive_tests::mysql_tabular_exports_never_silently_turn_decode_errors_into_null ... ok
+test commands::db_export::archive_tests::mysql_xlsx_large_ids_and_decimals_are_text_with_exact_digits ... ok
+test commands::db_extra::batch_insert_atomicity_tests::mysql_rejects_nontransactional_target_and_rolls_back_later_chunk ... ok
+test commands::db_extra::batch_insert_atomicity_tests::pg_later_chunk_duplicate_rolls_back_first_chunk ... ok
+test commands::db_extra::copy_publication_atomicity_tests::real_mysql_copy_is_invisible_until_complete_and_preserves_raw_ddl ... ok
+test commands::db_extra::delete_atomicity_tests::mysql_later_fk_failure_restores_earlier_delete_and_null_matches ... ok
+test commands::db_extra::draft_insert::tests::mysql_variable_columns_defaults_and_later_chunk_rollback ... ok
+test commands::db_extra::draft_insert::tests::postgres_draft_text_parameters_cast_to_target_types ... ok
+test commands::db_extra::draft_insert::tests::real_mysql_insert_commit_disconnect_checks_complete_batch_and_unknown_receipt ... ok
+test commands::db_extra::migration_scalar_tests::mysql_stream_preserves_set_bitmasks_even_when_text_labels_collide ... ok
+test commands::db_extra::migration_scalar_tests::mysql_stream_zero_date_strict_failure_preserves_existing_target ... ok
+test commands::db_extra::migration_scalar_tests::postgres_failed_restore_reports_and_preserves_backup_when_target_cannot_be_dropped ... ok
+test commands::db_extra::migration_scalar_tests::postgres_restore_transaction_rolls_back_target_drop_if_backup_rename_fails ... ok
+test commands::db_extra::migration_verification_tests::real_mysql_migration_verification_detects_equal_count_different_content ... ok
+test commands::db_extra::mysql_ddl_fidelity_tests::real_mysql_setup_preserves_ddl_and_restores_existing_table_on_create_failure ... ok
+test commands::db_extra::optimistic_delete_tests::mysql_delete_baseline_is_exact_and_later_stale_row_rolls_back ... ok
+test commands::db_extra::pg_delete_fidelity_tests::pg_case_space_and_null_baseline_changes_refuse_delete ... ok
+test commands::db_extra::pg_delete_fidelity_tests::pg_composite_integer_key_deletes_selected_rows_only ... ok
+test commands::db_extra::pg_delete_fidelity_tests::pg_later_stale_row_rolls_back_prior_delete ... ok
+test commands::db_extra::pg_insert_fidelity_tests::pg_grid_insert_rejects_oversized_text_and_retains_domain_constraints ... ok
+test commands::db_extra::pg_insert_fidelity_tests::pg_grid_insert_typed_values_keep_text_and_roll_back_later_conversion ... ok
+test commands::db_extra::pg_insert_fidelity_tests::pg_type_planning_locks_target_until_transaction_finishes ... ok
+test commands::db_extra::publication_acceptance_tests::real_mysql_delete_commit_disconnect_checks_complete_batch_and_unknown_receipt ... ok
+test commands::db_extra::publication_acceptance_tests::real_mysql_publish_rejects_stage_charset_and_concurrent_target_ddl_changes ... ok
+test commands::db_extra::publication_disconnect_tests::real_mysql_publish_disconnect_preserves_complete_old_or_new_and_recovery_tables ... publication fault accepted: existing_target=false, rename_reached_server=false
+publication fault accepted: existing_target=false, rename_reached_server=true
+publication fault accepted: existing_target=true, rename_reached_server=false
+publication fault accepted: existing_target=true, rename_reached_server=true
+ok
+test commands::db_extra::schema_compare_safety_tests::mysql_backspace_default_requires_same_escape_mode_for_raw_alter ... ok
+test commands::db_extra::schema_compare_safety_tests::mysql_full_definition_capture_includes_hidden_generated_and_rejects_triggers ... ok
+test commands::db_extra::schema_compare_snapshot::tests::mysql_schema_snapshot_keeps_all_table_locks_detects_new_tables_and_refuses_partial_visibility ... ok
+test commands::db_extra::schema_compare_snapshot::tests::schema_snapshot_preserves_unicode_and_rejects_functional_index_mismatch ... ok
+test commands::db_extra::sql_file_reader::tests::mysql_execution_preserves_version_comments_delimiters_modes_and_stops_on_error ... ok
+test commands::db_tx::pg_tx_finish_tests::postgres_commit_and_recovered_savepoint_keep_successful_changes ... ok
+test commands::db_tx::pg_tx_finish_tests::postgres_deferred_failure_and_disconnect_never_return_success ... ok
+test commands::db_tx::pg_tx_finish_tests::postgres_failed_transaction_commit_is_never_reported_success ... ok
+test commands::db_tx::tx_cancel_tests::postgres_authenticated_cancel_stops_long_query_and_releases_locks ... ok
+test commands::db_tx::tx_cancel_tests::postgres_running_cancel_invalidates_client_and_eventually_releases_server_locks ... ok
+test commands::pg_admin::tls_tests::pg_admin_tls_policy_matches_query_connector ... 
+thread 'commands::pg_admin::tls_tests::pg_admin_tls_policy_matches_query_connector' (232589) panicked at src/commands/pg_admin.rs:77:130:
+called `Result::unwrap()` on an `Err` value: "连接失败: error communicating with database: invalid peer certificate: Other(OtherError(CaUsedAsEndEntity))"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test commands::pg_cancel_transport_tests::postgres_cancel_capability_cannot_cancel_other_session ... ok
+test commands::pg_cancel_transport_tests::postgres_cancel_prefer_must_not_downgrade_negotiated_tls ... ok
+test commands::pg_cancel_transport_tests::postgres_encrypted_cancel_reports_server_query_cancelled ... ok
+test commands::pg_cancel_transport_tests::postgres_expired_cancel_capability_cannot_cancel_replacement_session ... ok
+test commands::pg_cancel_transport_tests::postgres_verify_full_cancel_uses_trusted_certificate ... 
+thread 'commands::pg_cancel_transport_tests::postgres_verify_full_cancel_uses_trusted_certificate' (232623) panicked at src/commands/pg_cancel_transport_tests.rs:15:81:
+called `Result::unwrap()` on an `Err` value: Io(Custom { kind: InvalidData, error: InvalidCertificate(Other(OtherError(CaUsedAsEndEntity))) })
+FAILED
+test commands::pg_explain::tests::postgres_explain_analyze_executes_query_once_and_recovers_from_failure ... ok
+test commands::pg_explain::tests::postgres_explain_analyze_refuses_persistent_sequence_side_effects ... ok
+test commands::pg_explain::tests::postgres_explain_timeout_also_bounds_lock_waits ... ok
+test commands::pg_explain::tests::postgres_explain_timeout_stops_backend_and_restores_session_settings ... ok
+test commands::query::commit_disconnect_tests::real_mysql_commit_disconnect_reports_unknown_and_observer_checks_both_outcomes ... ok
+test commands::query::optimistic_update_tests::mysql_grid_update_with_saved_latin1_database_preserves_batch ... ok
+test commands::query::optimistic_update_tests::mysql_optimistic_update_rejects_stale_case_space_null_and_rolls_back_batch ... ok
+test commands::query::optimistic_update_tests::postgres_optimistic_typed_updates_preserve_encoding_and_atomic_baselines ... ok
+test commands::query::tests::real_mysql_archive_object_preserves_raw_view_ddl_and_refuses_unsafe_routine ... ok
+test commands::query::tests::real_mysql_cancelled_query_does_not_reuse_its_interrupted_connection ... ok
+test commands::query::tests::real_mysql_inline_edit_rejects_unsafe_tables_and_rolls_back_warnings ... ok
+test commands::sqlite_admin::alter_execute::reader::tests::mysql_execution_preserves_version_comments_delimiters_modes_and_stops_on_error ... ok
+
+failures:
+
+failures:
+    commands::pg_admin::tls_tests::pg_admin_tls_policy_matches_query_connector
+    commands::pg_cancel_transport_tests::postgres_verify_full_cancel_uses_trusted_certificate
+
+test result: FAILED. 60 passed; 2 failed; 0 ignored; 0 measured; 404 filtered out; finished in 3.45s
+
+error: test failed, to rerun pass `--lib`

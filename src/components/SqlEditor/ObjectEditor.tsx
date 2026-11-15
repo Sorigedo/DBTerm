@@ -1,3 +1,4 @@
+import { objectSaveSql } from '../../utils/objectDdlSafety'
 import { useState, useMemo, useRef, useCallback, useEffect } from 'react'
 import CodeMirror from '@uiw/react-codemirror'
 import { sql, schemaCompletionSource, StandardSQL, MySQL, MariaSQL, PostgreSQL, SQLite, MSSQL } from '@codemirror/lang-sql'
@@ -95,7 +96,7 @@ function friendlyDbError(raw: string): string {
     return '没有 SUPER 权限且 binlog 已开启，无法创建函数。请用更高权限账号，或为函数声明 '
       + 'DETERMINISTIC / NO SQL / READS SQL DATA 特性。'
   }
-  if (/\b1304\b/.test(raw)) return '同名函数/存储过程已存在。编辑时请先 DROP 再创建，或改用其它名称。'
+  if (/\b1304\b/.test(raw)) return '同名函数/存储过程已存在；此引擎不支持原子替换。原对象未自动删除，请使用原生安全变更流程或新名称核验。'
   return raw
 }
 
@@ -362,20 +363,8 @@ export default function ObjectEditor({ tabId, connectionId, connType }: Props) {
   const handleSave = useCallback(async (): Promise<boolean> => {
     if (!ddl.trim() || saving) return false
     setSaving(true); setRunError('')
-    // 函数/存储过程：MySQL 系没有 CREATE OR REPLACE，需要先 DROP IF EXISTS 再 CREATE。
-    // Oracle/PG 支持 CREATE OR REPLACE，不需要预置 DROP（Oracle OCI 也不支持多语句合并执行）。
-    let execSql = ddl
-    const needsDrop = draft
-      && (draft.objType === 'function' || draft.objType === 'procedure')
-      && !/^\s*DROP\s+(FUNCTION|PROCEDURE)/i.test(ddl)
-      && connType !== 'oracle'
-      && !['postgres', 'kingBase', 'openGauss'].includes(connType)
-    if (needsDrop) {
-      const kind = draft!.objType === 'function' ? 'FUNCTION' : 'PROCEDURE'
-      const m = ddl.match(/CREATE\s+(?:DEFINER\s*=\s*\S+\s+)?(?:FUNCTION|PROCEDURE)\s+(`[^`]+`|"[^"]+"|\w+)/i)
-      const name = m ? m[1] : qid(connType, draft!.name)
-      execSql = `DROP ${kind} IF EXISTS ${name};\n${ddl}`
-    }
+    // Execute only the edited text. An invalid replacement must never delete the original first.
+    const execSql = objectSaveSql(ddl)
     // 生产环境写操作二次确认
     if (!(await requireProdConfirm(envConn, `保存${draft ? OBJ_LABEL[draft.objType] : '对象'} ${draft?.name ?? ''}`, execSql))) {
       setSaving(false); return false
@@ -383,12 +372,6 @@ export default function ObjectEditor({ tabId, connectionId, connType }: Props) {
     const t0 = performance.now()
     try {
       const { invoke } = await import('@tauri-apps/api/core')
-      // SQLite 不支持 CREATE OR REPLACE VIEW，需要分两步：DROP VIEW IF EXISTS + CREATE VIEW
-      if (connType === 'sqlite' && draft?.objType === 'view') {
-        const m = execSql.match(/CREATE\s+(?:TEMP(?:ORARY)?\s+)?VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:"([^"]*)"|`([^`]*)`|(\w+))/i)
-        const viewName = m ? (m[1] ?? m[2] ?? m[3] ?? draft.name) : draft.name
-        await invoke('execute_query', { id: connectionId, sql: `DROP VIEW IF EXISTS "${viewName.replace(/"/g, '""')}"` })
-      }
       await invoke('execute_query', {
         id: connectionId,
         sql: execSql,
@@ -649,6 +632,11 @@ export default function ObjectEditor({ tabId, connectionId, connType }: Props) {
         </button>
       </div>
 
+      {draft.mode === 'edit' && (
+        <div style={{ padding: '6px 12px', fontSize: 12, color: 'var(--text-muted)', background: 'var(--surface)', borderBottom: '1px solid var(--border)' }}>
+          保存仅执行编辑框内的 SQL。原始 CREATE 定义用于核对；修改已有对象请显式使用本引擎支持的 ALTER 或 CREATE OR REPLACE。软件不会自动删除原对象，也不会改写 DEFINER 等权限子句。
+        </div>
+      )}
       <div className="object-editor__cm" ref={cmWrapRef}>
         <CodeMirror
           value={ddl}

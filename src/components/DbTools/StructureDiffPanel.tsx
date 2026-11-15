@@ -1,10 +1,11 @@
-﻿import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import type { CSSProperties } from 'react'
 import { createPortal } from 'react-dom'
-import { X, Layers, Copy, Check, CheckCircle2, Play, AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react'
-import ConfirmDialog from '../shared/ConfirmDialog'
+import { X, Layers, Copy, Check, CheckCircle2, AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react'
 import SearchableSelect from './SearchableSelect'
 import { useAppStore } from '../../stores/appStore'
+import { structureDiffSelectionKey, isCurrentStructureDiff, currentStructureDiffResult } from './structureDiffSafety'
+import { useRef } from 'react'
 
 const sdCard: CSSProperties = { background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 8 }
 const sdLabel: CSSProperties = { fontSize: 11, color: 'var(--text-muted)', fontWeight: 500 }
@@ -53,6 +54,7 @@ interface SchemaTableDiff {
 }
 
 interface SchemaDiff {
+  databaseDefinition: { identical: boolean; sourceDdl: string; targetDdl: string }
   missingTables: string[]
   extraTables: string[]
   changedTables: SchemaTableDiff[]
@@ -104,9 +106,15 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
   const [schemaDiff, setSchemaDiff] = useState<SchemaDiff | null>(null)
   const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set())
   const [copied, setCopied] = useState(false)
-  const [confirm, setConfirm] = useState(false)
-  const [executing, setExecuting] = useState(false)
   const [execResult, setExecResult] = useState<string>('')
+  const selectionKey = structureDiffSelectionKey([mode, srcConnId, srcSchema, srcTable, dstConnId, dstSchema, dstTable])
+  const selectionRef = useRef(selectionKey)
+  const requestRef = useRef(0)
+  selectionRef.current = selectionKey
+  const [resultKey, setResultKey] = useState<string | null>(null)
+  useEffect(() => {
+    setDiff(null); setSchemaDiff(null); setResultKey(null); setError(''); setExecResult('')
+  }, [selectionKey])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -145,15 +153,16 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
 
   // 加载源端表列表
   useEffect(() => {
-    if (!srcConnId || !srcSchema) return
+    setSrcTables([])
+    if (!srcConnId || !srcSchema) { setSrcLoadingTables(false); return }
     let alive = true
     setSrcLoadingTables(true)
     ;(async () => {
       try {
         const { invoke } = await import('@tauri-apps/api/core')
         const list = await invoke<TableInfo[]>('list_tables', { id: srcConnId, schema: srcSchema })
-        if (alive) setSrcTables(list)
-      } catch { /* ignore */ } finally {
+        if (alive) { setSrcTables(list); setSrcTable(prev => list.some(item => item.name === prev && !item.isView) ? prev : '') }
+      } catch { if (alive) { setSrcTables([]); setSrcTable('') } } finally {
         if (alive) setSrcLoadingTables(false)
       }
     })()
@@ -162,15 +171,16 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
 
   // 加载目标端表列表
   useEffect(() => {
-    if (!dstConnId || !dstSchema) return
+    setDstTables([])
+    if (!dstConnId || !dstSchema) { setDstLoadingTables(false); return }
     let alive = true
     setDstLoadingTables(true)
     ;(async () => {
       try {
         const { invoke } = await import('@tauri-apps/api/core')
         const list = await invoke<TableInfo[]>('list_tables', { id: dstConnId, schema: dstSchema })
-        if (alive) setDstTables(list)
-      } catch { /* ignore */ } finally {
+        if (alive) { setDstTables(list); setDstTable(prev => list.some(item => item.name === prev && !item.isView) ? prev : '') }
+      } catch { if (alive) { setDstTables([]); setDstTable('') } } finally {
         if (alive) setDstLoadingTables(false)
       }
     })()
@@ -178,6 +188,8 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
   }, [dstConnId, dstSchema])
 
   const runDiff = useCallback(async () => {
+    const requestedKey = selectionKey
+    const requestId = ++requestRef.current
     if (!srcSchema || !dstSchema) { setError('请选择源 Schema 和目标 Schema'); return }
     if (mode === 'table' && (!srcTable || !dstTable)) { setError('请选择源表和目标表'); return }
     setRunning(true)
@@ -192,77 +204,39 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
         const result = await invoke<StructureDiff>('db_diff_structure', {
           srcId: srcConnId, srcSchema, srcTable, dstId: dstConnId, dstSchema, dstTable,
         })
-        setDiff(result)
+        if (selectionRef.current !== requestedKey || requestRef.current !== requestId) return
+        setDiff(result); setResultKey(requestedKey)
       } else {
-        const sourceNames = srcTables.filter(t => !t.isView).map(t => t.name)
-        const targetNames = dstTables.filter(t => !t.isView).map(t => t.name)
-        const sourceSet = new Set(sourceNames)
-        const targetSet = new Set(targetNames)
-        const missingTables = sourceNames.filter(name => !targetSet.has(name)).sort()
-        const extraTables = targetNames.filter(name => !sourceSet.has(name)).sort()
-        const commonTables = sourceNames.filter(name => targetSet.has(name)).sort()
-        const results: SchemaTableDiff[] = []
-
-        let cursor = 0
-        const worker = async () => {
-          while (cursor < commonTables.length) {
-            const name = commonTables[cursor++]
-            const tableDiff = await invoke<StructureDiff>('db_diff_structure', {
-              srcId: srcConnId, srcSchema, srcTable: name,
-              dstId: dstConnId, dstSchema, dstTable: name,
-            })
-            if (tableDiff.added.length || tableDiff.removed.length || tableDiff.modified.length) {
-              results.push({ table: name, diff: tableDiff })
-            }
-          }
-        }
-        await Promise.all(Array.from({ length: Math.min(4, commonTables.length) }, worker))
-        results.sort((a, b) => a.table.localeCompare(b.table))
-        setSchemaDiff({
-          missingTables,
-          extraTables,
-          changedTables: results,
-          comparedTables: commonTables.length,
-          alterSql: results.map(item => item.diff.alterSql).filter(Boolean).join('\n\n'),
-          dangerDrops: results.flatMap(item => item.diff.dangerDrops.map(col => `${item.table}.${col}`)),
+        const result = await invoke<SchemaDiff>('db_diff_schema_snapshot', {
+          srcId: srcConnId, srcSchema, dstId: dstConnId, dstSchema,
         })
+        if (selectionRef.current !== requestedKey || requestRef.current !== requestId) return
+        setResultKey(requestedKey)
+        setSchemaDiff(result)
       }
     } catch (e) {
-      setError(String(e))
+      if (selectionRef.current === requestedKey && requestRef.current === requestId) setError(String(e))
     } finally {
-      setRunning(false)
+      if (requestRef.current === requestId) setRunning(false)
     }
-  }, [mode, srcConnId, srcSchema, srcTable, srcTables, dstConnId, dstSchema, dstTable, dstTables])
+  }, [mode, srcConnId, srcSchema, srcTable, srcTables, dstConnId, dstSchema, dstTable, dstTables, selectionKey])
 
-  const alterSql = mode === 'schema' ? schemaDiff?.alterSql ?? '' : diff?.alterSql ?? ''
-  const dangerDrops = mode === 'schema' ? schemaDiff?.dangerDrops ?? [] : diff?.dangerDrops ?? []
+  const currentSelection = [mode, srcConnId, srcSchema, srcTable, dstConnId, dstSchema, dstTable]
+  const currentDiff = currentStructureDiffResult(resultKey, currentSelection, diff)
+  const currentSchemaDiff = currentStructureDiffResult(resultKey, currentSelection, schemaDiff)
+  const alterSql = mode === 'schema' ? currentSchemaDiff?.alterSql ?? '' : currentDiff?.alterSql ?? ''
+  const dangerDrops = mode === 'schema' ? currentSchemaDiff?.dangerDrops ?? [] : currentDiff?.dangerDrops ?? []
 
   const copySql = () => {
-    if (!alterSql) return
+    if (!alterSql || !isCurrentStructureDiff(resultKey, [mode, srcConnId, srcSchema, srcTable, dstConnId, dstSchema, dstTable])) return
     navigator.clipboard.writeText(alterSql).then(() => {
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     })
   }
 
-  const executeAlter = async () => {
-    if (!alterSql) return
-    setExecuting(true)
-    setExecResult('')
-    try {
-      const { invoke } = await import('@tauri-apps/api/core')
-      await invoke('execute_query', { id: dstConnId, sql: alterSql })
-      setExecResult('执行成功，表结构已更新')
-    } catch (e) {
-      setExecResult(`执行失败：${e}`)
-    } finally {
-      setExecuting(false)
-      setConfirm(false)
-    }
-  }
-
-  const hasDiff = diff && (diff.added.length + diff.removed.length + diff.modified.length) > 0
-  const hasSchemaDiff = schemaDiff && (schemaDiff.missingTables.length + schemaDiff.extraTables.length + schemaDiff.changedTables.length) > 0
+  const hasDiff = currentDiff && (currentDiff.added.length + currentDiff.removed.length + currentDiff.modified.length) > 0
+  const hasSchemaDiff = currentSchemaDiff && (!currentSchemaDiff.databaseDefinition.identical || (currentSchemaDiff.missingTables.length + currentSchemaDiff.extraTables.length + currentSchemaDiff.changedTables.length) > 0)
   const hasDangerDrop = dangerDrops.length > 0
 
   function ConnSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
@@ -275,7 +249,7 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
   function TableSelect({ value, onChange, tables, loading }: { value: string; onChange: (v: string) => void; tables: TableInfo[]; loading: boolean }) {
     return (
       <SearchableSelect value={value} onChange={onChange} disabled={loading}
-        options={tables.map(t => t.name)} placeholder="选择表" searchPlaceholder="搜索表名…" />
+        options={tables.filter(t => !t.isView).map(t => t.name)} placeholder="选择表" searchPlaceholder="搜索表名…" />
     )
   }
 
@@ -283,9 +257,10 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
     return (
       <section>
         <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
-          生成的 ALTER SQL
+          生成的 ALTER SQL（仅供核对，需在 SQL 编辑器确认目标后逐表执行）
           {hasDangerDrop && <span style={{ fontSize: 11, color: 'var(--error)', display: 'flex', alignItems: 'center', gap: 4 }}><AlertTriangle size={11} /> 包含高危 DROP COLUMN，执行前请备份</span>}
         </div>
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8 }}>DDL 不能保证整批事务回滚；仅提供原文定义生成的 SQL，请确认目标并逐表审阅执行。</div>
         <div style={{ background: 'var(--bg)', border: `1px solid ${hasDangerDrop ? 'rgba(220,38,38,0.4)' : 'var(--border)'}`, borderRadius: 8, padding: 12, fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text)', whiteSpace: 'pre-wrap', wordBreak: 'break-all', maxHeight: 200, overflow: 'auto' }}>
           {alterSql}
         </div>
@@ -294,9 +269,7 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
           <button onClick={copySql} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, color: copied ? '#16a34a' : 'var(--text-muted)', padding: '5px 12px', borderRadius: 7, border: '1px solid var(--border)', background: 'var(--surface-2)' }}>
             {copied ? <Check size={12} /> : <Copy size={12} />}{copied ? '已复制' : '复制 SQL'}
           </button>
-          <button onClick={() => setConfirm(true)} disabled={executing} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, color: '#fff', padding: '5px 12px', borderRadius: 7, background: 'var(--error)', opacity: executing ? 0.6 : 1 }}>
-            <Play size={12} />{executing ? '执行中…' : '执行 ALTER SQL'}
-          </button>
+
         </div>
       </section>
     )
@@ -335,6 +308,7 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
                 </button>
               ))}
             </div>
+            {mode === 'schema' && <div style={sdLabel}>核验库默认定义与全部普通表；不含视图、存储程序、事件及权限。读取期间持有已捕获表的结构锁并复查表清单，不能阻止其他会话新建表；请暂停 DDL 后比对。结果仅反映本次读取。</div>}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr auto 1fr', gap: 12, alignItems: 'center' }}>
               {/* 源（基准） */}
               <div style={sdCard}>
@@ -376,7 +350,7 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
               <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
                 {mode === 'table'
                   ? '以源表为基准，生成让目标表匹配源表结构的 ALTER SQL'
-                  : '比较全部同名表；视图、索引和约束暂不在对比范围内'}
+                  : '比较 MySQL 库默认选项和普通表完整定义；视图、存储程序和权限不在范围内'}
               </span>
             </div>
 
@@ -387,25 +361,30 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
             )}
 
             {/* 结构一致：紧凑徽标，不占整块空间 */}
-            {diff !== null && !hasDiff && (
+            {currentDiff !== null && !hasDiff && (
               <div style={{ display: 'inline-flex', alignSelf: 'flex-start', alignItems: 'center', gap: 8, padding: '8px 14px', borderRadius: 8, background: 'rgba(22,163,74,0.10)', border: '1px solid rgba(22,163,74,0.30)', fontSize: 12.5, color: '#16a34a', fontWeight: 500 }}>
-                <CheckCircle2 size={15} strokeWidth={2.2} /> 两表结构完全一致，无需同步
+                <CheckCircle2 size={15} strokeWidth={2.2} /> 当前读取的两表完整定义一致（不含权限和外部依赖）
               </div>
             )}
-            {schemaDiff !== null && !hasSchemaDiff && (
+            {currentSchemaDiff !== null && !hasSchemaDiff && (
               <div style={{ display: 'inline-flex', alignSelf: 'flex-start', alignItems: 'center', gap: 8, padding: '8px 14px', borderRadius: 8, background: 'rgba(22,163,74,0.10)', border: '1px solid rgba(22,163,74,0.30)', fontSize: 12.5, color: '#16a34a', fontWeight: 500 }}>
-                <CheckCircle2 size={15} strokeWidth={2.2} /> 两个 Schema 的 {schemaDiff.comparedTables} 张表结构一致
+                <CheckCircle2 size={15} strokeWidth={2.2} /> 本次读取的库默认定义、普通表清单及 {currentSchemaDiff.comparedTables} 张同名表定义一致（不含视图、存储程序和权限）
               </div>
             )}
           </div>
 
-          {schemaDiff !== null && hasSchemaDiff && (
+          {currentSchemaDiff !== null && hasSchemaDiff && (
             <div style={{ flex: 1, overflow: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 14 }}>
+              {!currentSchemaDiff.databaseDefinition.identical && <section style={sdCard}>
+                <strong style={{ color: 'var(--text-bright)', fontSize: 12 }}>数据库默认定义不同（仅展示，不自动改写）</strong>
+                <span style={sdLabel}>源库原文</span><pre style={{ whiteSpace: 'pre-wrap', margin: 0, color: 'var(--text)', fontSize: 11 }}>{currentSchemaDiff.databaseDefinition.sourceDdl}</pre>
+                <span style={sdLabel}>目标库原文</span><pre style={{ whiteSpace: 'pre-wrap', margin: 0, color: 'var(--text)', fontSize: 11 }}>{currentSchemaDiff.databaseDefinition.targetDdl}</pre>
+              </section>}
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
                 {[
-                  ['目标缺表', schemaDiff.missingTables.length, 'var(--success)'],
-                  ['目标多表', schemaDiff.extraTables.length, 'var(--error)'],
-                  ['结构不同', schemaDiff.changedTables.length, 'var(--warning)'],
+                  ['目标缺表', currentSchemaDiff.missingTables.length, 'var(--success)'],
+                  ['目标多表', currentSchemaDiff.extraTables.length, 'var(--error)'],
+                  ['结构不同', currentSchemaDiff.changedTables.length, 'var(--warning)'],
                 ].map(([label, count, color]) => (
                   <div key={String(label)} style={{ ...sdCard, gap: 3 }}>
                     <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{label}</span>
@@ -414,23 +393,23 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
                 ))}
               </div>
 
-              {schemaDiff.missingTables.length > 0 && (
+              {currentSchemaDiff.missingTables.length > 0 && (
                 <section>
-                  <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--success)', marginBottom: 7 }}>目标缺少的表（{schemaDiff.missingTables.length}）</div>
-                  <div style={{ fontSize: 12, color: 'var(--text)', lineHeight: 1.8 }}>{schemaDiff.missingTables.join('、')}</div>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--success)', marginBottom: 7 }}>目标缺少的表（{currentSchemaDiff.missingTables.length}）</div>
+                  <div style={{ fontSize: 12, color: 'var(--text)', lineHeight: 1.8 }}>{currentSchemaDiff.missingTables.join('、')}</div>
                 </section>
               )}
-              {schemaDiff.extraTables.length > 0 && (
+              {currentSchemaDiff.extraTables.length > 0 && (
                 <section>
-                  <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--error)', marginBottom: 7 }}>目标多出的表（{schemaDiff.extraTables.length}）</div>
-                  <div style={{ fontSize: 12, color: 'var(--text)', lineHeight: 1.8 }}>{schemaDiff.extraTables.join('、')}</div>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--error)', marginBottom: 7 }}>目标多出的表（{currentSchemaDiff.extraTables.length}）</div>
+                  <div style={{ fontSize: 12, color: 'var(--text)', lineHeight: 1.8 }}>{currentSchemaDiff.extraTables.join('、')}</div>
                 </section>
               )}
-              {schemaDiff.changedTables.length > 0 && (
+              {currentSchemaDiff.changedTables.length > 0 && (
                 <section>
-                  <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--warning)', marginBottom: 7 }}>同名表结构差异（{schemaDiff.changedTables.length}）</div>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--warning)', marginBottom: 7 }}>同名表结构差异（{currentSchemaDiff.changedTables.length}）</div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                    {schemaDiff.changedTables.map(item => {
+                    {currentSchemaDiff.changedTables.map(item => {
                       const expanded = expandedTables.has(item.table)
                       return (
                         <div key={item.table} style={{ border: '1px solid var(--border)', borderRadius: 8, background: 'var(--surface-2)', overflow: 'hidden' }}>
@@ -455,27 +434,27 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
                   </div>
                 </section>
               )}
-              {(schemaDiff.missingTables.length > 0 || schemaDiff.extraTables.length > 0) && (
+              {(currentSchemaDiff.missingTables.length > 0 || currentSchemaDiff.extraTables.length > 0) && (
                 <div style={{ fontSize: 11, color: 'var(--text-muted)', padding: '8px 10px', background: 'var(--surface-2)', border: '1px solid var(--border-subtle)', borderRadius: 8 }}>
                   缺失或多余的整表不自动生成 CREATE/DROP SQL；下方 SQL 仅同步同名表的列结构。
                 </div>
               )}
-              {schemaDiff.alterSql && renderSqlSection()}
+              {currentSchemaDiff.alterSql && renderSqlSection()}
             </div>
           )}
 
           {/* 结果区：仅在有差异时展开滚动区 */}
-          {diff !== null && hasDiff && (
+          {currentDiff !== null && hasDiff && (
             <div style={{ flex: 1, overflow: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 16 }}>
                 <>
                   {/* 新增列 (ADD COLUMN) */}
-                  {diff.added.length > 0 && (
+                  {currentDiff.added.length > 0 && (
                     <section>
                       <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--success)', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <span>✅</span> 目标缺少列（需 ADD）<span style={{ fontWeight: 400, color: 'var(--text-muted)' }}>({diff.added.length})</span>
+                        <span>✅</span> 目标缺少列（需 ADD）<span style={{ fontWeight: 400, color: 'var(--text-muted)' }}>({currentDiff.added.length})</span>
                       </div>
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                        {diff.added.map(col => (
+                        {currentDiff.added.map(col => (
                           <div key={col.name} style={{
                             background: 'rgba(22,163,74,0.08)', border: '1px solid rgba(22,163,74,0.2)',
                             borderRadius: 8, padding: '8px 12px',
@@ -488,15 +467,15 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
                   )}
 
                   {/* 删除列 (DROP COLUMN — 高危) */}
-                  {diff.removed.length > 0 && (
+                  {currentDiff.removed.length > 0 && (
                     <section>
                       <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--error)', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 6 }}>
                         <AlertTriangle size={13} />
                         目标多余列（需 DROP — 数据丢失）
-                        <span style={{ fontWeight: 400, color: 'var(--text-muted)' }}>({diff.removed.length})</span>
+                        <span style={{ fontWeight: 400, color: 'var(--text-muted)' }}>({currentDiff.removed.length})</span>
                       </div>
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                        {diff.removed.map(col => (
+                        {currentDiff.removed.map(col => (
                           <div key={col.name} style={{
                             background: 'rgba(220,38,38,0.08)', border: '1px solid rgba(220,38,38,0.3)',
                             borderRadius: 8, padding: '8px 12px',
@@ -509,13 +488,13 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
                   )}
 
                   {/* 修改列 (MODIFY COLUMN) */}
-                  {diff.modified.length > 0 && (
+                  {currentDiff.modified.length > 0 && (
                     <section>
                       <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--warning)', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <span>✏️</span> 列定义不同（需 MODIFY）<span style={{ fontWeight: 400, color: 'var(--text-muted)' }}>({diff.modified.length})</span>
+                        <span>✏️</span> 列定义不同（需 MODIFY）<span style={{ fontWeight: 400, color: 'var(--text-muted)' }}>({currentDiff.modified.length})</span>
                       </div>
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                        {diff.modified.map(change => (
+                        {currentDiff.modified.map(change => (
                           <div key={change.name} style={{
                             background: 'rgba(234,88,12,0.08)', border: '1px solid rgba(234,88,12,0.2)',
                             borderRadius: 8, padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 6,
@@ -539,10 +518,10 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
                 </>
 
               {/* ALTER SQL */}
-              {diff.alterSql && (
+              {currentDiff.alterSql && (
                 <section>
                   <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
-                    生成的 ALTER SQL
+                    生成的 ALTER SQL（仅供核对，需在 SQL 编辑器确认目标后逐表执行）
                     {hasDangerDrop && (
                       <span style={{ fontSize: 11, color: 'var(--error)', display: 'flex', alignItems: 'center', gap: 4 }}>
                         <AlertTriangle size={11} /> 包含高危 DROP COLUMN，执行前请备份
@@ -580,18 +559,7 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
                       {copied ? <Check size={12} /> : <Copy size={12} />}
                       {copied ? '已复制' : '复制 SQL'}
                     </button>
-                    <button
-                      onClick={() => setConfirm(true)}
-                      disabled={executing}
-                      style={{
-                        display: 'flex', alignItems: 'center', gap: 5, fontSize: 12,
-                        color: '#fff', padding: '5px 12px', borderRadius: 7,
-                        background: 'var(--error)', opacity: executing ? 0.6 : 1,
-                      }}
-                    >
-                      <Play size={12} />
-                      {executing ? '执行中…' : '执行 ALTER SQL'}
-                    </button>
+
                   </div>
                 </section>
               )}
@@ -600,15 +568,7 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
         </div>
       </div>
 
-      <ConfirmDialog
-        open={confirm}
-        title="确认执行 ALTER SQL"
-        desc={`即将对目标${mode === 'schema' ? ` Schema ${dstSchema}` : `表 ${dstSchema ? dstSchema + '.' : ''}${dstTable}`}执行结构变更。${hasDangerDrop ? `\n\n高危：将 DROP ${dangerDrops.length} 列，列中数据不可恢复，请确认已备份！` : '此操作不可撤销，请确认已备份数据。'}`}
-        danger
-        okText="确认执行"
-        onOk={executeAlter}
-        onCancel={() => setConfirm(false)}
-      />
+
     </>,
     document.body
   )
