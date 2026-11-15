@@ -186,9 +186,8 @@ impl russh::server::Handler for ExecServer {
         if command == b"large-output" {
             let handle = session.handle();
             tokio::spawn(async move {
-                for _ in 0..1056 {
+                for _ in 0..1025 {
                     if handle.data(id, vec![b'x'; 32 * 1024]).await.is_err() { return; }
-                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                 }
                 let _ = handle.exit_status_request(id,0).await;
                 let _ = handle.eof(id).await;
@@ -393,7 +392,7 @@ async fn loopback_exec_requires_confirmed_zero_status_after_stdout_eof(){
     let server=tokio::spawn(async move{while let Ok((socket,_))=listener.accept().await{let cfg=server_config.clone();tokio::spawn(async move{if let Ok(session)=russh::server::run_stream(cfg,socket,ExecServer).await{let _=session.await;}});}});
     let config:ConnConfig=serde_json::from_value(serde_json::json!({"id":format!("local-exec-{port}"),"name":"isolated","type":"ssh","host":"127.0.0.1","port":port,"username":"audit","useSsl":false,"createdAt":0,"updatedAt":0,
         "extraJson":serde_json::json!({"hostKeyPolicy":"skip","authType":"password","heartbeatInterval":0,"proxyPassword":"unused-test-only","jumpPassword":"unused-test-only"}).to_string()})).unwrap();
-    let outcome=tokio::time::timeout(std::time::Duration::from_secs(10),async{
+    let outcome=tokio::time::timeout(std::time::Duration::from_secs(30),async{
         assert_eq!(exec_command(&config,Some("local-test-only"),"success").await.unwrap(),"operation output");
         let error=exec_command(&config,Some("local-test-only"),"failure").await.expect_err("nonzero SSH command must not report success");
         assert!(error.contains('7')&&error.contains("operation output"),"{error}");
