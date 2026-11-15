@@ -364,6 +364,7 @@ pub(super) async fn sqlite_delete_rows_impl(
     tx.commit()
         .await
         .map_err(|e| format!("删除提交未获确认，结果未知，请核对目标，禁止自动重试: {e}"))?;
+    pool.close().await;
     Ok(total)
 }
 fn conflict() -> String {
