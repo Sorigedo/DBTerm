@@ -47,9 +47,20 @@ jobs:
         run: npm run tauri -- build --target x86_64-pc-windows-msvc --no-bundle
 
       - name: Run Windows-compatible Rust tests
-        run: >-
-          cargo test --locked --manifest-path src-tauri/Cargo.toml
-          -- --skip ssh::exec_integration_tests::loopback_upload_real_staging_preserves_target_on_changed_source
+        shell: pwsh
+        run: |
+          $output = & cargo test --locked --manifest-path src-tauri/Cargo.toml -- --skip ssh::exec_integration_tests::loopback_upload_real_staging_preserves_target_on_changed_source 2>&1
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) {
+            $lines = @($output | ForEach-Object { "$_" })
+            $summary = $lines | Select-Object -Last 80
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## Rust test failure details`n````text`n$($summary -join "`n")`n````"
+            foreach ($line in $summary) {
+              $escaped = $line.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+              Write-Output "::error::$escaped"
+            }
+          }
+          exit $testExit
 
       - name: Verify Windows executable
         shell: pwsh
