@@ -93,6 +93,13 @@ fn safe_archive_name(name: &str) -> Result<String, String> {
         || normalized.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
         return Err("ZIP 条目名称无效".into());
     }
+    // A drive-qualified name is rooted on Windows even though Path::is_absolute
+    // on non-Windows hosts cannot recognize it. Reject it on Windows before
+    // creating an archive entry.
+    #[cfg(target_os = "windows")]
+    if normalized.as_bytes().get(1) == Some(&b':') {
+        return Err("ZIP 条目名称无效".into());
+    }
     Ok(normalized)
 }
 
