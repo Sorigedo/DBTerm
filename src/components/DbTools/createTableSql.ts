@@ -1,7 +1,16 @@
 import type { ConnType } from '../../types'
 import { dialectFamily, qid, tableRef } from '../../utils/sqlDialect.ts'
 
-export interface IndexSpec { name: string; columns: string; unique: boolean; method: 'BTREE' | 'HASH' | 'FULLTEXT' | 'SPATIAL' }
+export interface IndexSpec { name: string; columns: string; unique: boolean; method: 'BTREE' | 'HASH' | 'FULLTEXT' | 'SPATIAL' | 'DEFAULT' }
+
+export function moveIndex<T extends { _id: string }>(indexes: T[], id: string, direction: -1 | 1): T[] {
+  const from = indexes.findIndex(index => index._id === id)
+  const to = from + direction
+  if (from < 0 || to < 0 || to >= indexes.length) return indexes
+  const next = [...indexes]
+  ;[next[from], next[to]] = [next[to], next[from]]
+  return next
+}
 
 export interface MysqlTableOptionState {
   loaded: boolean
@@ -55,12 +64,15 @@ export function validateMysqlExistingIndexEdits(indexes: IndexSpec[], originals:
       return '现有索引的完整定义无法从摘要还原，请在 SQL 编辑器中修改原始 DDL'
     }
   }
+  // List order is a UI convenience only; MySQL has no persisted index position.
+  // New indexes may be appended without implying a rebuild of existing ones.
   return null
 }
 
 export function buildIndexAlterStatements(ct: ConnType, schema: string, table: string, indexes: IndexSpec[], origIndexes: IndexSpec[], ssSchema?: string): string[] {
   const out: string[] = []
   const oldByName = new Map(origIndexes.filter(i => i.name.trim()).map(i => [i.name.trim().toLowerCase(), i]))
+  indexes = indexes.map(i => !i.name.trim() && i.columns.trim() ? { ...i, name: 'idx_' + i.columns.split(',').map(s => s.trim()).filter(Boolean).join('_') } : i)
   const curByName = new Map(indexes.filter(i => i.name.trim() && i.columns.trim()).map(i => [i.name.trim().toLowerCase(), i]))
   const fam = dialectFamily(ct)
   const changed = (a: IndexSpec, b: IndexSpec) => a.unique !== b.unique || !sameColumns(a.columns, b.columns) || a.method !== b.method
@@ -80,7 +92,7 @@ export function buildIndexAlterStatements(ct: ConnType, schema: string, table: s
       const colsSql = idx.columns.split(',').map(s => s.trim()).filter(Boolean).map(s => qid(ct, s)).join(', ')
       if (fam === 'mysql') {
         const using = idx.method === 'HASH' ? ' USING HASH' : ''
-        out.push(`  ADD ${idx.unique ? 'UNIQUE INDEX' : 'INDEX'} ${qid(ct, idx.name.trim())} (${colsSql})${using}`)
+        out.push(`  ADD ${idx.method === 'FULLTEXT' ? 'FULLTEXT INDEX' : idx.method === 'SPATIAL' ? 'SPATIAL INDEX' : idx.unique ? 'UNIQUE INDEX' : 'INDEX'} ${qid(ct, idx.name.trim())} (${colsSql})${using}`)
       } else {
         out.push(`CREATE ${idx.unique ? 'UNIQUE ' : ''}INDEX ${qid(ct, idx.name.trim())} ON ${tableRef(ct, schema, table, ssSchema)} (${colsSql});`)
       }
