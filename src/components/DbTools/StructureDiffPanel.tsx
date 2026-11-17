@@ -1,11 +1,13 @@
 import { useState, useEffect, useCallback } from 'react'
 import type { CSSProperties } from 'react'
 import { createPortal } from 'react-dom'
-import { X, Layers, Copy, Check, CheckCircle2, AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react'
+import { X, Layers, Copy, Check, CheckCircle2, AlertTriangle, ChevronDown, ChevronRight, Download, Minus, Maximize2 } from 'lucide-react'
 import SearchableSelect from './SearchableSelect'
 import { useAppStore } from '../../stores/appStore'
 import { structureDiffSelectionKey, isCurrentStructureDiff, currentStructureDiffResult } from './structureDiffSafety'
 import { useRef } from 'react'
+import { mysqlColumnDefinitionDetails } from './mysqlColumnDefinitionDetails'
+import { explainIndexDifference, formatStructureDiffReport, type StructureDiffReportData, type ReportTableDiff } from './structureDiffReport'
 
 const sdCard: CSSProperties = { background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 8 }
 const sdLabel: CSSProperties = { fontSize: 11, color: 'var(--text-muted)', fontWeight: 500 }
@@ -33,6 +35,8 @@ interface ColumnChange {
   name: string
   before: ColumnInfo
   after: ColumnInfo
+  beforeDefinition?: string | null
+  afterDefinition?: string | null
 }
 
 interface StructureDiff {
@@ -41,6 +45,8 @@ interface StructureDiff {
   modified: ColumnChange[]
   alterSql: string
   dangerDrops: string[]
+  tableOptions?: { kind: string; source: string; target: string } | null
+  alterBlockReason?: string | null
 }
 
 interface TableInfo {
@@ -52,13 +58,19 @@ interface SchemaTableDiff {
   table: string
   diff: StructureDiff
 }
+interface SchemaTableIssue {
+  table: string
+  reason: string
+}
 
 interface SchemaDiff {
   databaseDefinition: { identical: boolean; sourceDdl: string; targetDdl: string }
   missingTables: string[]
   extraTables: string[]
   changedTables: SchemaTableDiff[]
+  uncomparableTables: SchemaTableIssue[]
   comparedTables: number
+  comparisonScope: string
   alterSql: string
   dangerDrops: string[]
 }
@@ -77,6 +89,15 @@ function ColBadge({ col }: { col: ColumnInfo }) {
       )}
     </span>
   )
+}
+
+function ColumnDefinitionDetails({ definition }: { definition?: string | null }) {
+  if (!definition) return null
+  const { charset, collation } = mysqlColumnDefinitionDetails(definition)
+  if (!charset && !collation) return null
+  return <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+    {charset && <>字符集: {charset}{collation ? ' · ' : ''}</>}{collation && <>排序规则: {collation}</>}
+  </span>
 }
 
 export default function StructureDiffPanel({ connectionId, schema, table, onClose }: Props) {
@@ -107,6 +128,9 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
   const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set())
   const [copied, setCopied] = useState(false)
   const [execResult, setExecResult] = useState<string>('')
+  const [reportFormat, setReportFormat] = useState<'md' | 'txt' | 'json' | 'csv' | 'doc'>('md')
+  const [reportError, setReportError] = useState('')
+  const [minimized, setMinimized] = useState(false)
   const selectionKey = structureDiffSelectionKey([mode, srcConnId, srcSchema, srcTable, dstConnId, dstSchema, dstTable])
   const selectionRef = useRef(selectionKey)
   const requestRef = useRef(0)
@@ -117,10 +141,10 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
   }, [selectionKey])
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !minimized) onClose() }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [onClose])
+  }, [onClose, minimized])
 
   // 加载源 / 目标 schema 列表（连接变化时），默认选第一个非系统库
   useEffect(() => {
@@ -235,9 +259,49 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
     })
   }
 
-  const hasDiff = currentDiff && (currentDiff.added.length + currentDiff.removed.length + currentDiff.modified.length) > 0
-  const hasSchemaDiff = currentSchemaDiff && (!currentSchemaDiff.databaseDefinition.identical || (currentSchemaDiff.missingTables.length + currentSchemaDiff.extraTables.length + currentSchemaDiff.changedTables.length) > 0)
+  const hasDiff = currentDiff && (currentDiff.added.length + currentDiff.removed.length + currentDiff.modified.length > 0 || !!currentDiff.tableOptions)
+  const hasSchemaDiff = currentSchemaDiff && (!currentSchemaDiff.databaseDefinition.identical || (currentSchemaDiff.missingTables.length + currentSchemaDiff.extraTables.length + currentSchemaDiff.changedTables.length + currentSchemaDiff.uncomparableTables.length) > 0)
   const hasDangerDrop = dangerDrops.length > 0
+
+  const asReportTable = (table: string, item: StructureDiff, targetTable = table): ReportTableDiff => ({
+    table, targetTable, added: item.added, removed: item.removed, modified: item.modified, tableOptions: item.tableOptions,
+  })
+  const reportData = (): StructureDiffReportData | null => {
+    if (mode === 'table' && currentDiff) return {
+      mode, source: `${srcSchema}.${srcTable}`, target: `${dstSchema}.${dstTable}`, alterSql,
+      tableDiff: asReportTable(srcTable, currentDiff, dstTable),
+    }
+    if (mode === 'schema' && currentSchemaDiff) return {
+      mode, source: srcSchema, target: dstSchema, alterSql,
+      databaseDefinition: currentSchemaDiff.databaseDefinition,
+      missingTables: currentSchemaDiff.missingTables, extraTables: currentSchemaDiff.extraTables,
+      changedTables: currentSchemaDiff.changedTables.map(item => asReportTable(item.table, item.diff, item.table)),
+      uncomparableTables: currentSchemaDiff.uncomparableTables,
+    }
+    return null
+  }
+  const downloadReport = async () => {
+    const data = reportData()
+    if (!data) return
+    setReportError('')
+    const ext = reportFormat === 'doc' ? 'doc' : reportFormat
+    try {
+      const { save } = await import('@tauri-apps/plugin-dialog')
+      const path = await save({ title: '下载结构对比报告', defaultPath: `dbterm-structure-diff.${ext}`, filters: [{ name: ext.toUpperCase(), extensions: [ext] }] })
+      if (!path) return
+      const { invoke } = await import('@tauri-apps/api/core')
+      await invoke('write_local_file', { path, content: formatStructureDiffReport(data, reportFormat) })
+    } catch (e) { setReportError(`报告下载失败：${e}`) }
+  }
+  const reportExport = (dataAvailable: boolean) => dataAvailable && <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap', padding: '8px 10px', background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 8 }}>
+    <Download size={13} color="var(--accent)" />
+    <span style={{ fontSize: 12, color: 'var(--text-bright)', fontWeight: 600 }}>下载全部差异</span>
+    <select value={reportFormat} onChange={e => setReportFormat(e.target.value as typeof reportFormat)} style={{ background: 'var(--surface)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 6, padding: '4px 7px', fontSize: 11 }}>
+      <option value="md">Markdown</option><option value="txt">TXT</option><option value="json">JSON</option><option value="csv">CSV</option><option value="doc">Word（.doc）</option>
+    </select>
+    <button onClick={downloadReport} style={{ background: 'var(--accent)', color: '#fff', border: 0, borderRadius: 6, padding: '5px 10px', fontSize: 11, fontWeight: 600 }}>下载</button>
+    {reportError && <span style={{ color: 'var(--error)', fontSize: 11 }}>{reportError}</span>}
+  </div>
 
   function ConnSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
     return (
@@ -277,7 +341,7 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
 
   return createPortal(
     <>
-      <div className="cdlg-overlay" onMouseDown={onClose}>
+      {minimized ? <button onClick={() => setMinimized(false)} style={{ position: 'fixed', right: 24, bottom: 24, zIndex: 100001, display: 'flex', alignItems: 'center', gap: 8, padding: '11px 16px', borderRadius: 10, color: 'var(--text-bright)', background: 'var(--surface)', border: '1px solid var(--border)', boxShadow: '0 8px 24px rgba(0,0,0,.2)', cursor: 'pointer' }}><Maximize2 size={14} />恢复结构对比</button> : <div className="cdlg-overlay">
         <div
           className="cdlg-box"
           onMouseDown={e => e.stopPropagation()}
@@ -295,7 +359,8 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
             <Layers size={15} color="var(--accent)" />
             <span style={{ fontWeight: 600, color: 'var(--text-bright)', fontSize: 14 }}>结构对比</span>
             <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 2 }}>支持跨连接</span>
-            <button onClick={onClose} style={{ marginLeft: 'auto', color: 'var(--text-muted)', lineHeight: 0 }}><X size={15} /></button>
+            <button onClick={() => setMinimized(true)} title="收起到右下角，稍后可恢复" style={{ marginLeft: 'auto', color: 'var(--text-muted)', lineHeight: 0 }}><Minus size={15} /></button>
+            <button onClick={onClose} title="关闭" style={{ color: 'var(--text-muted)', lineHeight: 0 }}><X size={15} /></button>
           </div>
 
           {/* 配置区 */}
@@ -308,7 +373,7 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
                 </button>
               ))}
             </div>
-            {mode === 'schema' && <div style={sdLabel}>核验库默认定义与全部普通表；不含视图、存储程序、事件及权限。读取期间持有已捕获表的结构锁并复查表清单，不能阻止其他会话新建表；请暂停 DDL 后比对。结果仅反映本次读取。</div>}
+            {mode === 'schema' && <div style={sdLabel}>核验库默认定义与当前账号可见的普通表；不含视图、存储程序、事件及权限。读取期间持有已捕获表的结构锁并复查表清单，不能阻止其他会话新建表；请暂停 DDL 后比对。结果仅反映本次读取。</div>}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr auto 1fr', gap: 12, alignItems: 'center' }}>
               {/* 源（基准） */}
               <div style={sdCard}>
@@ -368,13 +433,14 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
             )}
             {currentSchemaDiff !== null && !hasSchemaDiff && (
               <div style={{ display: 'inline-flex', alignSelf: 'flex-start', alignItems: 'center', gap: 8, padding: '8px 14px', borderRadius: 8, background: 'rgba(22,163,74,0.10)', border: '1px solid rgba(22,163,74,0.30)', fontSize: 12.5, color: '#16a34a', fontWeight: 500 }}>
-                <CheckCircle2 size={15} strokeWidth={2.2} /> 本次读取的库默认定义、普通表清单及 {currentSchemaDiff.comparedTables} 张同名表定义一致（不含视图、存储程序和权限）
+                <CheckCircle2 size={15} strokeWidth={2.2} /> 本次读取的库默认定义及{currentSchemaDiff.comparisonScope}中的 {currentSchemaDiff.comparedTables} 张同名表定义一致（不含视图、存储程序和权限）
               </div>
             )}
           </div>
 
           {currentSchemaDiff !== null && hasSchemaDiff && (
             <div style={{ flex: 1, overflow: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 14 }}>
+              {reportExport(true)}
               {!currentSchemaDiff.databaseDefinition.identical && <section style={sdCard}>
                 <strong style={{ color: 'var(--text-bright)', fontSize: 12 }}>数据库默认定义不同（仅展示，不自动改写）</strong>
                 <span style={sdLabel}>源库原文</span><pre style={{ whiteSpace: 'pre-wrap', margin: 0, color: 'var(--text)', fontSize: 11 }}>{currentSchemaDiff.databaseDefinition.sourceDdl}</pre>
@@ -385,6 +451,7 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
                   ['目标缺表', currentSchemaDiff.missingTables.length, 'var(--success)'],
                   ['目标多表', currentSchemaDiff.extraTables.length, 'var(--error)'],
                   ['结构不同', currentSchemaDiff.changedTables.length, 'var(--warning)'],
+                  ['无法完整比对', currentSchemaDiff.uncomparableTables.length, 'var(--error)'],
                 ].map(([label, count, color]) => (
                   <div key={String(label)} style={{ ...sdCard, gap: 3 }}>
                     <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{label}</span>
@@ -418,19 +485,49 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
                             {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
                             <span style={{ fontWeight: 600 }}>{item.table}</span>
                             <span style={{ marginLeft: 'auto', color: 'var(--text-muted)', fontSize: 11 }}>
-                              +{item.diff.added.length} / -{item.diff.removed.length} / ~{item.diff.modified.length}
+                              +{item.diff.added.length} / -{item.diff.removed.length} / ~{item.diff.modified.length}{item.diff.tableOptions ? ` / ${item.diff.tableOptions.kind}` : ''}
                             </span>
                           </button>
                           {expanded && (
                             <div style={{ borderTop: '1px solid var(--border-subtle)', padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 7 }}>
+                              {item.diff.tableOptions && <div style={{ ...sdCard, gap: 5 }}>
+                                <strong style={{ fontSize: 12, color: 'var(--warning)' }}>{item.diff.tableOptions.kind}不同</strong>
+                                {item.diff.tableOptions.kind === '索引和约束' ? explainIndexDifference(item.diff.tableOptions.source, item.diff.tableOptions.target, item.table).map((line, index) => <div key={index} style={{ fontSize: 12, color: 'var(--text)' }}>{line}</div>) : <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                                  {(['source', 'target'] as const).map((side) => (
+                                    <div key={side} style={{ minWidth: 0 }}>
+                                      <div style={{ ...sdLabel, marginBottom: 5 }}>{side === 'source' ? '源端定义' : '目标端定义'}</div>
+                                      <pre style={{ margin: 0, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontFamily: 'var(--font-mono)', fontSize: 11, lineHeight: 1.6, color: 'var(--text)' }}>{item.diff.tableOptions![side] || '（无）'}</pre>
+                                    </div>
+                                  ))}
+                                </div>}
+                              </div>}
                               {item.diff.added.map(col => <div key={`a-${col.name}`}><span style={{ color: 'var(--success)', marginRight: 8 }}>新增</span><ColBadge col={col} /></div>)}
                               {item.diff.removed.map(col => <div key={`r-${col.name}`}><span style={{ color: 'var(--error)', marginRight: 8 }}>删除</span><ColBadge col={col} /></div>)}
-                              {item.diff.modified.map(change => <div key={`m-${change.name}`}><span style={{ color: 'var(--warning)', marginRight: 8 }}>修改</span><ColBadge col={change.after} /></div>)}
+                              {item.diff.modified.map(change => <div key={`m-${change.name}`} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                                <div><span style={{ color: 'var(--warning)', marginRight: 8 }}>修改</span><ColBadge col={change.after} /></div>
+                                <div style={{ paddingLeft: 36, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                                  <ColumnDefinitionDetails definition={change.beforeDefinition} />
+                                  <ColumnDefinitionDetails definition={change.afterDefinition} />
+                                </div>
+                              </div>)}
                             </div>
                           )}
                         </div>
                       )
                     })}
+                  </div>
+                </section>
+              )}
+              {currentSchemaDiff.uncomparableTables.length > 0 && (
+                <section>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--error)', marginBottom: 7 }}>无法完整比对的表（{currentSchemaDiff.uncomparableTables.length}）</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {currentSchemaDiff.uncomparableTables.map(item => (
+                      <div key={item.table} style={{ ...sdCard, gap: 4 }}>
+                        <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-bright)' }}>{item.table}</span>
+                        <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{item.reason}</span>
+                      </div>
+                    ))}
                   </div>
                 </section>
               )}
@@ -446,7 +543,13 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
           {/* 结果区：仅在有差异时展开滚动区 */}
           {currentDiff !== null && hasDiff && (
             <div style={{ flex: 1, overflow: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 16 }}>
+              {reportExport(true)}
                 <>
+                  {currentDiff.tableOptions && <section style={{ ...sdCard, gap: 6 }}>
+                    <strong style={{ fontSize: 12, color: 'var(--warning)' }}>{currentDiff.tableOptions.kind}不同</strong>
+                    {currentDiff.tableOptions.kind === '索引和约束' ? explainIndexDifference(currentDiff.tableOptions.source, currentDiff.tableOptions.target, dstTable).map((line, index) => <span key={index} style={{ fontSize: 12, color: 'var(--text)', fontFamily: line.startsWith('ALTER TABLE') ? 'var(--font-mono)' : undefined, overflowWrap: 'anywhere' }}>{line}</span>) : <><span style={sdLabel}>源：{currentDiff.tableOptions.source}</span><span style={sdLabel}>目标：{currentDiff.tableOptions.target}</span></>}
+                  </section>}
+                  {currentDiff.alterBlockReason && <div style={{ fontSize: 12, color: 'var(--warning)', background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 8, padding: '9px 12px' }}>{currentDiff.alterBlockReason}</div>}
                   {/* 新增列 (ADD COLUMN) */}
                   {currentDiff.added.length > 0 && (
                     <section>
@@ -501,13 +604,15 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
                           }}>
                             <span style={{ fontWeight: 600, color: 'var(--warning)', fontSize: 12 }}>{change.name}</span>
                             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                              <div>
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                                 <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 3 }}>目标当前</div>
                                 <ColBadge col={change.before} />
+                                <ColumnDefinitionDetails definition={change.beforeDefinition} />
                               </div>
-                              <div>
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                                 <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 3 }}>修改为（源）</div>
                                 <ColBadge col={change.after} />
+                                <ColumnDefinitionDetails definition={change.afterDefinition} />
                               </div>
                             </div>
                           </div>
@@ -566,7 +671,7 @@ export default function StructureDiffPanel({ connectionId, schema, table, onClos
             </div>
           )}
         </div>
-      </div>
+      </div>}
 
 
     </>,
