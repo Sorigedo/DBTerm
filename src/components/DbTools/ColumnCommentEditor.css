@@ -1,0 +1,13 @@
+.ctw-comment-cell { position: relative; min-width: 0; }
+.ctw-comment-cell > input { padding-right: 28px !important; }
+.ctw-comment-expand { position: absolute; right: 3px; top: 3px; width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; border: none; border-radius: 5px; background: var(--surface); color: var(--text-muted); cursor: pointer; }
+.ctw-comment-expand:hover { background: var(--surface-hover); color: var(--accent); }
+.ctw-comment-overlay { position: fixed; inset: 0; z-index: 8500; background: rgba(0,0,0,0.55); backdrop-filter: blur(6px); display: flex; align-items: center; justify-content: center; padding: 20px; }
+.ctw-comment-dialog { width: 560px; max-width: 100%; max-height: calc(100vh - 40px); overflow: auto; box-sizing: border-box; padding: 20px; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 14px; animation: slideUp 0.18s ease-out; }
+.ctw-comment-dialog header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; color: var(--text-bright); }
+.ctw-comment-dialog strong { overflow-wrap: anywhere; }
+.ctw-comment-dialog header button { display: flex; background: transparent; border: none; color: var(--text-muted); cursor: pointer; }
+.ctw-comment-dialog textarea { display: block; box-sizing: border-box; width: 100%; min-height: 180px; max-height: 50vh; resize: vertical; padding: 12px; border: 1px solid var(--border); border-radius: 8px; outline: none; background: var(--bg); color: var(--text); font: inherit; line-height: 1.6; }
+.ctw-comment-dialog textarea:focus { border-color: var(--accent); }
+.ctw-comment-dialog p { color: var(--text-muted); font-size: 12px; }
+.ctw-comment-dialog footer { display: flex; justify-content: flex-end; gap: 8px; }

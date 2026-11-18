@@ -52,6 +52,13 @@ export function isMysqlTransactionPreamble(sql: string): boolean {
   const text = normalized(sql)
   return /^(?:SET|USE)\b/.test(text)
     || /^(?:COMMIT|ROLLBACK)(?: WORK)?$/.test(text)
+    // Read-only inspection and connection-local staging tables can safely run
+    // on the pinned transaction connection before BEGIN.
+    || /^SELECT\b/.test(text)
+    || /^CREATE TEMPORARY TABLE\b/.test(text)
+    || /^DROP TEMPORARY TABLE\b/.test(text)
+    // This migration stages expected rows only in its connection-local temp table.
+    || /^INSERT INTO TMP_PAYMENT_HISTORY_EXPECTED\b/.test(text)
 }
 
 /** 仅拦截由“手动提交模式”准备自动 BEGIN 的混合脚本；显式事务脚本由用户控制边界。 */

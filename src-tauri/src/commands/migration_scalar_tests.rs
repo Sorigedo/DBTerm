@@ -318,3 +318,33 @@ async fn mysql_stream_zero_date_strict_failure_preserves_existing_target() {
         .await
         .unwrap();
 }
+
+
+#[tokio::test]
+#[ignore = "requires disposable local MySQL DBTERM_TEST_MYSQL_PORT"]
+async fn mysql_migration_metadata_decodes_all_text_and_preserves_safety_checks() {
+    let port: u16 = std::env::var("DBTERM_TEST_MYSQL_PORT").unwrap().parse().unwrap();
+    let config: ConnConfig = serde_json::from_value(serde_json::json!({
+        "id":"migration-metadata-test", "name":"disposable", "type":"mysql", "host":"127.0.0.1",
+        "port":port, "username":"root", "useSsl":false, "createdAt":0, "updatedAt":0
+    })).unwrap();
+    let (mut conn, _) = mysql_connect(&config, None).await.unwrap();
+    let db = format!("dbterm_metadata_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE {}", q_mysql(&db))).execute(&mut conn).await.unwrap();
+    let result = async {
+        sqlx::Executor::execute(&mut conn, sqlx::raw_sql(&format!("USE {}", q_mysql(&db)))).await.unwrap();
+        sqlx::query(include_str!("fixtures/mc_pos_settlement_company.sql")).execute(&mut conn).await.unwrap();
+        let columns = mysql_migration_column_safety(&mut conn, &db, "mc_pos_settlement_company").await?;
+        assert_eq!(columns.len(), 13);
+        assert_eq!(columns[0], ("id".into(), "bigint".into(), "auto_increment".into()));
+        assert_eq!(columns[1], ("plan_name".into(), "varchar".into(), "".into()));
+        assert!(columns.iter().all(|(_, typ, extra)| !super::super::mysql_migration_safety::unsupported_transfer_type(typ, extra)));
+        sqlx::query("CREATE TABLE unsafe_types (id int, payload blob, derived int GENERATED ALWAYS AS (id+1) STORED)").execute(&mut conn).await.unwrap();
+        let columns = mysql_migration_column_safety(&mut conn, &db, "unsafe_types").await?;
+        assert!(super::super::mysql_migration_safety::unsupported_transfer_type(&columns[1].1, &columns[1].2));
+        assert!(super::super::mysql_migration_safety::unsupported_transfer_type(&columns[2].1, &columns[2].2));
+        Ok::<(), String>(())
+    }.await;
+    sqlx::query(&format!("DROP DATABASE {}", q_mysql(&db))).execute(&mut conn).await.unwrap();
+    result.unwrap();
+}

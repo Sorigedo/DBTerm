@@ -1,15 +1,48 @@
 import type { ConnType } from '../../types'
 import { dialectFamily, qid, tableRef } from '../../utils/sqlDialect.ts'
 
-export interface IndexSpec { name: string; columns: string; unique: boolean; method: 'BTREE' | 'HASH' | 'FULLTEXT' | 'SPATIAL' | 'DEFAULT' }
+export interface IndexSpec { _id?: string; name: string; columns: string; unique: boolean; method: 'BTREE' | 'HASH' | 'FULLTEXT' | 'SPATIAL' | 'DEFAULT' }
 
-export function moveIndex<T extends { _id: string }>(indexes: T[], id: string, direction: -1 | 1): T[] {
-  const from = indexes.findIndex(index => index._id === id)
-  const to = from + direction
-  if (from < 0 || to < 0 || to >= indexes.length) return indexes
-  const next = [...indexes]
-  ;[next[from], next[to]] = [next[to], next[from]]
-  return next
+function originalMysqlIndexSuffix(ddl: string, name: string): string | null {
+  for (const rawLine of ddl.split(/\r?\n/)) {
+    const line = rawLine.trim().replace(/,$/, '')
+    const prefix = /^(?:(?:UNIQUE|FULLTEXT|SPATIAL)\s+)?(?:KEY|INDEX)\s+/i.exec(line)
+    if (!prefix) continue
+    let i = prefix[0].length
+    let found = ''
+    if (line[i] === '`') {
+      const start = ++i
+      while (i < line.length) {
+        if (line[i] === '`' && line[i + 1] === '`') { i += 2; continue }
+        if (line[i] === '`') break
+        i++
+      }
+      if (i >= line.length) continue
+      found = line.slice(start, i).replace(/``/g, '`')
+      i++
+    } else {
+      const start = i
+      while (i < line.length && !/\s|\(/.test(line[i])) i++
+      found = line.slice(start, i)
+    }
+    if (found.toLowerCase() !== name.toLowerCase()) continue
+    while (/\s/.test(line[i] ?? '')) i++
+    if (line[i] !== '(') return null
+    const columnsStart = i
+    let depth = 0, quote = ''
+    for (; i < line.length; i++) {
+      const ch = line[i]
+      if (quote) {
+        if (ch === quote && line[i + 1] === quote) i++
+        else if (ch === quote) quote = ''
+        else if (ch === '\\' && quote !== '`') i++
+      } else if (ch === "'" || ch === '"' || ch === '`') quote = ch
+      else if (ch === '(') depth++
+      else if (ch === ')' && --depth === 0) return line.slice(i + 1).replace(/\s+USING\s+(?:BTREE|HASH)\b/i, '').trim()
+    }
+    return line.slice(columnsStart).includes('(') ? null : null
+  }
+  return null
 }
 
 export interface MysqlTableOptionState {
@@ -56,43 +89,57 @@ function sameColumns(a: string, b: string): boolean {
 
 /** Existing indexes may carry prefix lengths, expressions and options absent from the summary. */
 export function validateMysqlExistingIndexEdits(indexes: IndexSpec[], originals: IndexSpec[]): string | null {
-  const currentByName = new Map(indexes.map(index => [index.name.toLowerCase(), index]))
+  const currentById = new Map(indexes.filter(i => i._id).map(i => [i._id!, i]))
+  const currentByName = new Map(indexes.map(i => [i.name.toLowerCase(), i]))
   for (const original of originals) {
-    const current = currentByName.get(original.name.toLowerCase())
-    if (!current || current.name !== original.name || current.columns !== original.columns
-      || current.unique !== original.unique || current.method !== original.method) {
-      return '现有索引的完整定义无法从摘要还原，请在 SQL 编辑器中修改原始 DDL'
+    if (original.columns.trim()) continue
+    const current = (original._id ? currentById.get(original._id) : undefined)
+      ?? currentByName.get(original.name.toLowerCase())
+    if (current && (current.name !== original.name || current.columns !== original.columns
+      || current.unique !== original.unique || current.method !== original.method)) {
+      return '复杂索引定义不能从摘要安全修改；可删除，修改请在 SQL 编辑器中操作'
     }
   }
-  // List order is a UI convenience only; MySQL has no persisted index position.
-  // New indexes may be appended without implying a rebuild of existing ones.
   return null
 }
 
-export function buildIndexAlterStatements(ct: ConnType, schema: string, table: string, indexes: IndexSpec[], origIndexes: IndexSpec[], ssSchema?: string): string[] {
+export function buildIndexAlterStatements(ct: ConnType, schema: string, table: string, indexes: IndexSpec[], origIndexes: IndexSpec[], ssSchema?: string, originalDdl = ''): string[] {
   const out: string[] = []
-  const oldByName = new Map(origIndexes.filter(i => i.name.trim()).map(i => [i.name.trim().toLowerCase(), i]))
+  const oldIndexes = origIndexes.filter(i => i.name.trim())
   indexes = indexes.map(i => !i.name.trim() && i.columns.trim() ? { ...i, name: 'idx_' + i.columns.split(',').map(s => s.trim()).filter(Boolean).join('_') } : i)
-  const curByName = new Map(indexes.filter(i => i.name.trim() && i.columns.trim()).map(i => [i.name.trim().toLowerCase(), i]))
   const fam = dialectFamily(ct)
   const changed = (a: IndexSpec, b: IndexSpec) => a.unique !== b.unique || !sameColumns(a.columns, b.columns) || a.method !== b.method
-  for (const [name, oldIdx] of oldByName) {
-    // FUNCTIONAL INDEX 的 COLUMN_NAME 为 NULL，数据字典无法表示其表达式；
-    // 不能把空列当作用户删除索引，否则无关的字段修改会删除唯一约束。
-    if (!oldIdx.columns.trim()) continue
-    const next = curByName.get(name)
-    if (!next || changed(next, oldIdx)) out.push(fam === 'mysql'
+  const matched = new Map<IndexSpec, IndexSpec>()
+  for (const oldIdx of oldIndexes) {
+    const next = (oldIdx._id && indexes.find(i => i._id === oldIdx._id))
+      ?? indexes.find(i => i.name.trim().toLowerCase() === oldIdx.name.trim().toLowerCase())
+    if (next) matched.set(oldIdx, next)
+  }
+  for (const oldIdx of oldIndexes) {
+    const next = matched.get(oldIdx)
+    if (!next) {
+      out.push(fam === 'mysql'
+        ? `  DROP INDEX ${qid(ct, oldIdx.name.trim())}`
+        : `DROP INDEX ${qid(ct, oldIdx.name.trim())};`)
+      continue
+    }
+    // FUNCTIONAL INDEX 的 COLUMN_NAME 为 NULL；保留时不重建，明确删除时仍可按名称删除。
+    if (!oldIdx.columns.trim() && next.name === oldIdx.name && next.columns === oldIdx.columns
+      && next.unique === oldIdx.unique && next.method === oldIdx.method) continue
+    if (next.name !== oldIdx.name || changed(next, oldIdx)) out.push(fam === 'mysql'
       ? `  DROP INDEX ${qid(ct, oldIdx.name.trim())}`
       : `DROP INDEX ${qid(ct, oldIdx.name.trim())};`)
   }
-  for (const [name, idx] of curByName) {
-    const oldIdx = oldByName.get(name)
-    if (oldIdx && !oldIdx.columns.trim()) continue
-    if (!oldIdx || changed(idx, oldIdx)) {
+  for (const idx of indexes.filter(i => i.name.trim())) {
+    if (!idx.columns.trim()) continue
+    const oldIdx = [...matched.entries()].find(([, current]) => current === idx)?.[0]
+    if (!oldIdx || idx.name !== oldIdx.name || changed(idx, oldIdx)) {
       const colsSql = idx.columns.split(',').map(s => s.trim()).filter(Boolean).map(s => qid(ct, s)).join(', ')
       if (fam === 'mysql') {
         const using = idx.method === 'HASH' ? ' USING HASH' : ''
-        out.push(`  ADD ${idx.method === 'FULLTEXT' ? 'FULLTEXT INDEX' : idx.method === 'SPATIAL' ? 'SPATIAL INDEX' : idx.unique ? 'UNIQUE INDEX' : 'INDEX'} ${qid(ct, idx.name.trim())} (${colsSql})${using}`)
+        const suffix = oldIdx ? originalMysqlIndexSuffix(originalDdl, oldIdx.name) : ''
+        if (oldIdx && suffix === null) throw new Error(`无法从原始 DDL 读取索引 ${oldIdx.name}，已停止生成 ALTER`)
+        out.push(`  ADD ${idx.method === 'FULLTEXT' ? 'FULLTEXT INDEX' : idx.method === 'SPATIAL' ? 'SPATIAL INDEX' : idx.unique ? 'UNIQUE INDEX' : 'INDEX'} ${qid(ct, idx.name.trim())} (${colsSql})${using}${suffix ? ' ' + suffix : ''}`)
       } else {
         out.push(`CREATE ${idx.unique ? 'UNIQUE ' : ''}INDEX ${qid(ct, idx.name.trim())} ON ${tableRef(ct, schema, table, ssSchema)} (${colsSql});`)
       }

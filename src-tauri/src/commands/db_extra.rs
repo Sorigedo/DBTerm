@@ -591,6 +591,8 @@ pub struct ColumnChange {
     pub name:   String,
     pub before: ColumnInfo,
     pub after:  ColumnInfo,
+    pub before_definition: Option<String>,
+    pub after_definition: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -601,6 +603,16 @@ pub struct StructureDiff {
     pub modified:     Vec<ColumnChange>,
     pub alter_sql:    String,
     pub danger_drops: Vec<String>, // DROP COLUMN 列名，前端高亮警告
+    pub table_options: Option<TableOptionsDiff>,
+    pub alter_block_reason: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableOptionsDiff {
+    pub kind: String,
+    pub source: String,
+    pub target: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1862,13 +1874,13 @@ async fn mysql_copy_table_atomic(
     sqlx::Executor::execute(&mut source, sqlx::raw_sql("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")).await
         .map_err(|e| format!("建立复制源快照失败: {e}"))?;
     // Keep source metadata fixed on a separate connection; target DDL cannot implicitly commit this lock.
-    super::query::mysql_require_atomic_table(&mut source, &schema, src_table).await?;
+    mysql_validate_live_table(&mut source, &schema, src_table, copy_data, false).await?;
     let self_refs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND REFERENCED_TABLE_SCHEMA=TABLE_SCHEMA AND REFERENCED_TABLE_NAME=TABLE_NAME")
         .bind(&schema).bind(src_table).fetch_one(&mut source).await.map_err(|e| e.to_string())?;
     if self_refs > 0 { return Err("源表含自引用外键，无法保证改名后定义一致，已拒绝复制".into()); }
     let source_sql_mode: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut source).await.map_err(|e| format!("读取复制源会话模式失败: {e}"))?;
     let raw = mysql_read_ddl(&mut source, &src).await?;
-    let meta = sqlx::query("SELECT COLUMN_NAME,EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION")
+    let meta = sqlx::query("SELECT CAST(COLUMN_NAME AS CHAR CHARACTER SET utf8mb4),CAST(EXTRA AS CHAR CHARACTER SET utf8mb4) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION")
         .bind(&schema).bind(src_table).fetch_all(&mut source).await.map_err(|e| format!("读取完整源字段失败: {e}"))?;
     let mut columns = Vec::new();
     let mut digest_columns = Vec::new();
@@ -1898,7 +1910,7 @@ async fn mysql_copy_table_atomic(
     create_mysql_verified(&mut target, &expected_ddl, &stage, &stage_name).await?;
     let prepared: Result<u64, String> = async {
         sqlx::Executor::execute(&mut target, sqlx::raw_sql("START TRANSACTION")).await.map_err(|e| format!("开启复制写事务失败: {e}"))?;
-        super::query::mysql_require_atomic_table(&mut target, &schema, &stage_name).await?;
+        mysql_validate_live_table(&mut target, &schema, &stage_name, copy_data, false).await?;
         let n = if copy_data {
             let list = columns.iter().map(|c| q_mysql(c)).collect::<Vec<_>>().join(",");
             let result = sqlx::query(&tag_sql(&format!("INSERT INTO {stage} ({list}) SELECT {list} FROM {src}")))
@@ -3698,9 +3710,6 @@ async fn mysql_schema_compare_read(conn: &mut sqlx::mysql::MySqlConnection, sche
     let kind: String = sqlx::query_scalar("SELECT CAST(TABLE_TYPE AS CHAR) FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?")
         .bind(schema).bind(table).fetch_one(&mut *conn).await.map_err(|e| e.to_string())?;
     if kind != "BASE TABLE" { return Err("完整表结构对比不支持视图".into()); }
-    let visible: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM information_schema.USER_PRIVILEGES WHERE GRANTEE=CONCAT(CHAR(39),REPLACE(CURRENT_USER(),'@',CONCAT(CHAR(39),'@',CHAR(39))),CHAR(39)) AND PRIVILEGE_TYPE='TRIGGER') OR EXISTS(SELECT 1 FROM information_schema.SCHEMA_PRIVILEGES WHERE GRANTEE=CONCAT(CHAR(39),REPLACE(CURRENT_USER(),'@',CONCAT(CHAR(39),'@',CHAR(39))),CHAR(39)) AND TABLE_SCHEMA=? AND PRIVILEGE_TYPE='TRIGGER') OR EXISTS(SELECT 1 FROM information_schema.TABLE_PRIVILEGES WHERE GRANTEE=CONCAT(CHAR(39),REPLACE(CURRENT_USER(),'@',CONCAT(CHAR(39),'@',CHAR(39))),CHAR(39)) AND TABLE_SCHEMA=? AND TABLE_NAME=? AND PRIVILEGE_TYPE='TRIGGER')")
-        .bind(schema).bind(schema).bind(table).fetch_one(&mut *conn).await.map_err(|e| format!("检查触发器可见性失败: {e}"))?;
-    if visible == 0 { return Err("无法完整核验触发器，需要目标表、数据库或全局直接 TRIGGER 权限，已拒绝声称结构一致".into()); }
     let triggers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA=? AND EVENT_OBJECT_TABLE=?")
         .bind(schema).bind(table).fetch_one(&mut *conn).await.map_err(|e| e.to_string())?;
     if triggers != 0 { return Err("表存在触发器，当前完整结构对比尚未覆盖触发器定义，已拒绝声称完全一致或生成部分同步 SQL".into()); }
@@ -3763,9 +3772,25 @@ fn mysql_structure_diff_from_definition(
     target_sql_mode: &str,
 ) -> Result<StructureDiff, String> {
     let sf=1; let mut mysql_definitions=None;
+    let mut table_options = None;
+    let mut alter_block_reason = None;
     if sf == 1 {
-        if mysql_table_signature(&source_ddl, &src_table, &cols_src)? != mysql_table_signature(&target_ddl, &dst_table, &cols_dst)? {
-            return Err("表索引、约束或表选项存在差异；当前结构对比器不能安全生成完整 ALTER，已拒绝显示为一致或执行不完整 SQL".into());
+        let (source_indexes, source_options) = mysql_table_index_and_options(&source_ddl, &src_table, &cols_src)?;
+        let (target_indexes, target_options) = mysql_table_index_and_options(&target_ddl, &dst_table, &cols_dst)?;
+        let mut table_definition_diffs = Vec::new();
+        if source_indexes != target_indexes {
+            table_definition_diffs.push(TableOptionsDiff { kind: "索引和约束".into(), source: source_indexes, target: target_indexes });
+        }
+        if normalize_mysql_table_options(&source_options) != normalize_mysql_table_options(&target_options) {
+            table_definition_diffs.push(TableOptionsDiff { kind: "表选项".into(), source: source_options, target: target_options });
+        }
+        if !table_definition_diffs.is_empty() {
+            table_options = Some(TableOptionsDiff {
+                kind: table_definition_diffs.iter().map(|d| d.kind.as_str()).collect::<Vec<_>>().join("、"),
+                source: table_definition_diffs.iter().map(|d| format!("【{}】\n{}", d.kind, d.source)).collect::<Vec<_>>().join("\n\n"),
+                target: table_definition_diffs.iter().map(|d| format!("【{}】\n{}", d.kind, d.target)).collect::<Vec<_>>().join("\n\n"),
+            });
+            alter_block_reason = Some("索引、约束或表选项不同。已继续显示列级差异；因当前 ALTER 生成器尚未同步这些表级定义，已禁用部分 SQL。".to_string());
         }
         mysql_definitions = Some((source_ddl, target_ddl));
         let common_source: Vec<String> = cols_src.iter().filter(|s| cols_dst.iter().any(|d| d.name.eq_ignore_ascii_case(&s.name)))
@@ -3811,6 +3836,8 @@ fn mysql_structure_diff_from_definition(
                     name:   col_src.name.clone(),
                     before: col_dst.clone(), // dst 当前状态
                     after:  col_src.clone(), // src 目标状态
+                    before_definition: mysql_definitions.as_ref().map(|(_, target)| mysql_column_definition(target, &col_dst.name).map(str::to_string)).transpose()?,
+                    after_definition: mysql_definitions.as_ref().map(|(source, _)| mysql_column_definition(source, &col_src.name).map(str::to_string)).transpose()?,
                 });
             }
         } else {
@@ -3841,11 +3868,11 @@ fn mysql_structure_diff_from_definition(
                 parts.push(format!("MODIFY COLUMN {}", mysql_column_definition(&source_ddl, &ch.name)?));
             }
             for col in &removed { parts.push(format!("DROP COLUMN {}", q_mysql(&col.name))); }
-            if parts.is_empty() { String::new() } else { format!("-- 目标会话前置条件：@@SESSION.sql_mode = '{target_sql_mode}'；请先核验，禁止在转义规则不同的会话直接执行\nALTER TABLE {target}\n  {};", parts.join(",\n  ")) }
+            if parts.is_empty() || table_options.is_some() { String::new() } else { format!("-- 目标会话前置条件：@@SESSION.sql_mode = '{target_sql_mode}'；请先核验，禁止在转义规则不同的会话直接执行\nALTER TABLE {target}\n  {};", parts.join(",\n  ")) }
 
     };
 
-    Ok(StructureDiff { added, removed, modified, alter_sql, danger_drops })
+    Ok(StructureDiff { added, removed, modified, alter_sql, danger_drops, table_options, alter_block_reason })
 }
 
 // ── 11. db_migrate_table ──────────────────────────────────────────────────────
@@ -4131,6 +4158,21 @@ async fn migrate_same_engine(
     })
 }
 
+// Preflight and the locked source session must decode the same metadata.
+async fn mysql_migration_column_safety(
+    conn: &mut sqlx::MySqlConnection, schema: &str, table: &str,
+) -> Result<Vec<(String, String, String)>, String> {
+    use sqlx::Row;
+    let rows = sqlx::query("SELECT CAST(COLUMN_NAME AS CHAR CHARACTER SET utf8mb4), CAST(DATA_TYPE AS CHAR CHARACTER SET utf8mb4), CAST(EXTRA AS CHAR CHARACTER SET utf8mb4) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION")
+        .bind(schema).bind(table).fetch_all(conn).await
+        .map_err(|e| format!("读取源字段安全信息失败: {e}"))?;
+    rows.iter().map(|row| Ok((
+        row.try_get(0).map_err(|e| format!("解析源字段名失败: {e}"))?,
+        row.try_get(1).map_err(|e| format!("解析源类型失败: {e}"))?,
+        row.try_get(2).map_err(|e| format!("解析源字段属性失败: {e}"))?,
+    ))).collect()
+}
+
 #[tauri::command]
 pub async fn db_migrate_table(
     src_id:     String,
@@ -4275,16 +4317,11 @@ pub async fn db_migrate_table(
                 if self_refs > 0 { return Err("源表包含自引用外键，改名复制会改变引用关系，已中止迁移".into()); }
             }
         }
-        let columns = sqlx::query("SELECT COLUMN_NAME, DATA_TYPE, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=?")
-            .bind(source_schema).bind(&src_table).fetch_all(&mut source_conn).await
-            .map_err(|e| format!("读取源字段安全信息失败: {e}"))?;
+        let columns = mysql_migration_column_safety(&mut source_conn, source_schema, &src_table).await?;
         if columns.is_empty() { return Err("源表不存在或无法读取完整元数据，已中止迁移".into()); }
         if do_data {
-            for column in columns {
-                let typ: String = column.try_get(1).map_err(|e| format!("解析源类型失败: {e}"))?;
-                let extra: String = column.try_get(2).map_err(|e| format!("解析源字段属性失败: {e}"))?;
+            for (name, typ, extra) in columns {
                 if super::mysql_migration_safety::unsupported_transfer_type(&typ, &extra) {
-                    let name: String = column.try_get(0).unwrap_or_default();
                     return Err(format!("字段 {name}（{typ} / {extra}）尚不支持无损数据传输，已在修改目标前中止；可单独复制表结构"));
                 }
             }
@@ -4375,11 +4412,8 @@ pub async fn db_migrate_table(
                     if self_refs > 0 { return Err("源表存在自引用外键，原样定义无法经暂存重命名保持引用，已在修改目标前中止".into()); }
                 }
                 if do_data {
-                    let columns = sqlx::query("SELECT DATA_TYPE,EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=?")
-                        .bind(&schema_q).bind(&src_table).fetch_all(&mut src_conn).await.map_err(|e| e.to_string())?;
-                    for c in columns {
-                        let typ: String = c.try_get(0).map_err(|e| e.to_string())?;
-                        let extra: String = c.try_get(1).map_err(|e| e.to_string())?;
+                    let columns = mysql_migration_column_safety(&mut src_conn, &schema_q, &src_table).await?;
+                    for (_, typ, extra) in columns {
                         if super::mysql_migration_safety::unsupported_transfer_type(&typ, &extra) {
                             return Err(format!("实际源字段类型无法无损传输（{typ}/{extra}），已在修改目标前中止"));
                         }
@@ -4553,7 +4587,7 @@ pub async fn db_migrate_table(
             } else { src_schema.clone() };
             if !schema_q.is_empty() {
                 if let Ok(type_rows) = sqlx::query(
-                    "SELECT COLUMN_NAME, COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION"
+                    "SELECT CAST(COLUMN_NAME AS CHAR CHARACTER SET utf8mb4), CAST(COLUMN_TYPE AS CHAR CHARACTER SET utf8mb4) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION"
                 ).bind(&schema_q).bind(&src_table).fetch_all(&mut conn).await {
                     meta_names = type_rows.iter().filter_map(|r| r.try_get::<String, _>(0).ok()).collect();
                     col_types  = type_rows.iter().filter_map(|r| r.try_get::<String, _>(1).ok()).collect();
@@ -5822,11 +5856,60 @@ fn mysql_export_database_ddl(raw: &str, schema: &str) -> Result<String, String> 
     Ok(format!("CREATE DATABASE IF NOT EXISTS {}{rest}", q_mysql(schema)))
 }
 
-fn mysql_table_signature(raw: &str, table: &str, columns: &[ColumnInfo]) -> Result<String, String> {
+fn mysql_table_index_and_options(raw: &str, table: &str, columns: &[ColumnInfo]) -> Result<(String, String), String> {
     let normalized = mysql_apply_ddl(raw, table, "`__DBTERM_TABLE__`")?;
-    let column_lines: std::collections::HashSet<String> = columns.iter().map(|c| format!("  {} ", q_mysql(&c.name))).collect();
-    Ok(normalized.lines().filter(|line| !column_lines.iter().any(|prefix| line.starts_with(prefix)))
-        .collect::<Vec<_>>().join("\n"))
+    let column_prefixes: Vec<String> = columns.iter().map(|c| format!("  {} ", q_mysql(&c.name))).collect();
+    let body = normalized.lines().filter(|line| !column_prefixes.iter().any(|prefix| line.starts_with(prefix)))
+        .collect::<Vec<_>>().join("\n");
+    let (index_block, options) = body.split_once("\n) ")
+        .ok_or_else(|| "SHOW CREATE TABLE 缺少表选项分界，已停止结构比较".to_string())?;
+    // The first remaining line is the CREATE TABLE wrapper. Keep only the
+    // actual index/constraint clauses so the UI can explain them directly.
+    let indexes = index_block.split_once('\n').map(|(_, clauses)| clauses).unwrap_or("");
+    // InnoDB's ordinary PRIMARY/UNIQUE/KEY indexes use BTREE by default.
+    // Treat an explicit `USING BTREE` as the same definition so SHOW CREATE
+    // formatting differences do not produce a false structure mismatch.
+    let mut indexes = indexes.lines().map(|line| {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("PRIMARY KEY") || trimmed.starts_with("UNIQUE KEY") || trimmed.starts_with("KEY ") {
+            line.replace(" USING BTREE", "")
+        } else { line.to_string() }
+    }).map(|line| line.trim().trim_end_matches(',').to_string()).filter(|line| !line.is_empty()).collect::<Vec<_>>();
+    // MySQL does not persist a meaningful position between ordinary indexes.
+    // Compare definitions as a set, while keeping each index's column order intact.
+    indexes.sort();
+    let last = indexes.len().saturating_sub(1);
+    let indexes = indexes.into_iter().enumerate().map(|(i, line)| {
+        if i < last { format!("{line},") } else { line }
+    }).collect::<Vec<_>>().join("\n");
+    Ok((indexes, options.to_string()))
+}
+
+fn normalize_mysql_table_options(options: &str) -> String {
+    // AUTO_INCREMENT is the next generated id counter, not table structure.
+    // SHOW CREATE normally emits AUTO_INCREMENT=N, but tolerate case and
+    // whitespace variants so server/proxy formatting cannot create a false diff.
+    let mut tokens = options.split_whitespace().peekable();
+    let mut kept = Vec::new();
+    while let Some(token) = tokens.next() {
+        let upper = token.to_ascii_uppercase();
+        if upper.starts_with("AUTO_INCREMENT=") || upper == "AUTO_INCREMENT" {
+            if upper == "AUTO_INCREMENT" {
+                if tokens.peek().is_some_and(|next| *next == "=") { tokens.next(); }
+                if tokens.peek().is_some_and(|next| next.chars().all(|c| c.is_ascii_digit())) { tokens.next(); }
+            }
+            continue;
+        }
+        kept.push(token);
+    }
+    // ROW_FORMAT is a storage/layout choice. MySQL may emit it explicitly on
+    // one server and omit it on another while both tables have the same
+    // logical definition. It is intentionally outside structure-diff scope.
+    kept
+        .into_iter()
+        .filter(|token| !token.to_ascii_uppercase().starts_with("ROW_FORMAT="))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 async fn create_mysql_verified(
@@ -5922,13 +6005,122 @@ mod mysql_ddl_fidelity_tests {
             "`s` varchar(24) DEFAULT 'x' INVISIBLE",
         ] {
             let other = base.replace("`s` varchar(24) DEFAULT 'x'", definition);
-            assert_eq!(super::mysql_table_signature(base, "t", std::slice::from_ref(&col)).unwrap(),
-                super::mysql_table_signature(&other, "t", std::slice::from_ref(&col)).unwrap());
+            assert_eq!(super::mysql_table_index_and_options(base, "t", std::slice::from_ref(&col)).unwrap(),
+                super::mysql_table_index_and_options(&other, "t", std::slice::from_ref(&col)).unwrap());
             assert_ne!(super::mysql_column_definition(base, "s").unwrap(), super::mysql_column_definition(&other, "s").unwrap());
         }
         let other = base.replace("DEFAULT CHARSET=utf8mb4", "DEFAULT CHARSET=latin1");
-        assert_ne!(super::mysql_table_signature(base, "t", std::slice::from_ref(&col)).unwrap(),
-            super::mysql_table_signature(&other, "t", &[col]).unwrap());
+        assert_ne!(super::mysql_table_index_and_options(base, "t", std::slice::from_ref(&col)).unwrap(),
+            super::mysql_table_index_and_options(&other, "t", &[col]).unwrap());
+    }
+
+    #[test]
+    fn structure_diff_treats_explicit_btree_as_default_for_innodb_indexes() {
+        let source = "CREATE TABLE `t` (\n  `id` bigint NOT NULL,\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `uk_id` (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        let target = source.replace("PRIMARY KEY (`id`)", "PRIMARY KEY (`id`) USING BTREE")
+            .replace("UNIQUE KEY `uk_id` (`id`)", "UNIQUE KEY `uk_id` (`id`) USING BTREE");
+        let col = crate::models::ColumnInfo { name: "id".into(), data_type: "bigint".into(), nullable: false, key: "PRI".into(), default_value: None };
+        assert_eq!(super::mysql_table_index_and_options(source, "t", std::slice::from_ref(&col)).unwrap(),
+            super::mysql_table_index_and_options(&target, "t", std::slice::from_ref(&col)).unwrap());
+    }
+
+    #[test]
+    fn structure_diff_ignores_index_clause_position_but_keeps_column_order() {
+        let source = "CREATE TABLE `t` (\n  `a` int NOT NULL,\n  `b` int NOT NULL,\n  KEY `idx_a` (`a`),\n  UNIQUE KEY `uk_ba` (`b`,`a`)\n) ENGINE=InnoDB";
+        let reordered = "CREATE TABLE `t` (\n  `a` int NOT NULL,\n  `b` int NOT NULL,\n  UNIQUE KEY `uk_ba` (`b`,`a`),\n  KEY `idx_a` (`a`)\n) ENGINE=InnoDB";
+        let changed_column_order = reordered.replace("(`b`,`a`)", "(`a`,`b`)");
+        let columns = [
+            crate::models::ColumnInfo { name: "a".into(), data_type: "int".into(), nullable: false, key: String::new(), default_value: None },
+            crate::models::ColumnInfo { name: "b".into(), data_type: "int".into(), nullable: false, key: String::new(), default_value: None },
+        ];
+        let source_parts = super::mysql_table_index_and_options(source, "t", &columns).unwrap();
+        let reordered_parts = super::mysql_table_index_and_options(reordered, "t", &columns).unwrap();
+        let changed_parts = super::mysql_table_index_and_options(&changed_column_order, "t", &columns).unwrap();
+        assert_eq!(source_parts, reordered_parts);
+        assert_ne!(source_parts, changed_parts);
+    }
+
+    #[test]
+    fn structure_diff_reports_field_collation_in_before_and_after_definitions() {
+        let source = "CREATE TABLE `t` (\n  `pos_no` varchar(24) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4".to_string();
+        let target = "CREATE TABLE `t` (\n  `pos_no` varchar(24) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4".to_string();
+        let column = crate::models::ColumnInfo { name: "pos_no".into(), data_type: "varchar(24)".into(), nullable: false, key: String::new(), default_value: None };
+        let diff = super::mysql_structure_diff_from_definition(
+            vec![column.clone()], source, "t", vec![column], target, "db", "t", "",
+        ).unwrap();
+        assert_eq!(diff.modified.len(), 1);
+        assert!(diff.modified[0].before_definition.as_deref().unwrap().contains("COLLATE utf8mb4_bin"));
+        assert!(diff.modified[0].after_definition.as_deref().unwrap().contains("COLLATE utf8mb4_0900_ai_ci"));
+        assert!(diff.alter_sql.contains("COLLATE utf8mb4_0900_ai_ci"));
+    }
+
+    #[test]
+    fn structure_diff_compares_columns_when_only_table_default_collation_differs() {
+        let source = "CREATE TABLE `mc_app_menu` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT COMMENT '主键',\n  `menu_no` varchar(24) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '业务标识',\n  PRIMARY KEY (`id`) USING BTREE,\n  UNIQUE KEY `uk_menu_no` (`menu_no`) USING BTREE\n) ENGINE=InnoDB AUTO_INCREMENT=131 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='菜单'".to_string();
+        let target = "CREATE TABLE `mc_app_menu` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT COMMENT '主键',\n  `menu_no` varchar(24) NOT NULL COMMENT '业务标识',\n  PRIMARY KEY (`id`) USING BTREE,\n  UNIQUE KEY `uk_menu_no` (`menu_no`) USING BTREE\n) ENGINE=InnoDB AUTO_INCREMENT=131 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci ROW_FORMAT=DYNAMIC COMMENT='菜单'".to_string();
+        let id = crate::models::ColumnInfo { name: "id".into(), data_type: "bigint unsigned".into(), nullable: false, key: "PRI".into(), default_value: None };
+        let menu_no = crate::models::ColumnInfo { name: "menu_no".into(), data_type: "varchar(24)".into(), nullable: false, key: "UNI".into(), default_value: None };
+        let diff = super::mysql_structure_diff_from_definition(
+            vec![id.clone(), menu_no.clone()], source, "mc_app_menu",
+            vec![id, menu_no], target, "sql_maychi_test", "mc_app_menu", "",
+        ).unwrap();
+        assert_eq!(diff.modified.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["menu_no"]);
+        let options = diff.table_options.expect("表默认排序规则差异需要显示");
+        assert!(options.source.contains("COLLATE=utf8mb4_unicode_ci"));
+        assert!(options.target.contains("COLLATE=utf8mb4_0900_ai_ci"));
+        assert!(diff.alter_sql.is_empty(), "表选项尚未纳入完整 ALTER 时不能输出部分 SQL");
+        assert!(diff.alter_block_reason.is_some());
+    }
+
+    #[test]
+    fn mysql_table_options_ignore_auto_increment_runtime_counter_only() {
+        assert_eq!(super::normalize_mysql_table_options("ENGINE=InnoDB AUTO_INCREMENT=131 DEFAULT CHARSET=utf8mb4"),
+                   super::normalize_mysql_table_options("ENGINE=InnoDB AUTO_INCREMENT=999 DEFAULT CHARSET=utf8mb4"));
+        assert_ne!(super::normalize_mysql_table_options("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"),
+                   super::normalize_mysql_table_options("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"));
+        assert_eq!(super::normalize_mysql_table_options("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"),
+                   super::normalize_mysql_table_options("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=COMPACT"));
+        assert_eq!(super::normalize_mysql_table_options("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"),
+                   super::normalize_mysql_table_options("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"));
+        assert_eq!(super::normalize_mysql_table_options("ENGINE=InnoDB AUTO_INCREMENT = 3 DEFAULT CHARSET=utf8mb4"),
+                   super::normalize_mysql_table_options("ENGINE=InnoDB AUTO_INCREMENT = 1025 DEFAULT CHARSET=utf8mb4"));
+    }
+
+    #[test]
+    fn structure_diff_ignores_only_auto_increment_value_in_full_table_ddl() {
+        let source = "CREATE TABLE `mc_business_owner` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT COMMENT '主键'\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci ROW_FORMAT=DYNAMIC COMMENT='商务负责人主数据表，记录内部维护运营商关系的商务/运营人员'".to_string();
+        let target = "CREATE TABLE `mc_business_owner` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT COMMENT '主键'\n) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci ROW_FORMAT=DYNAMIC COMMENT='商务负责人主数据表，记录内部维护运营商关系的商务/运营人员'".to_string();
+        let diff = super::mysql_structure_diff_from_definition(
+            vec![], source, "mc_business_owner", vec![], target,
+            "sql_maychi_test", "mc_business_owner", "",
+        ).unwrap();
+        assert!(diff.table_options.is_none(), "AUTO_INCREMENT 运行时计数不能成为表选项差异");
+        assert!(diff.alter_sql.is_empty(), "不能为 AUTO_INCREMENT 计数变化生成结构同步 SQL");
+    }
+
+    #[test]
+    fn structure_diff_ignores_runtime_counter_and_row_format_but_keeps_column_definition_changes() {
+        let source = "CREATE TABLE `mc_device_online` (\n  `device_no` varchar(24) NOT NULL COMMENT '终端业务编号：BOARD=mc_device.device_no, PAX=mc_device_pos.pos_no',\n  `client_id` varchar(128) NOT NULL DEFAULT '' COMMENT 'MQTT clientId（AWS 端为 IMEI 或 pos_sn）'\n) ENGINE=InnoDB AUTO_INCREMENT=1025 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci".to_string();
+        let target = "CREATE TABLE `mc_device_online` (\n  `device_no` varchar(24) NOT NULL COMMENT '当前柜体或POS编号；离柜BOARD为NULL',\n  `client_id` varchar(128) NOT NULL COMMENT '物理终端MQTT clientId；旧空值为NULL'\n) ENGINE=InnoDB AUTO_INCREMENT=17 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci ROW_FORMAT=DYNAMIC".to_string();
+        let cols = |default_value: Option<&str>| crate::models::ColumnInfo {
+            name: "unused".into(), data_type: "varchar(128)".into(), nullable: false,
+            key: String::new(), default_value: default_value.map(str::to_string),
+        };
+        let source_cols = vec![
+            crate::models::ColumnInfo { name: "device_no".into(), data_type: "varchar(24)".into(), nullable: false, key: String::new(), default_value: None },
+            { let mut c = cols(Some("")); c.name = "client_id".into(); c },
+        ];
+        let target_cols = vec![
+            crate::models::ColumnInfo { name: "device_no".into(), data_type: "varchar(24)".into(), nullable: false, key: String::new(), default_value: None },
+            { let mut c = cols(None); c.name = "client_id".into(); c },
+        ];
+        let diff = super::mysql_structure_diff_from_definition(
+            source_cols, source, "mc_device_online", target_cols, target,
+            "db", "mc_device_online", "",
+        ).unwrap();
+        assert_eq!(diff.modified.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["device_no", "client_id"]);
+        assert!(diff.table_options.is_none(), "AUTO_INCREMENT/ROW_FORMAT 不应造成表级差异");
+        assert!(!diff.alter_sql.is_empty(), "字段定义差异应生成 ALTER TABLE");
     }
 
     #[test]
@@ -6632,7 +6824,11 @@ async fn mysql_validate_live_table(conn: &mut sqlx::mysql::MySqlConnection, sche
     if kind != "BASE TABLE" || require_innodb && engine.as_deref() != Some("InnoDB") {
         return Err("实际表不满足普通表/InnoDB 安全条件，已拒绝迁移".into());
     }
-    super::query::mysql_require_atomic_table(conn, schema, table).await?;
+    // Copy/migration needs the permissions for its actual SQL, not TRIGGER administration.
+    // Hold source MDL and validate visible triggers; invisible triggers cannot be ruled out.
+    let qualified = mysql_qualified(schema, table);
+    sqlx::query(&format!("SELECT * FROM {qualified} LIMIT 0")).execute(&mut *conn).await
+        .map_err(|e| format!("读取表元数据失败: {e}"))?;
     let triggers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA=? AND EVENT_OBJECT_TABLE=?")
         .bind(schema).bind(table).fetch_one(&mut *conn).await.map_err(|e| e.to_string())?;
     if triggers > 0 { return Err("实际表存在触发器，已拒绝迁移以保护数据".into()); }

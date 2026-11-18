@@ -502,13 +502,16 @@ fn push_csv_cell(out: &mut String, s: &str) {
 }
 
 fn push_tsv_cell(out: &mut String, s: &str) {
-    for ch in s.chars() {
-        if matches!(ch, '\t' | '\n' | '\r') {
-            out.push(' ');
-        } else {
+    // Use the same quoted-field convention as the CSV/TSV importer.
+    // Replacing embedded separators or line breaks with spaces changes data.
+    if s.contains('\t') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        out.push('"');
+        for ch in s.chars() {
+            if ch == '"' { out.push('"'); }
             out.push(ch);
         }
-    }
+        out.push('"');
+    } else { out.push_str(s); }
 }
 
 fn push_md_cell(out: &mut String, s: &str) {
@@ -818,6 +821,7 @@ enum MySqlExportCellKind {
     Date,
     DateTime,
     MySqlTime,
+    Json,
     Text,
     Bytes,
     UncheckedText,
@@ -843,7 +847,8 @@ fn mysql_export_cell_kinds(columns: &[sqlx::mysql::MySqlColumn]) -> Vec<MySqlExp
             "DATETIME" | "TIMESTAMP" => MySqlExportCellKind::DateTime,
             "TIME" => MySqlExportCellKind::MySqlTime,
             "CHAR" | "VARCHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT"
-            | "ENUM" | "SET" | "JSON" => MySqlExportCellKind::Text,
+            | "ENUM" | "SET" => MySqlExportCellKind::Text,
+            "JSON" => MySqlExportCellKind::Json,
             "BINARY" | "VARBINARY" | "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB"
             | "BIT" => MySqlExportCellKind::Bytes,
             "DECIMAL" | "NEWDECIMAL" => MySqlExportCellKind::UncheckedText,
@@ -868,6 +873,10 @@ fn mysql_export_cell(row: &sqlx::mysql::MySqlRow, i: usize, kind: MySqlExportCel
         MySqlExportCellKind::Date => row.try_get::<Option<chrono::NaiveDate>, _>(i).ok().flatten().map(|v| v.to_string()),
         MySqlExportCellKind::DateTime => row.try_get_unchecked::<Option<chrono::NaiveDateTime>, _>(i).ok().flatten().map(|v| v.to_string()),
         MySqlExportCellKind::MySqlTime => row.try_get::<Option<sqlx::mysql::types::MySqlTime>, _>(i).ok().flatten().map(|v| v.to_string()),
+        // Native JSON has its own protocol type: String/Vec type checks reject it.
+        // Decode its UTF-8 text directly, without parsing into floating-point JSON
+        // values (which would round high-precision decimals or large integers).
+        MySqlExportCellKind::Json => row.try_get_unchecked::<Option<String>, _>(i).ok().flatten(),
         MySqlExportCellKind::Text => row.try_get::<Option<String>, _>(i).ok().flatten()
             .or_else(|| row.try_get::<Option<Vec<u8>>, _>(i).ok().flatten().and_then(|b| String::from_utf8(b).ok())),
         MySqlExportCellKind::Bytes => row.try_get::<Option<Vec<u8>>, _>(i).ok().flatten()
@@ -3021,6 +3030,49 @@ mod archive_tests {
 
     #[tokio::test]
     #[ignore = "requires DBTERM_EXPORT_TEST_URL pointing at disposable MySQL"]
+    async fn mysql_json_export_round_trips_csv_sql_and_xlsx_without_number_rounding() {
+        use sqlx::{Connection, Row};
+        let mut conn=sqlx::mysql::MySqlConnection::connect(&std::env::var("DBTERM_EXPORT_TEST_URL").unwrap()).await.unwrap();
+        sqlx::query("CREATE TEMPORARY TABLE dbterm_json_src(id INT PRIMARY KEY, extra JSON)").execute(&mut conn).await.unwrap();
+        sqlx::query("CREATE TEMPORARY TABLE dbterm_json_dst LIKE dbterm_json_src").execute(&mut conn).await.unwrap();
+        let documents=[Some(r#"{"中文":"逗号,引号\"换行\n反斜杠\\","large":18446744073709551615,"decimal":0.12345678901234567890123456789}"#),Some("null"),None,Some(r#"[true,false,{},[],"",0]"#),Some(r#""字符串""#),Some("18446744073709551615")];
+        for (id,document) in documents.iter().enumerate() {
+            sqlx::query("INSERT INTO dbterm_json_src VALUES(?,CAST(? AS JSON))").bind(id as i32).bind(document).execute(&mut conn).await.unwrap();
+        }
+        let rows=sqlx::query("SELECT id,extra,CAST(extra AS CHAR CHARACTER SET utf8mb4) AS expected FROM dbterm_json_src ORDER BY id").fetch_all(&mut conn).await.unwrap();
+        let mut writer=RowWriter::Csv {sep:b','};
+        let columns=vec!["id".into(),"extra".into()];
+        let mut csv=String::new();
+        writer.write_header_to(&mut csv,&columns).unwrap();
+        for row in &rows {
+            let values=mysql_export_values_checked(row).expect("valid native JSON must export");
+            let expected:Option<String>=row.try_get(2).unwrap();
+            assert_eq!(values[1],expected,"preserve exact server JSON text, including decimal digits");
+            writer.write_row_to(&mut csv,&columns,&values[..2]).unwrap();
+            let kinds=mysql_export_cell_kinds(row.columns());
+            match mysql_xlsx_cell(row,1,kinds[1]).unwrap() {
+                Some(XlsxCell::Text(actual))=>assert_eq!(Some(actual),expected),
+                None=>assert!(expected.is_none()),
+                _=>panic!("JSON must remain text in Excel"),
+            }
+            let sql=mysql_sql_values(row).expect("JSON must also export as SQL");
+            sqlx::query(&format!("INSERT INTO dbterm_json_dst VALUES({},{})",sql[0],sql[1])).execute(&mut conn).await.unwrap();
+        }
+        let records=csv::Reader::from_reader(csv.as_bytes()).records().collect::<Result<Vec<_>,_>>().unwrap();
+        assert_eq!(records.len(),documents.len());
+        for (row,record) in rows.iter().zip(records) {
+            let expected:Option<String>=row.try_get(2).unwrap();
+            assert_eq!(&record[1],expected.as_deref().unwrap_or(""));
+        }
+        let source:Vec<Option<String>>=sqlx::query_scalar("SELECT CAST(extra AS CHAR CHARACTER SET utf8mb4) FROM dbterm_json_src ORDER BY id").fetch_all(&mut conn).await.unwrap();
+        let target:Vec<Option<String>>=sqlx::query_scalar("SELECT CAST(extra AS CHAR CHARACTER SET utf8mb4) FROM dbterm_json_dst ORDER BY id").fetch_all(&mut conn).await.unwrap();
+        assert_eq!(source,target);
+        assert_eq!(source[1].as_deref(),Some("null"));
+        assert_eq!(source[2],None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBTERM_EXPORT_TEST_URL pointing at disposable MySQL"]
     async fn mysql_tabular_exports_never_silently_turn_decode_errors_into_null() {
         use sqlx::{Connection,Row};
         let url=std::env::var("DBTERM_EXPORT_TEST_URL").unwrap();
@@ -3042,6 +3094,83 @@ mod archive_tests {
         let kinds=mysql_export_cell_kinds(row.columns());
         assert_eq!(mysql_export_cell_checked(&row,0,kinds[0]).unwrap().as_deref(),Some("2026"));
         assert_eq!(mysql_export_cell_checked(&row,1,kinds[1]).unwrap().as_deref(),Some("-1"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable MySQL DBTERM_EXPORT_TEST_URL"]
+    async fn mysql_export_format_matrix_reads_back_typed_values() {
+        use sqlx::{Connection, Row, Column};
+        use calamine::Reader;
+        let mut conn=sqlx::mysql::MySqlConnection::connect(&std::env::var("DBTERM_EXPORT_TEST_URL").unwrap()).await.unwrap();
+        sqlx::query("CREATE TEMPORARY TABLE dbterm_format_matrix (id INT PRIMARY KEY, ti TINYINT, si SMALLINT, mi MEDIUMINT, bi BIGINT, ui BIGINT UNSIGNED, deci DECIMAL(40,20), f FLOAT, d DOUBLE, txt LONGTEXT, raw LONGBLOB, bits BIT(64), dt DATETIME(6), day DATE, tm TIME(6), yr YEAR, e ENUM('','a,b','中文'), s SET('a','b'), extra JSON, empty_text TEXT, null_text TEXT)").execute(&mut conn).await.unwrap();
+        let text="中文😀,引号\"\t制表符\n换行\r\n反斜杠\\|管道 <tag> _x0041_";
+        let raw=vec![0u8,255,65,10,13,9];
+        sqlx::query("INSERT INTO dbterm_format_matrix VALUES(1,-128,-32768,-8388608,-9223372036854775808,18446744073709551615,12345678901234567890.12345678901234567890,1.25,-1.5e100,?,?,18446744073709551615,'2024-02-29 12:34:56.123456','2024-02-29','-837:59:59.123456',2026,'a,b','a,b',JSON_OBJECT('中文','a,b'),'',NULL)").bind(text).bind(&raw).execute(&mut conn).await.unwrap();
+        sqlx::query("INSERT INTO dbterm_format_matrix(id) VALUES(2)").execute(&mut conn).await.unwrap();
+        let rows=sqlx::query("SELECT * FROM dbterm_format_matrix ORDER BY id").fetch_all(&mut conn).await.unwrap();
+        let columns=rows[0].columns().iter().map(|c|c.name().to_string()).collect::<Vec<_>>();
+        let values=rows.iter().map(mysql_export_values_checked).collect::<Result<Vec<_>,_>>().unwrap();
+        let cell=|name:&str|values[0][columns.iter().position(|c|c==name).unwrap()].as_deref().unwrap();
+        assert_eq!(cell("bi"),"-9223372036854775808");
+        assert_eq!(cell("ui"),"18446744073709551615");
+        assert_eq!(cell("deci"),"12345678901234567890.12345678901234567890");
+        assert_eq!(cell("txt"),text);
+        assert_eq!(cell("raw"),"0x00ff410a0d09");
+        assert_eq!(cell("bits"),"0xffffffffffffffff");
+        assert_eq!(cell("dt"),"2024-02-29 12:34:56.123456");
+        assert_eq!(cell("tm"),"-837:59:59.123456");
+        assert_eq!(cell("e"),"a,b");
+        assert_eq!(cell("s"),"a,b");
+        for sep in [b',',b'\t'] {
+            let mut out=String::new();
+            let mut writer=RowWriter::Csv {sep};
+            writer.write_header_to(&mut out,&columns).unwrap();
+            for row in &values {writer.write_row_to(&mut out,&columns,row).unwrap();}
+            let mut reader=csv::ReaderBuilder::new().delimiter(sep).from_reader(out.as_bytes());
+            assert_eq!(reader.headers().unwrap().iter().collect::<Vec<_>>(),columns.iter().map(String::as_str).collect::<Vec<_>>());
+            let records=reader.records().collect::<Result<Vec<_>,_>>().unwrap();
+            assert_eq!(records.len(),values.len());
+            for (record,row) in records.iter().zip(&values) {for (actual,expected) in record.iter().zip(row) {assert_eq!(actual,expected.as_deref().unwrap_or(""));}}
+        }
+        for mut writer in [RowWriter::Json {wrote_any:false},RowWriter::Jsonl] {
+            let lines=matches!(writer,RowWriter::Jsonl);
+            let mut out=String::new();writer.write_header_to(&mut out,&columns).unwrap();
+            for row in &values {writer.write_row_to(&mut out,&columns,row).unwrap();}
+            writer.write_finish_to(&mut out);
+            let objects:Vec<serde_json::Value>=if lines {out.lines().map(|line|serde_json::from_str(line).unwrap()).collect()} else {serde_json::from_str(&out).unwrap()};
+            assert_eq!(objects.len(),values.len());
+            for (object,row) in objects.iter().zip(&values) {for (column,expected) in columns.iter().zip(row) {assert_eq!(&object[column],&expected.as_ref().map(|v|serde_json::Value::String(v.clone())).unwrap_or(serde_json::Value::Null));}}
+        }
+        let path=std::env::temp_dir().join(format!("{}.xlsx",unique_id("format-matrix")));
+        let mut writer=XlsxWriter::new(std::fs::File::create(&path).unwrap()).unwrap();
+        writer.write_header(&columns.iter().map(|c|Some(c.clone())).collect::<Vec<_>>()).unwrap();
+        for row in &rows {let kinds=mysql_export_cell_kinds(row.columns());let cells=(0..kinds.len()).map(|i|mysql_xlsx_cell(row,i,kinds[i])).collect::<Result<Vec<_>,_>>().unwrap();writer.write_row_cells(&cells).unwrap();}
+        writer.finish().unwrap();
+        let mut workbook:calamine::Xlsx<_>=calamine::open_workbook(&path).unwrap();
+        let range=workbook.worksheet_range_at(0).unwrap().unwrap();
+        for (r,row) in values.iter().enumerate() {for (c,expected) in row.iter().enumerate() {
+            let actual=range.get_value(((r+1) as u32,c as u32)).unwrap_or(&calamine::Data::Empty);
+            match actual {calamine::Data::String(v)=>assert_eq!(Some(v),expected.as_ref(),"xlsx {r}/{c}"),calamine::Data::Float(v)=>assert_eq!(*v,expected.as_ref().unwrap().parse::<f64>().unwrap()),calamine::Data::Int(v)=>assert_eq!(*v,expected.as_ref().unwrap().parse::<i64>().unwrap()),calamine::Data::Empty=>assert!(expected.is_none()),other=>panic!("unexpected Excel cell {other:?}")}
+        }}
+        drop(workbook);std::fs::remove_file(path).unwrap();
+        let mut md=RowWriter::Md;let mut out=String::new();md.write_header_to(&mut out,&columns).unwrap();for row in &values {md.write_row_to(&mut out,&columns,row).unwrap();}
+        assert_eq!(out.lines().count(),4,"Markdown retains one physical row per record");
+        assert!(out.contains("12345678901234567890.12345678901234567890"));
+        assert!(out.contains("\\|管道"));
+    }
+
+    #[test]
+    fn tsv_export_preserves_tabs_newlines_quotes_and_unicode_when_read_back() {
+        let columns=vec!["id".into(),"value".into()];
+        let original="中文\t引号\"\n第二行\r\n结束";
+        let mut writer=RowWriter::Csv {sep:b'\t'};
+        let mut out=String::new();
+        writer.write_header_to(&mut out,&columns).unwrap();
+        writer.write_row_to(&mut out,&columns,&[Some("1".into()),Some(original.into())]).unwrap();
+        let mut reader=csv::ReaderBuilder::new().delimiter(b'\t').from_reader(out.as_bytes());
+        let rows=reader.records().collect::<Result<Vec<_>,_>>().unwrap();
+        assert_eq!(rows.len(),1);
+        assert_eq!(&rows[0][1],original);
     }
 
     #[test]

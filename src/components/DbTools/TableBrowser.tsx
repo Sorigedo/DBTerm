@@ -20,6 +20,7 @@ import { displayShortcutStr, SHORTCUT_DEFS } from '../../utils/shortcuts'
 import { useShortcuts } from '../../utils/useShortcuts'
 import { useWheelScroll } from '../../utils/wheelScroll'
 import { isMysqlFamily, supportsMyMaintenance, supportsOptimizeTable, checkTableSql, isSqlite, qid, tableRef as dialectTableRef, buildIndexSql } from '../../utils/sqlDialect'
+import { normalizeMysqlDdlForDisplay } from '../../utils/mysqlDdlDisplay'
 import { queueTableExport } from '../../utils/exportTasks'
 import { tableDataLiteral } from './tableDataSql'
 import { insertTableDrafts } from './tableDrafts'
@@ -930,7 +931,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, ss
 
       if (tab === 'ddl') {
         const ddl = await invoke<string>('get_table_ddl', { id: connectionId, schema, table, ...(ssSchema ? { ssSchema } : {}) })
-        setDetailDdl(ddl)
+        setDetailDdl(isMy ? normalizeMysqlDdlForDisplay(ddl) : ddl)
       } else if (tab === 'cols') {
         let sql: string
         if (isMy) {
@@ -1633,6 +1634,7 @@ export default function TableBrowser({ connectionId, connType, schema, table, ss
                 {/* 草稿（新增）行 */}
                 {draftRows.map((draft, di) => (
                   <tr key={`draft-${di}`} className="tb-tr tb-tr--draft">
+                    <td className="tb-td tb-td--rownum tb-td--gutter" />
                     <td className="tb-td tb-td--ops">
                       <button className="tb-draft-del" disabled={committing||draftBlocked} data-tip="移除此行" onClick={() => removeDraft(di)}>
                         <Trash2 size={11} />

@@ -51,6 +51,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::db_export::db_stream_export,
             commands::db_extra::db_logical_backup,
+            commands::db_extra::db_migrate_table,
+            commands::db_extra::db_copy_table,
             commands::query::get_table_ddl,
             commands::query::execute_query,
             commands::query::table_columns,

@@ -19,6 +19,9 @@ export function sameObj(a: DbObjRef | null, b: DbObjRef | null): boolean {
 }
 
 interface DbClipboardState {
+  /** 最近点击的目标库，独立于已选中和已复制的源对象。 */
+  pasteTarget: { connectionId: string; schema: string } | null
+  setPasteTarget: (target: { connectionId: string; schema: string }) => void
   /** 当前选中的对象（用于高亮 + Mod+C 复制目标），全局唯一 */
   selected: DbObjRef | null
   /** 已复制到内部剪贴板的对象（用于库内粘贴/迁移），与系统剪贴板的对象名同步设置 */
@@ -33,6 +36,8 @@ interface DbClipboardState {
 }
 
 export const useDbClipboard = create<DbClipboardState>((set) => ({
+  pasteTarget: null,
+  setPasteTarget: (pasteTarget) => set({ pasteTarget }),
   selected: null,
   clipboard: null,
   clipboardTables: [],

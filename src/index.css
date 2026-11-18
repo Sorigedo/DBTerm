@@ -6769,6 +6769,11 @@ body.column-dragging .table-peek__table th:hover { background: var(--surface-2);
    导致超长内容撑高后被父级 overflow:hidden 裁掉且无法滚动；强制撑满父级修复 */
 .object-editor__cm > .cm-theme { height: 100%; min-height: 0; }
 .object-editor__cm .cm-editor { height: 100%; font-size: var(--font-size); }
+.object-editor__cm .cm-content,
+.sql-editor-wrap .cm-content {
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+}
 /* 与查询页一致：内容/行号跟随代码字体，亮色下背景融入 surface */
 .object-editor__cm .cm-content,
 .object-editor__cm .cm-gutters { font-family: var(--font-mono); }
@@ -11352,7 +11357,7 @@ body.resizing {
 .cf-hint { font-size: 11px; color: var(--text-muted); }
 
 /* ── 新建表向导 (CreateTableWizard) ─────────────────────────── */
-.ctw-modal { width: 960px; max-width: 96vw; height: 80vh; display: flex; flex-direction: column; }
+.ctw-modal { width: min(1180px, 94vw); max-width: 94vw; height: min(660px, 80vh); display: flex; flex-direction: column; }
 .ctw-modal input { -webkit-text-security: none; }
 
 .ctw-head {
@@ -11392,6 +11397,17 @@ body.resizing {
   grid-template-columns: 1.2fr 1fr 70px 46px 46px 1fr 1fr 140px 68px;
   gap: 2px; align-items: center;
 }
+.ctw-grid--mysql { grid-template-columns: minmax(130px, 1.2fr) 112px 56px 40px 40px minmax(140px, 1fr) minmax(130px, 1.4fr) 168px 126px 68px; min-width: 1100px; }
+/* 字段内容仅在当前单元格内省略，不能撑开网格或覆盖相邻列。 */
+.ctw-field-scroll .ctw-grid > * { min-width: 0; }
+.ctw-field-scroll .ctw-grid--row input:not([type]) { height: 28px; text-overflow: ellipsis; }
+.ctw-field-scroll .ctw-grid--row input:not([type]) { border-color: var(--border); background: var(--surface); border-radius: 7px; }
+.ctw-field-scroll .ctw-grid--row:hover input:not([type]) { border-color: var(--border); }
+.ctw-field-scroll .ctw-grid--row input:not([type]):focus { border-color: var(--accent); }
+.ctw-field-scroll .ctw-default-cell { min-width: 0; }
+.ctw-field-scroll .ctw-default-cell > input { width: 0; height: 28px; }
+.ctw-field-scroll .ctw-default-back { height: 28px; }
+.ctw-inapplicable { padding: 0 10px; color: var(--text-muted); }
 .ctw-grid--idx {
   grid-template-columns: 1fr 2fr 46px 100px 40px;
 }
@@ -11407,7 +11423,7 @@ body.resizing {
 .ctw-grid--head span.c, .ctw-grid--head span:last-child { text-align: center; }
 
 /* 字段 tab 专用滚动容器（header 置于同一容器内，用 sticky 避免滚动条宽度错位） */
-.ctw-field-scroll { flex: 1; overflow-y: auto; }
+.ctw-field-scroll { flex: 1; min-width: 0; overflow: auto; }
 /* 索引/外键 tab 继续使用 ctw-rows */
 .ctw-rows { flex: 1; overflow-y: auto; padding: 0; }
 .ctw-grid--row {

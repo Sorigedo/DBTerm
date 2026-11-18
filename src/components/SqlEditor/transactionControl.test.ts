@@ -26,12 +26,18 @@ test('does not mistake blocks, savepoints or unsupported engines for top-level c
   assert.equal(transactionControlStatement('BEGIN TRANSACTION', 'clickHouse'), null)
 })
 
-test('only mysql session setup statements are accepted as transaction preamble', () => {
+test('mysql transaction preamble allows session setup, read-only inspection and temporary tables', () => {
   assert.equal(isMysqlTransactionPreamble('-- variables\nSET @parent_id := 1'), true)
   assert.equal(isMysqlTransactionPreamble('USE `app_db`'), true)
   assert.equal(isMysqlTransactionPreamble('ROLLBACK'), true)
   assert.equal(isMysqlTransactionPreamble('COMMIT WORK'), true)
-  assert.equal(isMysqlTransactionPreamble('SELECT @parent_id'), false)
+  assert.equal(isMysqlTransactionPreamble('SELECT @parent_id'), true)
+  assert.equal(isMysqlTransactionPreamble('DROP TEMPORARY TABLE IF EXISTS tmp_source'), true)
+  assert.equal(isMysqlTransactionPreamble('CREATE TEMPORARY TABLE tmp_source LIKE mc_order_payment'), true)
+  assert.equal(isMysqlTransactionPreamble('INSERT INTO tmp_payment_history_expected (id) SELECT id FROM tmp_payment_history_source'), true)
+  assert.equal(isMysqlTransactionPreamble('INSERT INTO mc_order_payment (id) SELECT id FROM tmp_payment_history_expected'), false)
+  assert.equal(isMysqlTransactionPreamble('CREATE TABLE permanent_table (id INT)'), false)
+  assert.equal(isMysqlTransactionPreamble('INSERT INTO permanent_table VALUES (1)'), false)
   assert.equal(isMysqlTransactionPreamble('UPDATE t SET value = 1'), false)
 })
 
@@ -62,6 +68,29 @@ COMMIT;`
   assert.equal(statements.length, 6)
   assert.deepEqual(statements.map(s => transactionControlStatement(s, 'mysql')), [null, null, 'begin', null, null, 'commit'])
   assert.equal(statements.slice(0, 2).every(isMysqlTransactionPreamble), true)
+})
+
+test('payment history script preamble is all deferred onto the transaction connection', () => {
+  const sql = `SET @payment_from_id = NULL;
+SET @payment_to_id = NULL;
+SELECT DATABASE() AS target_database, VERSION() AS mysql_version;
+SELECT MIN(id) AS min_session_id, MAX(id) AS max_session_id, COUNT(*) AS historical_sessions FROM mc_order_session;
+DROP TEMPORARY TABLE IF EXISTS tmp_payment_history_source;
+DROP TEMPORARY TABLE IF EXISTS tmp_payment_history_expected;
+CREATE TEMPORARY TABLE tmp_payment_history_expected LIKE mc_order_payment;
+CREATE TEMPORARY TABLE tmp_payment_history_source ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci AS SELECT x.* FROM source x;
+SET @payment_range_invalid = 1;
+START TRANSACTION;
+INSERT INTO mc_order_payment (operation_no) SELECT operation_no FROM tmp_payment_history_expected;
+SELECT ROW_COUNT() AS inserted_rows;
+ROLLBACK;`
+  const statements = splitSqlStatements(sql, 'mysql')
+  const controls = statements.map(s => transactionControlStatement(s, 'mysql'))
+  const beginIndex = controls.indexOf('begin')
+
+  assert.ok(beginIndex > 0)
+  assert.ok(statements.slice(0, beginIndex).every(isMysqlTransactionPreamble))
+  assert.deepEqual(controls.slice(beginIndex), ['begin', null, null, 'rollback'])
 })
 
 test('explicit mysql transaction may mix temporary-table DDL and DML', () => {

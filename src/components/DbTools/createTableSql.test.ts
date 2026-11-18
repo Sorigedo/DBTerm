@@ -1,41 +1,54 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildIndexAlterStatements, moveIndex, validateMysqlExistingIndexEdits } from './createTableSql.ts'
+import { buildIndexAlterStatements, validateMysqlExistingIndexEdits } from './createTableSql.ts'
 
 const uniqueIndex = { name: 'g_barcode', columns: 'g_barcode', unique: true, method: 'BTREE' as const }
 
-test('moving an index changes its position without changing other indexes', () => {
-  const indexes = [
-    { ...uniqueIndex, _id: 'a' },
-    { ...uniqueIndex, name: 'idx_b', _id: 'b' },
-    { ...uniqueIndex, name: 'idx_c', _id: 'c' },
-  ]
-  assert.deepEqual(moveIndex(indexes, 'b', 1).map(index => index._id), ['a', 'c', 'b'])
-  assert.deepEqual(moveIndex(indexes, 'a', -1), indexes)
-})
-
-test('existing MySQL index cannot be rebuilt from its incomplete metadata summary', () => {
-  assert.match(validateMysqlExistingIndexEdits([{ ...uniqueIndex, unique: false }], [uniqueIndex]) ?? '', /原始 DDL/)
-  assert.match(validateMysqlExistingIndexEdits([], [uniqueIndex]) ?? '', /原始 DDL/)
+test('existing MySQL index changes are no longer blocked when source DDL is available', () => {
+  assert.equal(validateMysqlExistingIndexEdits([{ ...uniqueIndex, unique: false }], [uniqueIndex]), null)
+  assert.equal(validateMysqlExistingIndexEdits([], [uniqueIndex]), null)
   assert.equal(validateMysqlExistingIndexEdits([uniqueIndex, { ...uniqueIndex, name: 'new_idx' }], [uniqueIndex]), null)
 })
 
-test('moving existing indexes is allowed and does not generate index DDL', () => {
-  const a = { ...uniqueIndex, _id: 'a' }
-  const b = { ...uniqueIndex, name: 'idx_b', _id: 'b' }
-  const moved = moveIndex([a, b], 'b', -1)
-  assert.equal(validateMysqlExistingIndexEdits(moved, [a, b]), null)
-  assert.deepEqual(buildIndexAlterStatements('mysql', 'db', 't', moved, [a, b]), [])
+test('deleting an existing index emits only DROP INDEX and allows save', () => {
+  assert.equal(validateMysqlExistingIndexEdits([], [uniqueIndex]), null)
+  assert.deepEqual(buildIndexAlterStatements('mysql', 'db', 't', [], [uniqueIndex]), [
+    '  DROP INDEX `g_barcode`',
+  ])
+})
+
+test('deleting an existing index with unrepresented expression columns is safe', () => {
+  const functional = { ...uniqueIndex, name: 'uk_expression', columns: '' }
+  assert.equal(validateMysqlExistingIndexEdits([], [functional]), null)
+  assert.deepEqual(buildIndexAlterStatements('mysql', 'db', 't', [], [functional]), [
+    '  DROP INDEX `uk_expression`',
+  ])
+})
+
+test('unrepresented expression index is preserved when another index is added', () => {
+  const functional = { ...uniqueIndex, name: 'uk_expression', columns: '' }
+  assert.deepEqual(buildIndexAlterStatements('mysql', 'db', 't', [functional, { ...uniqueIndex, name: 'idx_new' }], [functional]), [
+    '  ADD UNIQUE INDEX `idx_new` (`g_barcode`)',
+  ])
 })
 
 test('changing a mysql index from unique to non-unique produces executable alter clauses', () => {
   const clauses = buildIndexAlterStatements('mysql', 'historical_prod', 'xmg_goods_store_list', [
     { ...uniqueIndex, unique: false },
-  ], [uniqueIndex])
+  ], [uniqueIndex], undefined, "CREATE TABLE `xmg_goods_store_list` (\n  UNIQUE KEY `g_barcode` (`g_barcode`)\n) ENGINE=InnoDB")
 
   assert.deepEqual(clauses, [
     '  DROP INDEX `g_barcode`',
     '  ADD INDEX `g_barcode` (`g_barcode`)',
+  ])
+})
+
+test('editing a MySQL index preserves original suffix options while changing its columns', () => {
+  const current = { ...uniqueIndex, columns: 'tenant_id, g_barcode', unique: false }
+  const ddl = "CREATE TABLE `t` (\n  `g_barcode` varchar(24),\n  `tenant_id` bigint,\n  UNIQUE KEY `g_barcode` (`g_barcode`) USING BTREE COMMENT 'kept' INVISIBLE\n) ENGINE=InnoDB"
+  assert.deepEqual(buildIndexAlterStatements('mysql', 'db', 't', [current], [uniqueIndex], undefined, ddl), [
+    '  DROP INDEX `g_barcode`',
+    "  ADD INDEX `g_barcode` (`tenant_id`, `g_barcode`) COMMENT 'kept' INVISIBLE",
   ])
 })
 
@@ -47,7 +60,7 @@ test('unchanged indexes do not make table ddl dirty', () => {
 })
 
 test('clearing an explicit BTREE method creates an ALTER that omits USING', () => {
-  assert.deepEqual(buildIndexAlterStatements('mysql', 'db', 't', [{ ...uniqueIndex, method: 'DEFAULT' }], [uniqueIndex]), [
+  assert.deepEqual(buildIndexAlterStatements('mysql', 'db', 't', [{ ...uniqueIndex, method: 'DEFAULT' }], [uniqueIndex], undefined, "CREATE TABLE `t` (\n  UNIQUE KEY `g_barcode` (`g_barcode`) USING BTREE\n) ENGINE=InnoDB"), [
     '  DROP INDEX `g_barcode`',
     '  ADD UNIQUE INDEX `g_barcode` (`g_barcode`)',
   ])
@@ -67,11 +80,7 @@ test('unrepresented functional index is not dropped by an unrelated table edit',
 
 test('unrepresented functional index cannot be replaced by a regular index through metadata guesswork', () => {
   const functionalIndex = { name: 'uk_pos_settlement_plan_code', columns: '', unique: true, method: 'BTREE' as const }
-  assert.deepEqual(
-    buildIndexAlterStatements('mysql', 'b', 'mc_pos_settlement_company',
-      [{ ...functionalIndex, columns: 'plan_code' }], [functionalIndex]),
-    [],
-  )
+  assert.match(validateMysqlExistingIndexEdits([{ ...functionalIndex, columns: 'plan_code' }], [functionalIndex]) ?? '', /复杂索引/)
 })
 
 test('all mysql-family engines emit ALTER clauses for removing a regular index', () => {

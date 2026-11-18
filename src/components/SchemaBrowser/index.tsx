@@ -1,3 +1,4 @@
+import { getActiveRegion } from '../../utils/activeRegion'
 import { useState, useEffect, useLayoutEffect, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import {
@@ -34,6 +35,7 @@ import CreateTableWizard from '../DbTools/CreateTableWizard'
 import ViewWizard from '../DbTools/ViewWizard'
 import RoutineWizard from '../DbTools/RoutineWizard'
 import { openEditObject, prettyViewDdl, prettyRoutineDdl } from '../../utils/objectEditor'
+import { normalizeMysqlDdlForDisplay } from '../../utils/mysqlDdlDisplay'
 import { qid, tableRef, supportsShowStatements, supportsMyMaintenance, supportsOptimizeTable, checkTableSql, previewSelect, buildIndexSql, MIGRATABLE_DB_TYPES } from '../../utils/sqlDialect'
 import { toolsFor } from '../DbTools/dbToolsCatalog'
 import { useDbToolsStore } from '../../stores/dbToolsStore'
@@ -767,7 +769,9 @@ export default function SchemaBrowser({ connectionId, connType, schema, category
         } else {
           const ddl = await invoke<string>('get_table_ddl', { id: connectionId, schema, table: tableName })
           // 视图：清洗为 CREATE OR REPLACE VIEW ... AS + 格式化 SELECT（与编辑页一致）
-          setDetailDdl(category === 'views' ? await prettyViewDdl(ddl, connType, schema, tableName) : ddl)
+          setDetailDdl(category === 'views'
+            ? await prettyViewDdl(ddl, connType, schema, tableName)
+            : ['mysql', 'mariadb', 'tidb', 'oceanBase'].includes(connType) ? normalizeMysqlDdlForDisplay(ddl) : ddl)
         }
       } else if (activeTab === 'cols') {
         if (supportsShowStatements(connType)) {
@@ -847,14 +851,14 @@ export default function SchemaBrowser({ connectionId, connType, schema, category
   // Mod+C 复制 / Mod+V 粘贴：用 document 捕获监听，不依赖网格焦点。
   // 之前用网格 onKeyDown，同库粘贴后列表刷新会令网格失焦 → 第二次 Mod+V 收不到（「只能粘一次」）。
   // 捕获阶段先于库树的 document 冒泡监听运行，命中即标记事件，库树看到标记便让位。
-  const kbdRef = useRef({ selected, sorted, doCopyHere, doCopyManyHere, doPasteHere })
-  kbdRef.current = { selected, sorted, doCopyHere, doCopyManyHere, doPasteHere }
+  const kbdRef = useRef({ active, selected, sorted, doCopyHere, doCopyManyHere, doPasteHere })
+  kbdRef.current = { active, selected, sorted, doCopyHere, doCopyManyHere, doPasteHere }
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey)) return
       const k = e.key.toLowerCase()
       if (k !== 'c' && k !== 'v') return
-      if (!rootRef.current?.offsetParent) return  // 本预览页不可见 → 不处理
+      if (!kbdRef.current.active || !rootRef.current?.offsetParent || getActiveRegion() === 'sidebar') return
       const ae = document.activeElement as HTMLElement | null
       // 焦点在输入/编辑器 → 让位；焦点在左侧库树 → 交给库树
       if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable

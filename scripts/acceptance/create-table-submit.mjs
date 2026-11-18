@@ -1,0 +1,60 @@
+// Real React form with mocked IPC; no database writes.
+import assert from 'node:assert/strict';
+import {fileURLToPath} from 'node:url';
+import {createServer} from 'vite';
+import react from '@vitejs/plugin-react';
+const {chromium}=await import(process.env.DBTERM_PLAYWRIGHT_MODULE||'playwright');
+const root=fileURLToPath(new URL('../../',import.meta.url));
+const entry="import React from 'react';import {createRoot} from 'react-dom/client';import Wizard from '/src/components/DbTools/CreateTableWizard.tsx';import '/src/index.css';createRoot(document.getElementById('root')).render(React.createElement(Wizard,{connectionId:'fixture',connType:'mysql',schema:'sql_cron',onClose:()=>window.closedWizard=true,onDone:()=>window.savedWizard=true}));";
+const server=await createServer({root,configFile:false,plugins:[react(),{name:'submit-fixture',configureServer(s){s.middlewares.use(async(req,res,next)=>{if(req.url!=='/__submit')return next();res.setHeader('Content-Type','text/html');res.end(await s.transformIndexHtml('/__submit','<html><body><div id=root></div><script type=module src=/__submit.tsx></script></body></html>'));});},resolveId(id){if(id==='/__submit.tsx')return '\0submit.tsx';},load(id){if(id==='\0submit.tsx')return entry;}}],server:{host:'127.0.0.1',port:0}});
+let browser;
+try {
+ await server.listen();
+ browser=await chromium.launch({executablePath:'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',headless:true});
+ const page=await browser.newPage({viewport:{width:1440,height:1000}}), errors=[];
+ page.on('pageerror',e=>errors.push(e.message));
+ await page.addInitScript(()=>{
+  window.writes=[];
+  window.__TAURI_INTERNALS__={invoke:async(command,args={})=>{
+   if(command!=='execute_query')throw new Error(command);
+   if(args.sql.startsWith('SHOW'))return {rows:[]};
+   window.writes.push(args.sql);
+   if(window.failCreate)throw new Error('没有 CREATE 权限');
+   return {rows:[]};
+  }};
+ });
+ await page.goto('http://127.0.0.1:'+server.httpServer.address().port+'/__submit');
+ await page.getByText('新建表 — 数据库：sql_cron',{exact:true}).waitFor({timeout:5000});
+ const name=page.getByRole('textbox',{name:'表名',exact:true});
+ const create=page.getByRole('button',{name:'创建表',exact:true});
+ assert.equal(await name.inputValue(),'');
+ assert.equal(await create.isDisabled(),true);
+ await page.getByRole('status').filter({hasText:'请填写表名（当前数据库：sql_cron）'}).waitFor();
+ assert.equal(await name.getAttribute('aria-invalid'),'true');
+ await name.fill('   ');
+ assert.equal(await create.isDisabled(),true);
+ await name.fill(' tasks ');
+ assert.equal(await create.isEnabled(),true);
+ assert.equal(await name.getAttribute('aria-invalid'),'false');
+ const field=page.locator('[data-col-name]').first();
+ await field.fill('');
+ assert.equal(await create.isDisabled(),true);
+ await page.getByRole('status').filter({hasText:'请至少填写一个字段名'}).waitFor();
+ await field.fill('id');
+ await page.getByRole('button',{name:'SQL 预览',exact:true}).click();
+ const tick=String.fromCharCode(96), target=tick+'sql_cron'+tick+'.'+tick+'tasks'+tick;
+ assert.ok((await page.locator('.ctw-sql').innerText()).includes('CREATE TABLE '+target));
+ await page.evaluate(()=>window.failCreate=true);
+ await create.click();
+ await page.getByRole('status').filter({hasText:'没有 CREATE 权限'}).waitFor();
+ assert.equal(await page.evaluate(()=>!!window.savedWizard),false);
+ assert.equal(await create.isEnabled(),true);
+ await page.evaluate(()=>window.failCreate=false);
+ await create.click();
+ await page.waitForFunction(()=>window.savedWizard&&window.closedWizard);
+ const writes=await page.evaluate(()=>window.writes);
+ assert.equal(writes.length,2);
+ assert.ok(writes[1].includes('CREATE TABLE '+target));
+ assert.deepEqual(errors,[]);
+ console.log('PASS labels, missing/whitespace names, missing fields, SQL target, submit, server error and retry. Mocked IPC only.');
+} finally {await browser?.close();await server.close();}

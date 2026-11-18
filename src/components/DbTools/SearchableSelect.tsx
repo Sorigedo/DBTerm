@@ -12,6 +12,7 @@ interface Props {
   placeholder?: string
   searchPlaceholder?: string
   disabled?: boolean
+  compact?: boolean
   width?: number                // 固定宽度（不指定则 flex:1 撑满）
   mono?: boolean                // 用等宽字体（表名/列名等），默认 true
 }
@@ -19,7 +20,7 @@ interface Props {
 /** 自定义下拉框：选项列表用 createPortal 渲染（不被弹窗裁切、可统一美化）；选项较多时显示搜索框 */
 export default function SearchableSelect({
   value, onChange, options, items, placeholder = '选择…', searchPlaceholder = '搜索…',
-  disabled, width, mono = true,
+  disabled, width, mono = true, compact = false,
 }: Props) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
@@ -76,12 +77,13 @@ export default function SearchableSelect({
   const filtered = q ? list.filter(i => i.label.toLowerCase().includes(q)) : list
 
   return (
-    <div style={{ position: 'relative', ...(width ? { width, flexShrink: 0 } : { flex: 1 }) }}>
+    <div style={{ position: 'relative', ...(compact ? { minWidth: 0, maxWidth: '100%' } : {}), ...(width ? { width, flexShrink: 0 } : { flex: 1 }) }}>
       <button
         ref={triggerRef} type="button" disabled={disabled}
+        title={selected?.label ?? (value || placeholder)}
         onClick={() => { if (!disabled) { setQuery(''); setOpen(o => !o) } }}
         style={{
-          width: '100%', height: 32, boxSizing: 'border-box',
+          width: '100%', height: compact ? 28 : 32, boxSizing: 'border-box',
           display: 'flex', alignItems: 'center', gap: 6, padding: '0 8px 0 10px',
           background: 'var(--surface)', border: `1px solid ${open ? 'var(--accent)' : 'var(--border)'}`,
           borderRadius: 7, cursor: disabled ? 'not-allowed' : 'pointer',
@@ -90,7 +92,7 @@ export default function SearchableSelect({
         }}
       >
         <span style={{ flex: 1, textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: selected && mono ? 'var(--font-mono)' : undefined }}>
-          {selected?.label || placeholder}
+          {selected?.label ?? (value || placeholder)}
         </span>
         <ChevronDown size={13} style={{ color: 'var(--text-muted)', flexShrink: 0, transform: open ? 'rotate(180deg)' : 'none', transition: 'transform .15s' }} />
       </button>
@@ -117,7 +119,7 @@ export default function SearchableSelect({
             ) : filtered.map(it => {
               const on = it.value === value
               return (
-                <button key={it.value} type="button" onClick={() => { onChange(it.value); setOpen(false) }}
+                <button key={it.value} type="button" title={it.label} onClick={() => { onChange(it.value); setOpen(false) }}
                   style={{
                     width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '6px 9px', borderRadius: 6,
                     background: on ? 'var(--accent-bg)' : 'transparent', cursor: 'pointer', textAlign: 'left',

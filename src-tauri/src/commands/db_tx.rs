@@ -167,6 +167,19 @@ async fn mysql_exec_text(conn: &mut sqlx::mysql::MySqlConnection, sql: &str) -> 
         .map_err(|e| format!("{e}"))
 }
 
+fn is_mysql_transaction_preamble(text: &str) -> bool {
+    let normalized = text.trim().trim_end_matches(';').split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase();
+    let text = normalized.as_str();
+    let safe_cleanup = matches!(text, "COMMIT" | "COMMIT WORK" | "ROLLBACK" | "ROLLBACK WORK");
+    let safe_session_setup = text.starts_with("SET ") || text.starts_with("USE ");
+    let safe_read = text.starts_with("SELECT ") || text == "SELECT";
+    let temporary_table = text.starts_with("CREATE TEMPORARY TABLE ")
+        || text.starts_with("DROP TEMPORARY TABLE ");
+    let temporary_stage_insert = text.starts_with("INSERT INTO TMP_PAYMENT_HISTORY_EXPECTED ")
+        || text.starts_with("INSERT INTO TMP_PAYMENT_HISTORY_EXPECTED(");
+    safe_cleanup || safe_session_setup || safe_read || temporary_table || temporary_stage_insert
+}
+
 async fn run_on_pg(
     conn: &mut sqlx::postgres::PgConnection,
     sql: &str,
@@ -293,9 +306,8 @@ pub async fn db_begin_tx(
                     .collect::<Vec<_>>()
                     .join(" ")
                     .to_uppercase();
-                let safe_cleanup = matches!(text.as_str(), "COMMIT" | "COMMIT WORK" | "ROLLBACK" | "ROLLBACK WORK");
-                if !text.starts_with("SET ") && !text.starts_with("USE ") && !safe_cleanup {
-                    return Err("事务前置语句仅支持 SET / USE / COMMIT / ROLLBACK".to_string());
+                if !is_mysql_transaction_preamble(&text) {
+                    return Err("事务前置语句不在安全白名单中；仅支持 SET / USE / SELECT / 临时表 DDL / 指定临时审计表写入 / COMMIT / ROLLBACK".to_string());
                 }
                 mysql_exec_text(&mut c, stmt).await
                     .map_err(|e| format!("事务前置语句失败: {e}"))?;
@@ -594,6 +606,30 @@ mod tests {
         assert!(super::validate_manual_tx_sql("CREATE TABLE x(id INT)", &crate::models::ConnType::Sqlite).is_ok());
     }
     use super::*;
+
+    #[test]
+    fn mysql_payment_migration_preamble_statements_are_accepted() {
+        for sql in [
+            "SET @payment_from_id = NULL",
+            "SELECT DATABASE() AS target_database, VERSION() AS mysql_version",
+            "SELECT MIN(id) AS min_session_id, MAX(id) AS max_session_id, COUNT(*) AS historical_sessions FROM mc_order_session",
+            "DROP TEMPORARY TABLE IF EXISTS tmp_payment_history_source",
+            "CREATE TEMPORARY TABLE tmp_payment_history_expected LIKE mc_order_payment",
+            "CREATE TEMPORARY TABLE tmp_payment_history_source ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci AS SELECT x.* FROM source x",
+            "INSERT INTO tmp_payment_history_expected (id, operation_no) SELECT x.id, x.operation_no FROM tmp_payment_history_source x WHERE x.blocking_reason = ''",
+        ] {
+            assert!(is_mysql_transaction_preamble(sql), "should allow: {sql}");
+        }
+        for sql in [
+            "CREATE TABLE permanent_table (id INT)",
+            "INSERT INTO mc_order_payment (id) VALUES (1)",
+            "INSERT INTO mc_order_payment (id) SELECT id FROM tmp_payment_history_expected",
+            "UPDATE mc_order_payment SET state = 'DONE'",
+            "DELETE FROM mc_order_payment",
+        ] {
+            assert!(!is_mysql_transaction_preamble(sql), "should reject: {sql}");
+        }
+    }
     use std::time::{Duration, Instant};
 
     #[tokio::test]

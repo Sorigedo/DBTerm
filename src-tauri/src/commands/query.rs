@@ -1446,15 +1446,20 @@ pub(crate) async fn mysql_require_atomic_table(
         "SELECT CAST(ENGINE AS CHAR), CAST(TABLE_TYPE AS CHAR) FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?")
         .bind(&schema).bind(table).fetch_one(&mut *conn).await
         .map_err(|e| format!("核验表引擎失败，已拒绝写入: {e}"))?;
-    // I_S.TRIGGERS hides rows without TRIGGER. Role-only grants fail closed.
-    let visible: i64 = sqlx::query_scalar(
+    // I_S.TRIGGERS hides rows without TRIGGER. Include active MySQL role grants;
+    // USER_PRIVILEGES only reports direct grants on some server versions.
+    let direct_visible: i64 = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.USER_PRIVILEGES WHERE GRANTEE=CONCAT(CHAR(39),REPLACE(CURRENT_USER(),'@',CONCAT(CHAR(39),'@',CHAR(39))),CHAR(39)) AND PRIVILEGE_TYPE='TRIGGER') OR EXISTS(SELECT 1 FROM information_schema.SCHEMA_PRIVILEGES WHERE GRANTEE=CONCAT(CHAR(39),REPLACE(CURRENT_USER(),'@',CONCAT(CHAR(39),'@',CHAR(39))),CHAR(39)) AND TABLE_SCHEMA=? AND PRIVILEGE_TYPE='TRIGGER') OR EXISTS(SELECT 1 FROM information_schema.TABLE_PRIVILEGES WHERE GRANTEE=CONCAT(CHAR(39),REPLACE(CURRENT_USER(),'@',CONCAT(CHAR(39),'@',CHAR(39))),CHAR(39)) AND TABLE_SCHEMA=? AND TABLE_NAME=? AND PRIVILEGE_TYPE='TRIGGER')")
         .bind(&schema).bind(&schema).bind(table).fetch_one(&mut *conn).await
         .map_err(|e| format!("核验触发器可见性失败，已拒绝写入: {e}"))?;
+    let role_visible: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.ENABLED_ROLES r JOIN information_schema.ROLE_SCHEMA_GRANTS g ON g.GRANTEE=CONCAT(CHAR(39),REPLACE(r.ROLE_NAME,CHAR(39),CONCAT(CHAR(39),CHAR(39))),CHAR(39),'@',CHAR(39),REPLACE(r.ROLE_HOST,CHAR(39),CONCAT(CHAR(39),CHAR(39))),CHAR(39)) WHERE g.TABLE_SCHEMA=? AND g.PRIVILEGE_TYPE='TRIGGER') OR EXISTS(SELECT 1 FROM information_schema.ENABLED_ROLES r JOIN information_schema.ROLE_TABLE_GRANTS g ON g.GRANTEE=CONCAT(CHAR(39),REPLACE(r.ROLE_NAME,CHAR(39),CONCAT(CHAR(39),CHAR(39))),CHAR(39),'@',CHAR(39),REPLACE(r.ROLE_HOST,CHAR(39),CONCAT(CHAR(39),CHAR(39))),CHAR(39)) WHERE g.TABLE_SCHEMA=? AND g.TABLE_NAME=? AND g.PRIVILEGE_TYPE='TRIGGER')")
+        .bind(&schema).bind(&schema).bind(table).fetch_one(&mut *conn).await.unwrap_or(0);
+    let visible = direct_visible != 0 || role_visible != 0;
     let triggers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA=? AND EVENT_OBJECT_TABLE=?")
         .bind(&schema).bind(table).fetch_one(&mut *conn).await
         .map_err(|e| format!("核验触发器失败，已拒绝写入: {e}"))?;
-    validate_mysql_inline_edit(engine.as_deref(), &kind, visible != 0, triggers)?;
+    validate_mysql_inline_edit(engine.as_deref(), &kind, visible, triggers)?;
     let mode: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut *conn).await
         .map_err(|e| format!("核验严格模式失败，已拒绝写入: {e}"))?;
     if !mode.split(',').any(|m| matches!(m, "STRICT_TRANS_TABLES" | "STRICT_ALL_TABLES")) {
@@ -1467,8 +1472,13 @@ fn validate_mysql_inline_edit(engine: Option<&str>, kind: &str, visible: bool, t
     if kind != "BASE TABLE" || !engine.is_some_and(|e| e.eq_ignore_ascii_case("InnoDB")) {
         return Err("安全写入仅支持 InnoDB 普通表，当前对象无法保证事务回滚，已拒绝写入".into());
     }
-    if !visible { return Err("无法完整核验触发器：当前账号需要目标表、数据库或全局的直接 TRIGGER 权限；仅角色授权暂不支持，已拒绝写入".into()); }
-    if triggers != 0 { return Err("目标表存在触发器，无法保证触发器对其他对象的事务安全，已拒绝写入".into()); }
+    // 没有可见触发器时，TRIGGER 权限不是普通行更新的前置条件。
+    // 只有确实读到触发器，且当前账号无法完整核验时才拒绝，避免把
+    // 没有触发器的普通表误判为不可写。
+    if triggers != 0 {
+        if !visible { return Err("目标表存在触发器，但当前账号没有足够的 TRIGGER 权限完成安全核验，已拒绝写入".into()); }
+        return Err("目标表存在触发器，无法保证触发器对其他对象的事务安全，已拒绝写入".into());
+    }
     Ok(())
 }
 
@@ -2599,7 +2609,8 @@ mod tests {
             assert!(super::validate_mysql_inline_edit(engine, "BASE TABLE", true, 0).is_err());
         }
         assert!(super::validate_mysql_inline_edit(Some("InnoDB"), "VIEW", true, 0).is_err());
-        assert!(super::validate_mysql_inline_edit(Some("InnoDB"), "BASE TABLE", false, 0).is_err());
+        assert!(super::validate_mysql_inline_edit(Some("InnoDB"), "BASE TABLE", false, 0).is_ok());
+        assert!(super::validate_mysql_inline_edit(Some("InnoDB"), "BASE TABLE", false, 1).is_err());
         assert!(super::validate_mysql_inline_edit(Some("InnoDB"), "BASE TABLE", true, 1).is_err());
     }
 

@@ -8,14 +8,22 @@ pub struct SchemaTableDiff {
 }
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SchemaTableIssue {
+    table: String,
+    reason: String,
+}
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SchemaSnapshotDiff {
     database_definition: DatabaseDefinitionDiff,
     missing_tables: Vec<String>,
     extra_tables: Vec<String>,
     changed_tables: Vec<SchemaTableDiff>,
+    uncomparable_tables: Vec<SchemaTableIssue>,
     compared_tables: usize,
     alter_sql: String,
     danger_drops: Vec<String>,
+    comparison_scope: String,
 }
 struct Snapshot {
     conn: sqlx::mysql::MySqlConnection,
@@ -24,6 +32,23 @@ struct Snapshot {
     names: Vec<(String, String)>,
     tables: std::collections::BTreeMap<String, (Vec<ColumnInfo>, String)>,
     mode: String,
+}
+fn collect_table_result(
+    table: &str,
+    result: Result<StructureDiff, String>,
+    changed_tables: &mut Vec<SchemaTableDiff>,
+    uncomparable_tables: &mut Vec<SchemaTableIssue>,
+) {
+    match result {
+        Ok(diff) if !diff.added.is_empty() || !diff.removed.is_empty() || !diff.modified.is_empty() || diff.table_options.is_some() => {
+            changed_tables.push(SchemaTableDiff { table: table.to_string(), diff });
+        }
+        Ok(_) => {}
+        Err(reason) => uncomparable_tables.push(SchemaTableIssue {
+            table: table.to_string(),
+            reason: format!("表完整结构无法安全比对：{reason}"),
+        }),
+    }
 }
 async fn database_ddl(c: &mut sqlx::mysql::MySqlConnection, s: &str) -> Result<String, String> {
     sqlx::query(&format!("SHOW CREATE DATABASE {}", q_mysql(s)))
@@ -39,34 +64,16 @@ async fn names(
 ) -> Result<Vec<(String, String)>, String> {
     sqlx::query_as("SELECT CAST(TABLE_NAME AS CHAR CHARACTER SET utf8mb4),CAST(TABLE_TYPE AS CHAR) FROM information_schema.TABLES WHERE TABLE_SCHEMA=? ORDER BY TABLE_NAME LIMIT 2001").bind(s).fetch_all(c).await.map_err(|e|format!("读取表清单失败: {e}"))
 }
-async fn visibility(c: &mut sqlx::mysql::MySqlConnection, s: &str) -> Result<(), String> {
-    let current: String = sqlx::query_scalar("SELECT CURRENT_USER()")
-        .fetch_one(&mut *c)
-        .await
-        .map_err(|e| e.to_string())?;
-    let (u, h) = current
-        .rsplit_once('@')
-        .ok_or("当前账号格式异常，无法证明全库元数据可见性")?;
-    let grantee = format!("'{}'@'{}'", u.replace('\'', "''"), h.replace('\'', "''"));
-    for privilege in ["SELECT", "TRIGGER"] {
-        let granted:i64=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM information_schema.USER_PRIVILEGES WHERE GRANTEE=? AND PRIVILEGE_TYPE=?) OR EXISTS(SELECT 1 FROM information_schema.SCHEMA_PRIVILEGES WHERE GRANTEE=? AND TABLE_SCHEMA=? AND PRIVILEGE_TYPE=?)").bind(&grantee).bind(privilege).bind(&grantee).bind(s).bind(privilege).fetch_one(&mut *c).await.map_err(|e|format!("检查全库可见性失败: {e}"))?;
-        if granted == 0 {
-            return Err(format!("无法证明数据库 {} 的全部表与触发器均可见：需要数据库级或全局直接 {privilege} 权限；逐表或角色授权请使用单表比对，不能据此声称全库一致",q_mysql(s)));
-        }
-    }
-    Ok(())
-}
 async fn recheck(x: &mut Snapshot, s: &str) -> Result<(), String> {
     if names(&mut x.conn, s).await? != x.names || database_ddl(&mut x.conn, s).await? != x.ddl {
         return Err(
             "结构比对期间数据库定义或对象清单发生变化，已丢弃结果；请暂停 DDL 后重试".into(),
         );
     }
-    visibility(&mut x.conn, s).await
+    Ok(())
 }
 async fn capture(cfg: &ConnConfig, pwd: Option<&str>, s: &str) -> Result<Snapshot, String> {
     let (mut conn, tunnel) = mysql_connect(cfg, pwd).await?;
-    visibility(&mut conn, s).await?;
     sqlx::query("SET SESSION lock_wait_timeout=5")
         .execute(&mut conn)
         .await
@@ -140,6 +147,7 @@ fn compare(
         .cloned()
         .collect();
     let mut changed_tables = Vec::new();
+    let mut uncomparable_tables = Vec::new();
     let mut compared_tables = 0;
     for (n, (sc, sd)) in &src.tables {
         if let Some((dc, dd)) = dst.tables.get(n) {
@@ -153,14 +161,8 @@ fn compare(
                 ds,
                 n,
                 &dst.mode,
-            )
-            .map_err(|e| format!("表 {} 完整结构比对失败: {e}", q_mysql(n)))?;
-            if !diff.added.is_empty() || !diff.removed.is_empty() || !diff.modified.is_empty() {
-                changed_tables.push(SchemaTableDiff {
-                    table: n.clone(),
-                    diff,
-                });
-            }
+            );
+            collect_table_result(n, diff, &mut changed_tables, &mut uncomparable_tables);
         }
     }
     let alter_sql = changed_tables
@@ -183,9 +185,11 @@ fn compare(
         missing_tables,
         extra_tables,
         changed_tables,
+        uncomparable_tables,
         compared_tables,
         alter_sql,
         danger_drops,
+        comparison_scope: "当前账号可见的普通表对象".to_string(),
     })
 }
 pub(super) async fn compare_configs(
@@ -209,6 +213,22 @@ pub(super) async fn compare_configs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn schema_compare_keeps_processing_after_uncomparable_table() {
+        let mut changed = Vec::new();
+        let mut issues = Vec::new();
+        collect_table_result("first", Err("索引差异".into()), &mut changed, &mut issues);
+        collect_table_result("second", Ok(StructureDiff {
+            added: vec![], removed: vec![], modified: vec![], alter_sql: "".into(), danger_drops: vec![], table_options: None, alter_block_reason: None,
+        }), &mut changed, &mut issues);
+        collect_table_result("third", Ok(StructureDiff {
+            added: vec![ColumnInfo { name: "id".into(), data_type: "INT".into(), nullable: false, default_value: None, key: String::new() }],
+            removed: vec![], modified: vec![], alter_sql: "ALTER TABLE third ADD id INT".into(), danger_drops: vec![], table_options: None, alter_block_reason: None,
+        }), &mut changed, &mut issues);
+        assert_eq!(issues[0].table, "first");
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].table, "third");
+    }
     fn config(port: u16) -> ConnConfig {
         serde_json::from_value(serde_json::json!({"id":"snapshot-test","name":"snapshot-test","type":"mysql","host":"127.0.0.1","port":port,"username":"root","useSsl":false,"createdAt":0,"updatedAt":0})).unwrap()
     }
@@ -362,11 +382,14 @@ mod tests {
         .unwrap();
         let mut restricted = cfg.clone();
         restricted.username = Some(user.clone());
-        let denied = capture(&restricted, Some("test-only-password"), &a)
+        // The account can read one table's DDL. A direct-grant lookup must not
+        // reject it merely because the privilege came from a table grant.
+        let mut restricted_snapshot = capture(&restricted, Some("test-only-password"), &a)
             .await
-            .err()
             .unwrap();
-        assert!(denied.contains("无法证明"));
+        assert_eq!(restricted_snapshot.tables.len(), 1);
+        assert!(restricted_snapshot.tables.contains_key("one"));
+        assert!(recheck(&mut restricted_snapshot, &a).await.is_ok());
         sqlx::query(&format!(
             "GRANT SELECT,TRIGGER ON {}.* TO '{user}'@'127.0.0.1'",
             q_mysql(&a)

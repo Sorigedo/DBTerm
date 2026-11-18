@@ -1,5 +1,9 @@
 # 原生导出命令验收
 
+迁移专项回归：构建下述 example 后，以 `DBTERM_ACCEPTANCE_MIGRATION=1 python3 scripts/acceptance/native-export.py` 运行。真实 Tauri IPC 调用生产迁移命令，将 13 字段夹具迁到默认 latin1 的另一临时库；覆盖结构加数据、仅结构、已有目标覆盖并保留备份、仅数据重写、类型拒绝后目标不变。独立客户端核对完整 DDL、函数唯一索引、所有字段值、源表不变且无暂存表残留。
+
+2026-11-16 修复前，同一原生验收复现 `解析源类型失败 ... String ... SQL type BLOB`；修复迁移预检与持锁读取遗漏元数据文本转换的问题，两处统一读取明确 CAST 为 utf8mb4 文本的字段名、类型和扩展属性。同库复制的相同遗漏同步修正。此验收不代表所有类型或兼容引擎均已支持。
+
 在项目根目录执行（当前已验收 macOS arm64、MySQL 8.4.11）：
 
 ```bash
@@ -25,3 +29,7 @@ python3 scripts/acceptance/native-export.py
 结果以Python退出码、`receipt.json` 和全部独立回放断言共同判断，不能仅看GUI进程退出码。
 
 边界：这是独立验收程序里的真实Tauri IPC和生产命令，覆盖DDL提交后端链路；不是完整编辑界面点击、生产打包程序或全部数据库版本认证。失败多动作ALTER验证仅适用于此次MySQL8.4/InnoDB，不能推导多条DDL可事务回滚。临时库无并发写入，不能据此宣称备份具备跨表或跨服务器全局一致快照。
+
+2026-11-16 权限回归：迁移模式使用无 TRIGGER、无全局管理权限的临时普通账号，源库仅 SELECT，目标库提供实际建表、写入、覆盖及锁操作所需权限。复制/迁移不再调用行内编辑专用的 TRIGGER 权限门槛。仅检查当前账号可见的触发器，不能声称完整排除隐藏触发器或复制了触发器。
+
+该模式同时调用真实 `db_copy_table`，验证同库复制结构和数据不要求 TRIGGER 权限，独立核对完整 DDL、数据及复制暂存表清理。快捷键回归使用 `DBTERM_PLAYWRIGHT_MODULE=/path/to/playwright/index.mjs node scripts/acceptance/tree-copy-paste.mjs`，覆盖实际库树和列表/网格组件、隐藏标签页抢事件、跨库粘贴自动打开已预选源表和目标库的迁移向导。该浏览器测试模拟 IPC 和系统剪贴板写入，不代表已验证发行包的操作系统剪贴板。

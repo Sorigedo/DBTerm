@@ -26,6 +26,7 @@ log = open(ROOT / 'server.log', 'wb')
 app_log = open(ROOT / 'app.log', 'wb')
 DB = 'dbterm_native_export'
 GRID = os.environ.get('DBTERM_ACCEPTANCE_GRID') == '1'
+MIGRATION = os.environ.get('DBTERM_ACCEPTANCE_MIGRATION') == '1'
 grid_server = None
 clipboard_saved = False
 
@@ -132,6 +133,44 @@ try:
         await invoke('acceptance_result',{result:{ok:true,checks}});
       }catch(error){await invoke('acceptance_result',{result:{ok:false,checks,error:String(error)}})}
     })()'''.replace('CONFIG', options)
+    if MIGRATION:
+        mysql(f'CREATE DATABASE {DB}_target DEFAULT CHARSET=latin1 COLLATE=latin1_bin')
+        mysql("CREATE USER 'migration_operator'@'127.0.0.1' IDENTIFIED BY ''; GRANT SELECT ON "+DB+".* TO 'migration_operator'@'127.0.0.1'; GRANT SELECT,INSERT,DELETE,CREATE,DROP,ALTER,INDEX,LOCK TABLES ON "+DB+"_target.* TO 'migration_operator'@'127.0.0.1'")
+        connection=json.loads((ROOT/'fixture.json').read_text()); connection['username']='migration_operator'
+        (ROOT/'fixture.json').write_text(json.dumps(connection))
+        script = r'''(async()=>{
+          const cfg=CONFIG, invoke=window.__TAURI_INTERNALS__.invoke, id='native-export-disposable', checks=[];
+          try {
+            for (const strategy of ['replace','skip']) {
+              const target=strategy==='replace'?'migration_copy':'migration_structure';
+              const result=await invoke('db_migrate_table',{srcId:id,srcSchema:cfg.db,srcTable:'mc_pos_settlement_company',
+                dstId:id,dstSchema:cfg.db+'_target',dstTable:target,strategy,batchSize:1,
+                options:{content:strategy==='replace'?'both':'structure',useTransaction:true,errorMode:'stop',conflictMode:'error'}});
+              if(result.failedRows!==0||result.errors.length||result.migratedRows!==(strategy==='replace'?2:0))throw Error(JSON.stringify(result));
+              const ddl=await invoke('get_table_ddl',{id,schema:cfg.db+'_target',table:target});
+              if(ddl!==cfg.ddl.mc_pos_settlement_company.replace('CREATE TABLE \u0060mc_pos_settlement_company\u0060','CREATE TABLE \u0060'+target+'\u0060'))throw Error('copied DDL differs');
+              checks.push(strategy+': real migration IPC succeeded, complete DDL identical');
+            }
+            for (const [strategy,content] of [['replace','both'],['truncate','data']]) {
+              const result=await invoke('db_migrate_table',{srcId:id,srcSchema:cfg.db,srcTable:'mc_pos_settlement_company',
+                dstId:id,dstSchema:cfg.db+'_target',dstTable:'migration_copy',strategy,batchSize:1,
+                options:{content,useTransaction:true,errorMode:'stop',conflictMode:'error'}});
+              if(result.failedRows!==0||result.errors.some(e=>!e.startsWith('旧目标完整保留为备份'))||result.migratedRows!==2)throw Error(JSON.stringify(result));
+              if(strategy==='replace'&&!result.errors.some(e=>e.startsWith('旧目标完整保留为备份')))throw Error('old target backup missing');
+              checks.push(strategy+'/'+content+': existing target migration succeeded');
+            }
+            await invoke('db_copy_table',{id,schema:cfg.db+'_target',srcTable:'migration_copy',dstTable:'shortcut_copy',copyData:true});
+            const copied=await invoke('get_table_ddl',{id,schema:cfg.db+'_target',table:'shortcut_copy'});
+            if(copied!==cfg.ddl.mc_pos_settlement_company.replace('CREATE TABLE \u0060mc_pos_settlement_company\u0060','CREATE TABLE \u0060shortcut_copy\u0060'))throw Error('same-schema copied DDL differs');
+            checks.push('same-schema copy: real IPC succeeded without TRIGGER grant');
+            let rejected=false;
+            try { await invoke('db_migrate_table',{srcId:id,srcSchema:cfg.db,srcTable:'typed',dstId:id,dstSchema:cfg.db+'_target',
+              dstTable:'migration_copy',strategy:'replace',batchSize:1,options:{content:'both',useTransaction:true}}); }
+            catch(e){rejected=true;checks.push('unsupported types rejected: '+String(e))}
+            if(!rejected)throw Error('unsupported types accepted');
+            await invoke('acceptance_result',{result:{ok:true,checks}});
+          }catch(error){await invoke('acceptance_result',{result:{ok:false,checks,error:String(error)}})}
+        })()'''.replace('CONFIG',options)
     if GRID:
         mysql("CREATE TABLE grid_acceptance (id int PRIMARY KEY,a varchar(50),b varchar(50)) ENGINE=InnoDB; INSERT INTO grid_acceptance VALUES (1,'alpha','one'),(2,'beta','two'),(3,'gamma','three');", DB)
         script=(PROJECT/'scripts/acceptance/native-grid-probe.js').read_text().replace('CONFIG',options)
@@ -155,6 +194,15 @@ try:
     receipt = json.loads((ROOT / 'receipt.json').read_text())
     print(json.dumps(receipt,ensure_ascii=False),flush=True)
     assert app.returncode==0 and receipt['ok'], (app.returncode, receipt)
+    if MIGRATION:
+        assert mysql(signatures['mc_pos_settlement_company'].replace('mc_pos_settlement_company','migration_copy'),DB+'_target')==before['mc_pos_settlement_company'], 'migrated values changed or rejection damaged target'
+        assert mysql('SELECT COUNT(*) FROM migration_structure',DB+'_target').strip()==b'0'
+        assert mysql(signatures['mc_pos_settlement_company'].replace('mc_pos_settlement_company','shortcut_copy'),DB+'_target')==before['mc_pos_settlement_company'], 'same-schema copy changed data'
+        assert mysql("SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME LIKE '__dbterm_copy_%'",DB+'_target').strip()==b'0'
+        assert mysql(signatures['mc_pos_settlement_company'],DB)==before['mc_pos_settlement_company'], 'source changed'
+        assert mysql("SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME LIKE '__dbterm_stage_%'",DB+'_target').strip()==b'0'
+        print('PASS native migration: structure+data, structure-only, complete DDL, all 13 columns/data, functional index, unsupported-type target protection, no staged tables',flush=True)
+        raise SystemExit(0)
     if GRID:
         actual = mysql('SELECT id,a,b FROM grid_acceptance ORDER BY id',DB)
         assert actual == b'1\tA1\tB1\n2\tA2\tB2\n3\tgrid-fill-acceptance\tgrid-fill-acceptance\n'.decode('unicode_escape').encode(), actual

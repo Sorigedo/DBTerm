@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { existingMysqlColumnEdit, validateExistingTableTarget } from './createTableEditSafety.ts'
+import { existingMysqlColumnDefinitionEdit, existingMysqlColumnEdit, validateExistingTableTarget } from './createTableEditSafety.ts'
 
 const original = { name: 'plan_code', baseType: 'VARCHAR', length: '64', unsigned: false, nullable: false, primaryKey: false, autoIncrement: false, defaultType: 'empty', defaultValue: '', comment: '编码' }
 
@@ -19,6 +19,18 @@ test('changing an existing column attribute fails closed when original DDL is no
     { error: '现有字段的完整定义无法从列摘要还原，请在 SQL 编辑器中修改原始 DDL' })
 })
 
+test('changing an existing column collation fails closed instead of rebuilding an incomplete definition', () => {
+  assert.deepEqual(existingMysqlColumnEdit('mysql', { ...original, collation: 'utf8mb4_0900_ai_ci' },
+    { ...original, collation: 'utf8mb4_bin' }),
+  { error: '现有字段的完整定义无法从列摘要还原，请在 SQL 编辑器中修改原始 DDL' })
+})
+
 test('unchanged existing column emits no clause', () => {
   assert.deepEqual(existingMysqlColumnEdit('mysql', original, original), {})
+})
+
+test('changing only collation modifies from original DDL and preserves other attributes', () => {
+  assert.deepEqual(existingMysqlColumnDefinitionEdit('resolution', 'resolution', "`resolution` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL DEFAULT '' COMMENT 'size'", ''), {
+    sql: "MODIFY COLUMN `resolution` varchar(64) NOT NULL DEFAULT '' COMMENT 'size'",
+  })
 })

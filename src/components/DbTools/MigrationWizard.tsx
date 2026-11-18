@@ -66,7 +66,7 @@ const STRATEGY_LABELS: Record<Strategy, string> = {
 }
 
 const STRATEGY_DESCS: Record<Strategy, string> = {
-  replace: '按源表 SHOW CREATE TABLE 定义创建目标表并校验；若目标表已存在，先改名备份，验证成功后再清理备份。遇到外键依赖或触发器会中止',
+  replace: '按源表原始 DDL 创建暂存表并迁入数据，校验后切换为目标表；已有目标表在切换时改名为备份并保留，不自动删除。遇到外键依赖或可见触发器会中止',
   truncate: '仅数据模式：先验证目标表结构与源表一致，再清空数据并写入；目标表须已存在且支持事务',
   append: '仅数据模式：先验证目标表结构与源表一致，再追加数据；目标表须已存在且支持事务',
   skip: '目标表已存在则跳过；不存在则自动建表后迁移',

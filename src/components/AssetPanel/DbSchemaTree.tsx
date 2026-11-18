@@ -1,3 +1,4 @@
+import { getActiveRegion } from '../../utils/activeRegion'
 import { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import {
@@ -847,11 +848,13 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
   pasteRef.current = doPaste
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!isModEvent(e)) return
+      if (!isModEvent(e) || getActiveRegion() !== 'sidebar') return
       const k = e.key.toLowerCase()
       if (k !== 'c' && k !== 'v') return
-      const sel = useDbClipboard.getState().selected
-      if (!sel || sel.connectionId !== connectionId) return
+      const state = useDbClipboard.getState()
+      const sel = state.selected
+      const target = state.pasteTarget ?? sel
+      if (k === 'c' ? (!sel || sel.connectionId !== connectionId) : (!target || target.connectionId !== connectionId)) return
       // 事件来源或焦点在输入框/编辑器/对象预览列表，或有文本选区 → 让位（防止与预览页 moveFocus 重复触发）
       const probe = (el: Element | null) => !!el && (
         (el as HTMLElement).tagName === 'INPUT' || (el as HTMLElement).tagName === 'TEXTAREA'
@@ -862,10 +865,10 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
       if (!dedupeKeyEvent(e as unknown as { __dbObjHandled?: boolean })) return
       if (k === 'c') {
         if (window.getSelection()?.toString()) return
-        e.preventDefault(); copyRef.current(sel)
+        e.preventDefault(); copyRef.current(sel!)
       } else {
         if (!useDbClipboard.getState().clipboard) return
-        e.preventDefault(); pasteRef.current(sel.schema)
+        e.preventDefault(); pasteRef.current(target!.schema)
       }
     }
     document.addEventListener('keydown', onKey)
@@ -1127,7 +1130,10 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
   const visibleSchemas = allSchemas.filter(s => !hiddenSchemas.includes(s))
 
   return (
-    <div className="dbt-conn-tree" onContextMenu={e => { e.preventDefault(); e.stopPropagation() }}>
+    <div className="dbt-conn-tree" onMouseDownCapture={e => {
+      const node = (e.target as HTMLElement).closest<HTMLElement>('[data-db-schema]')
+      if (node?.dataset.dbSchema) useDbClipboard.getState().setPasteTarget({ connectionId, schema: node.dataset.dbSchema })
+    }} onContextMenu={e => { e.preventDefault(); e.stopPropagation() }}>
       {loading && (
         <div className="dbt-conn-tree__loading">
           <Loader2 size={12} className="spin" />
@@ -1239,7 +1245,7 @@ export default function DbSchemaTree({ connectionId, connType, defaultSchema, ob
         const isEx = searching ? true : expandedSchemas.has(schema)
 
         return (
-          <div key={schema} className="dbt-schema-node">
+          <div key={schema} className="dbt-schema-node" data-db-schema={schema}>
             <button
               className={`dbt-schema-row${isEx ? ' active' : ''}`}
               onClick={() => {
