@@ -98,31 +98,63 @@ async fn create_upload_temp(sftp: &SftpSession, target: &str) -> Result<(String,
     Ok((temporary, file))
 }
 
-async fn preserve_upload_attributes(sftp: &SftpSession, temporary: &str, target: &str) -> Result<(), String> {
+async fn preserve_upload_attributes(sftp: &SftpSession, temporary: &str, target: &str) -> Result<bool, String> {
     match sftp.symlink_metadata(target).await {
         Ok(original) => {
             if original.is_symlink() { return Err("目标是符号链接，已拒绝替换链接本身，请选择真实文件路径".into()); }
+            if original.permissions.is_some_and(|mode| mode & 0o170000 != 0 && mode & 0o170000 != 0o100000) {
+                return Err("目标不是普通文件，已拒绝替换，原目标未修改".into());
+            }
             let mut attrs = FileAttributes::empty();
             attrs.permissions = Some(original.permissions.ok_or("服务器未返回原文件权限，无法安全替换")? & 0o7777);
             attrs.uid = original.uid;
             attrs.gid = original.gid;
             sftp.set_metadata(temporary, attrs).await
                 .map_err(|e| format!("保留原文件权限/所有者失败，原文件未修改: {e}"))?;
+            Ok(true)
         }
         Err(russh_sftp::client::error::Error::Status(status))
-            if status.status_code == russh_sftp::protocol::StatusCode::NoSuchFile => {}
+            if status.status_code == russh_sftp::protocol::StatusCode::NoSuchFile => Ok(false),
         Err(error) => return Err(format!("检查目标文件失败，已拒绝提交上传: {error}")),
     }
-    Ok(())
 }
 
 async fn commit_upload(sftp: &SftpSession, temporary: &str, target: &str) -> Result<(), String> {
-    preserve_upload_attributes(sftp, temporary, target).await
+    let target_exists = preserve_upload_attributes(sftp, temporary, target).await
         .map_err(|e| format!("{e}；临时文件位于 {temporary}"))?;
-    // Standard SFTP servers may reject overwrite. Never delete the original as
-    // a fallback: failure must preserve it even if atomic replacement is absent.
-    sftp.rename(temporary, target).await.map_err(|e|
-        format!("提交上传失败，未删除原文件；临时文件位于 {temporary}: {e}"))
+    match sftp.rename(temporary, target).await {
+        Ok(()) => return Ok(()),
+        Err(russh_sftp::client::error::Error::Status(status))
+            if target_exists && status.status_code == russh_sftp::protocol::StatusCode::Failure => {}
+        Err(error) => return Err(format!("提交上传失败，目标状态需核查；临时文件位于 {temporary}: {error}")),
+    }
+
+    // SFTP v3 rename does not require servers to overwrite an existing target.
+    // Move the old file aside, install the staged file, and restore the old
+    // file if installation fails. The backup is removed only after replacement.
+    let parent = target.rsplit_once('/').map(|(p, _)| p).unwrap_or(".");
+    let backup = format!("{parent}/.dbterm-backup-{}", uuid::Uuid::new_v4());
+    if let Err(error) = sftp.rename(target, &backup).await {
+        return Err(format!("暂存原文件失败，目标状态需核查；原文件备份可能位于 {backup}，上传临时文件位于 {temporary}: {error}"));
+    }
+
+    if let Err(install_error) = sftp.rename(temporary, target).await {
+        let definite_rejection = matches!(&install_error, russh_sftp::client::error::Error::Status(status)
+            if matches!(status.status_code, russh_sftp::protocol::StatusCode::Failure
+                | russh_sftp::protocol::StatusCode::PermissionDenied
+                | russh_sftp::protocol::StatusCode::NoSuchFile
+                | russh_sftp::protocol::StatusCode::OpUnsupported));
+        if !definite_rejection {
+            return Err(format!("替换上传结果不确定；原文件备份位于 {backup}，上传临时文件位于 {temporary}: {install_error}"));
+        }
+        return match sftp.rename(&backup, target).await {
+            Ok(()) => Err(format!("替换上传文件失败，原文件已恢复；临时文件位于 {temporary}: {install_error}")),
+            Err(restore_error) => Err(format!("替换上传文件失败且原文件恢复失败；原文件备份位于 {backup}，上传临时文件位于 {temporary}。安装错误：{install_error}；恢复错误：{restore_error}")),
+        };
+    }
+
+    sftp.remove_file(&backup).await
+        .map_err(|error| format!("上传已完成，但旧文件备份未能清理：{backup}: {error}"))
 }
 
 async fn cleanup_upload_temp(sftp: &SftpSession, temporary: &str) {
@@ -210,6 +242,7 @@ fn is_transport_err(msg: &str) -> bool {
         // and `6: No connection`; neither contains the old matcher tokens above.
         || lower.contains("7: connection lost") || lower.contains("6: no connection")
         || lower.contains("sender dropped") || lower.contains("session closed")
+        || lower.contains("connection lost") || lower.contains("no connection")
 }
 
 /// 统一重试包装：缓存会话遇传输层错误时重建会话再试一次
@@ -481,7 +514,65 @@ fn register_cancel(transfer_id: &str) -> (Arc<AtomicBool>, CancelGuard) {
 
 /// Keep incomplete downloads in a unique sibling until every byte is flushed.
 /// Dropping an uncommitted stage removes only our own temporary path.
-struct LocalDownloadStage { path: PathBuf, directory: bool, committed: bool }
+type LocalDirectorySnapshot = std::collections::BTreeMap<PathBuf, (bool, u64, std::time::SystemTime, std::fs::Permissions)>;
+
+struct LocalDownloadStage {
+    path: PathBuf, directory: bool, committed: bool,
+    original_directory: Option<LocalDirectorySnapshot>,
+}
+
+fn local_directory_snapshot(target: &Path) -> Result<Option<LocalDirectorySnapshot>, String> {
+    match std::fs::symlink_metadata(target) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("检查本地目录失败: {error}")),
+        Ok(_) => {}
+    }
+    let mut snapshot = LocalDirectorySnapshot::new();
+    let mut pending = vec![target.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&path).map_err(|e| format!("检查本地目录失败: {e}"))?;
+        if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
+            return Err(format!("已有目录包含非普通文件，已拒绝覆盖: {}", path.display()));
+        }
+        snapshot.insert(path.strip_prefix(target).map_err(|e| e.to_string())?.to_path_buf(),
+            (metadata.is_dir(), metadata.len(), metadata.modified().map_err(|e| e.to_string())?, metadata.permissions()));
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(&path).map_err(|e| format!("读取本地目录失败: {e}"))? {
+                pending.push(entry.map_err(|e| e.to_string())?.path());
+            }
+        }
+    }
+    Ok(Some(snapshot))
+}
+
+fn install_local_directory(stage: &Path, target: &Path) -> Result<PathBuf, String> {
+    let backup = target.parent().ok_or("下载目标没有父目录")?
+        .join(format!(".dbterm-download-backup-{}", uuid::Uuid::new_v4()));
+    // 同步完成替换和恢复，取消无法在两次重命名之间打断。
+    std::fs::rename(target, &backup).map_err(|e| format!("备份本地目录失败，原目录未修改: {e}"))?;
+    if let Err(error) = std::fs::rename(stage, target) {
+        return match std::fs::rename(&backup, target) {
+            Ok(()) => Err(format!("提交本地下载失败，原目录已恢复: {error}")),
+            Err(restore) => Err(format!("提交本地下载失败: {error}；恢复失败: {restore}；原目录保留在 {}", backup.display())),
+        };
+    }
+    Ok(backup)
+}
+
+async fn open_local_download_file(path: &Path) -> Result<tokio::fs::File, String> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            tokio::fs::remove_file(path).await.map_err(|e| format!("替换暂存文件失败: {e}"))?;
+        }
+        Ok(_) => return Err(format!("下载目标类型冲突: {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("检查暂存文件失败: {error}")),
+    }
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)] options.mode(0o600);
+    options.open(path).await.map_err(|e| format!("创建本地暂存文件失败: {e}"))
+}
 
 impl LocalDownloadStage {
     fn temporary_path(target: &Path) -> Result<PathBuf, String> {
@@ -491,30 +582,110 @@ impl LocalDownloadStage {
 
     async fn file(target: &Path) -> Result<(Self, tokio::fs::File), String> {
         let path = Self::temporary_path(target)?;
-        let file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&path).await
-            .map_err(|e| format!("创建下载临时文件失败: {e}"))?;
-        Ok((Self { path, directory: false, committed: false }, file))
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)] options.mode(0o600);
+        let file = options.open(&path).await.map_err(|e| format!("创建下载临时文件失败: {e}"))?;
+        Ok((Self { path, directory: false, committed: false, original_directory: None }, file))
     }
 
     async fn directory(target: &Path) -> Result<Self, String> {
-        if tokio::fs::symlink_metadata(target).await.is_ok() {
-            return Err(format!("本地目录已存在，已拒绝覆盖: {}", target.display()));
-        }
+        let original_directory = local_directory_snapshot(target)?;
         let path = Self::temporary_path(target)?;
-        tokio::fs::create_dir(&path).await.map_err(|e| format!("创建下载临时目录失败: {e}"))?;
-        Ok(Self { path, directory: true, committed: false })
+        let mut builder = tokio::fs::DirBuilder::new();
+        #[cfg(unix)] builder.mode(0o700);
+        builder.create(&path).await.map_err(|e| format!("创建下载临时目录失败: {e}"))?;
+        let stage = Self { path, directory: true, committed: false, original_directory };
+        match tokio::fs::symlink_metadata(target).await {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                // 在副本中合并，传输失败或取消时不触碰已有目录。
+                let mut pending = vec![(target.to_path_buf(), stage.path.clone())];
+                while let Some((source, destination)) = pending.pop() {
+                    let mut entries = tokio::fs::read_dir(&source).await
+                        .map_err(|e| format!("读取已有本地目录失败，原目录未修改: {e}"))?;
+                    while let Some(entry) = entries.next_entry().await
+                        .map_err(|e| format!("读取已有本地目录失败，原目录未修改: {e}"))? {
+                        let metadata = tokio::fs::symlink_metadata(entry.path()).await
+                            .map_err(|e| format!("检查已有本地文件失败，原目录未修改: {e}"))?;
+                        let destination = destination.join(entry.file_name());
+                        if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
+                            return Err(format!("已有目录包含非普通文件，已拒绝覆盖: {}", entry.path().display()));
+                        }
+                        if metadata.is_dir() {
+                            tokio::fs::create_dir(&destination).await
+                                .map_err(|e| format!("创建合并临时目录失败: {e}"))?;
+                            pending.push((entry.path(), destination));
+                        } else {
+                            tokio::fs::copy(entry.path(), &destination).await
+                                .map_err(|e| format!("复制已有本地文件失败，原目录未修改: {e}"))?;
+                        }
+                    }
+                }
+            }
+            Ok(_) => return Err(format!("本地目标不是普通目录，已拒绝覆盖: {}", target.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("检查本地目标失败，原目标未修改: {error}")),
+        }
+        Ok(stage)
     }
 
     fn path(&self) -> &Path { &self.path }
 
     async fn commit(mut self, target: &Path) -> Result<(), String> {
-        if self.directory && tokio::fs::symlink_metadata(target).await.is_ok() {
-            return Err(format!("本地目录已存在，已拒绝覆盖: {}", target.display()));
-        }
-        if !self.directory {
+        if self.directory {
+            if local_directory_snapshot(target)? != self.original_directory {
+                return Err("下载期间本地目录已变化，已取消覆盖，请重新下载".to_string());
+            }
+            match tokio::fs::symlink_metadata(target).await {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                    // 目录权限最后复制，避免只读目录妨碍暂存文件写入。
+                    let mut pending = vec![(target.to_path_buf(), self.path.clone())];
+                    let mut directory_permissions = Vec::new();
+                    while let Some((source, destination)) = pending.pop() {
+                        let mut entries = tokio::fs::read_dir(&source).await
+                            .map_err(|e| format!("核验已有本地目录失败，原目录未修改: {e}"))?;
+                        while let Some(entry) = entries.next_entry().await
+                            .map_err(|e| format!("核验已有本地目录失败，原目录未修改: {e}"))? {
+                            let metadata = tokio::fs::symlink_metadata(entry.path()).await
+                                .map_err(|e| format!("核验已有本地目录失败，原目录未修改: {e}"))?;
+                            let child = destination.join(entry.file_name());
+                            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                                pending.push((entry.path(), child));
+                            } else if metadata.is_file() {
+                                tokio::fs::set_permissions(&child, metadata.permissions()).await
+                                    .map_err(|e| format!("保留已有本地文件权限失败，原目录未修改: {e}"))?;
+                            } else {
+                                return Err(format!("已有目录包含非普通文件，已拒绝覆盖: {}", entry.path().display()));
+                            }
+                        }
+                        let metadata = tokio::fs::metadata(&source).await
+                            .map_err(|e| format!("读取已有本地目录权限失败: {e}"))?;
+                        directory_permissions.push((destination, metadata.permissions()));
+                    }
+                    // 子目录先收紧，根目录最后恢复，避免暂存内容短暂扩大可读范围。
+                    for (destination, permissions) in directory_permissions.into_iter().rev() {
+                        tokio::fs::set_permissions(&destination, permissions).await
+                            .map_err(|e| format!("保留已有本地目录权限失败，原目录未修改: {e}"))?;
+                    }
+                    if local_directory_snapshot(target)? != self.original_directory {
+                        return Err("下载期间本地目录已变化，已取消覆盖，请重新下载".to_string());
+                    }
+                    let backup = install_local_directory(&self.path, target)?;
+                    self.committed = true;
+                    tokio::fs::remove_dir_all(&backup).await
+                        .map_err(|e| format!("下载已完成，旧目录备份清理失败: {e}；备份位于 {}", backup.display()))?;
+                    return Ok(());
+                }
+                Ok(_) => return Err(format!("本地目标不是普通目录，已拒绝覆盖: {}", target.display())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("检查本地目标失败，原目标未修改: {error}")),
+            }
+        } else {
             match tokio::fs::symlink_metadata(target).await {
                 Ok(metadata) if !metadata.file_type().is_file() =>
                     return Err(format!("本地目标不是普通文件，已拒绝覆盖: {}", target.display())),
+                Ok(metadata) => tokio::fs::set_permissions(&self.path, metadata.permissions()).await
+                    .map_err(|e| format!("保留已有本地文件权限失败，原目标未修改: {e}"))?,
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound =>
                     return Err(format!("检查本地目标失败，原目标未修改: {error}")),
                 _ => {}
@@ -530,7 +701,27 @@ impl LocalDownloadStage {
 impl Drop for LocalDownloadStage {
     fn drop(&mut self) {
         if self.committed { return; }
-        if self.directory { let _ = std::fs::remove_dir_all(&self.path); }
+        if self.directory {
+            // 暂存目录可能已复制只读权限；仅调整本实例独有的暂存路径。
+            let mut pending = vec![self.path.clone()];
+            while let Some(path) = pending.pop() {
+                if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+                    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                        let mut permissions = metadata.permissions();
+                        #[cfg(unix)] {
+                            use std::os::unix::fs::PermissionsExt;
+                            permissions.set_mode(permissions.mode() | 0o700);
+                        }
+                        #[cfg(not(unix))] permissions.set_readonly(false);
+                        let _ = std::fs::set_permissions(&path, permissions);
+                        if let Ok(entries) = std::fs::read_dir(&path) {
+                            pending.extend(entries.filter_map(Result::ok).map(|entry| entry.path()));
+                        }
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
         else { let _ = std::fs::remove_file(&self.path); }
     }
 }
@@ -851,8 +1042,7 @@ pub async fn download_dir(
         let file = conn.sftp.open(remote_file).await
             .map_err(|e| format!("打开远程文件失败 {remote_file}: {e}"))?;
         let mut remote_reader = tokio::io::BufReader::with_capacity(CHUNK * 4, file);
-        let mut local_writer = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&local_file).await
-            .map_err(|e| format!("创建本地文件失败: {e}"))?;
+        let mut local_writer = open_local_download_file(&local_file).await?;
 
         if let Err(error) = copy_download_stream(&mut remote_reader, &mut local_writer, &cancel,
             &mut transferred_bytes, |n| emitter.tick(n)).await {
@@ -1074,7 +1264,7 @@ pub async fn read_text_file(
     Ok(text)
 }
 
-/// 在线编辑：原子写远程文件（写临时文件 → rename，失败时不破坏原文件）
+/// 在线编辑：暂存后替换；SFTP v3 不支持直接覆盖时备份旧文件，失败则恢复。
 pub async fn write_file(
     config: &ConnConfig,
     password: Option<&str>,
@@ -1110,11 +1300,10 @@ pub async fn write_file(
         Ok(Ok(())) => {}
     }
     drop(file);
-    // No destructive fallback when the destination already exists.
     if let Err(e) = commit_upload(&conn.sftp, &tmp_path, path).await {
-        let _ = conn.sftp.remove_file(&tmp_path).await;
+        if !is_transport_err(&e) { cleanup_upload_temp(&conn.sftp, &tmp_path).await; }
         drop(conn);
-        return Err(format!("重命名临时文件失败: {e}"));
+        return Err(format!("保存远程文件失败: {e}"));
     }
     drop(conn);
     session_guard.succeed();
@@ -1212,13 +1401,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directory_stage_does_not_merge_or_overwrite_existing_destination() {
+    async fn directory_stage_merges_existing_destination_without_losing_unique_files() {
         let root = std::env::temp_dir().join(format!("dbterm-dir-test-{}", uuid::Uuid::new_v4()));
         let target = root.join("existing");
         tokio::fs::create_dir_all(&target).await.unwrap();
         tokio::fs::write(target.join("old.txt"), b"original").await.unwrap();
-        assert!(LocalDownloadStage::directory(&target).await.is_err());
+        tokio::fs::write(target.join("same.txt"), b"old").await.unwrap();
+        tokio::fs::create_dir(target.join("nested")).await.unwrap();
+        tokio::fs::write(target.join("nested/private.txt"), b"old private").await.unwrap();
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o750)).await.unwrap();
+            tokio::fs::set_permissions(target.join("nested/private.txt"), std::fs::Permissions::from_mode(0o400)).await.unwrap();
+            tokio::fs::set_permissions(target.join("nested"), std::fs::Permissions::from_mode(0o700)).await.unwrap();
+        }
+        let stage = LocalDownloadStage::directory(&target).await.unwrap();
+        let mut writer = super::open_local_download_file(&stage.path().join("same.txt")).await.unwrap();
+        writer.write_all(b"replacement").await.unwrap();
+        drop(writer);
+        tokio::fs::write(stage.path().join("new.txt"), b"new").await.unwrap();
+        let mut writer = super::open_local_download_file(&stage.path().join("nested/private.txt")).await.unwrap();
+        writer.write_all(b"new private").await.unwrap();
+        drop(writer);
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(tokio::fs::metadata(stage.path()).await.unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(tokio::fs::metadata(stage.path().join("nested/private.txt")).await.unwrap().permissions().mode() & 0o777, 0o600);
+        }
         assert_eq!(tokio::fs::read(target.join("old.txt")).await.unwrap(), b"original");
+        assert_eq!(tokio::fs::read(target.join("same.txt")).await.unwrap(), b"old");
+        stage.commit(&target).await.unwrap();
+        assert_eq!(tokio::fs::read(target.join("old.txt")).await.unwrap(), b"original");
+        assert_eq!(tokio::fs::read(target.join("same.txt")).await.unwrap(), b"replacement");
+        assert_eq!(tokio::fs::read(target.join("new.txt")).await.unwrap(), b"new");
+        assert_eq!(tokio::fs::read(target.join("nested/private.txt")).await.unwrap(), b"new private");
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(tokio::fs::metadata(target.join("nested/private.txt")).await.unwrap().permissions().mode() & 0o777, 0o400);
+            assert_eq!(tokio::fs::metadata(target.join("nested")).await.unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(tokio::fs::metadata(&target).await.unwrap().permissions().mode() & 0o777, 0o750);
+        }
         let fresh = root.join("fresh");
         {
             let stage = LocalDownloadStage::directory(&fresh).await.unwrap();
@@ -1230,6 +1452,91 @@ mod tests {
         tokio::fs::write(stage.path().join("done.txt"), b"complete").await.unwrap();
         stage.commit(&fresh).await.unwrap();
         assert_eq!(tokio::fs::read(fresh.join("done.txt")).await.unwrap(), b"complete");
+        tokio::fs::remove_dir_all(&root).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_download_stage_preserves_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("dbterm-mode-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir(&root).await.unwrap();
+        let target = root.join("private.txt");
+        tokio::fs::write(&target, b"original").await.unwrap();
+        tokio::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).await.unwrap();
+        let (stage, mut file) = LocalDownloadStage::file(&target).await.unwrap();
+        file.write_all(b"replacement").await.unwrap();
+        drop(file);
+        stage.commit(&target).await.unwrap();
+        assert_eq!(tokio::fs::metadata(&target).await.unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"replacement");
+        tokio::fs::remove_dir_all(&root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn directory_stage_cancel_and_commit_failure_preserve_original() {
+        let root = std::env::temp_dir().join(format!("dbterm-dir-rollback-{}", uuid::Uuid::new_v4()));
+        let target = root.join("existing");
+        tokio::fs::create_dir_all(&target).await.unwrap();
+        tokio::fs::write(target.join("same.txt"), b"original").await.unwrap();
+        {
+            let stage = LocalDownloadStage::directory(&target).await.unwrap();
+            tokio::fs::write(stage.path().join("same.txt"), b"partial").await.unwrap();
+        }
+        assert_eq!(tokio::fs::read(target.join("same.txt")).await.unwrap(), b"original");
+        let stage = LocalDownloadStage::directory(&target).await.unwrap();
+        tokio::fs::remove_dir_all(stage.path()).await.unwrap();
+        assert!(stage.commit(&target).await.is_err());
+        assert_eq!(tokio::fs::read(target.join("same.txt")).await.unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        tokio::fs::remove_dir_all(&root).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn directory_stage_cleans_read_only_staging_after_commit_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("dbterm-readonly-cleanup-{}", uuid::Uuid::new_v4()));
+        let target = root.join("existing");
+        tokio::fs::create_dir_all(target.join("nested")).await.unwrap();
+        tokio::fs::write(target.join("nested/original.txt"), b"original").await.unwrap();
+        let stage = LocalDownloadStage::directory(&target).await.unwrap();
+        let stage_path = stage.path().to_path_buf();
+        tokio::fs::set_permissions(stage.path(), std::fs::Permissions::from_mode(0o500)).await.unwrap();
+        drop(stage);
+        assert!(!stage_path.exists());
+        assert_eq!(tokio::fs::read(target.join("nested/original.txt")).await.unwrap(), b"original");
+        tokio::fs::remove_dir_all(&root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn directory_stage_rejects_concurrent_local_changes() {
+        let root = std::env::temp_dir().join(format!("dbterm-concurrent-download-{}", uuid::Uuid::new_v4()));
+        let target = root.join("existing");
+        tokio::fs::create_dir_all(&target).await.unwrap();
+        tokio::fs::write(target.join("local.txt"), b"before").await.unwrap();
+        let stage = LocalDownloadStage::directory(&target).await.unwrap();
+        tokio::fs::write(target.join("local.txt"), b"changed locally").await.unwrap();
+        assert!(stage.commit(&target).await.is_err());
+        assert_eq!(tokio::fs::read(target.join("local.txt")).await.unwrap(), b"changed locally");
+        let stage = LocalDownloadStage::directory(&target).await.unwrap();
+        tokio::fs::write(target.join("added.txt"), b"new local").await.unwrap();
+        assert!(stage.commit(&target).await.is_err());
+        assert_eq!(tokio::fs::read(target.join("added.txt")).await.unwrap(), b"new local");
+        tokio::fs::remove_dir_all(&root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn directory_stage_restores_empty_original_when_install_rename_fails() {
+        let root = std::env::temp_dir().join(format!("dbterm-empty-restore-{}", uuid::Uuid::new_v4()));
+        let target = root.join("existing");
+        tokio::fs::create_dir_all(&target).await.unwrap();
+        let stage = LocalDownloadStage::directory(&target).await.unwrap();
+        tokio::fs::remove_dir(stage.path()).await.unwrap();
+        let error = super::install_local_directory(stage.path(), &target).unwrap_err();
+        assert!(error.contains("原目录已恢复"), "{error}");
+        assert!(target.is_dir());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
         tokio::fs::remove_dir_all(&root).await.unwrap();
     }
 

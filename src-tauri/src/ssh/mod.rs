@@ -1371,7 +1371,7 @@ async fn run_pty_session(
     app: &tauri::AppHandle,
 ) -> Result<(), String> {
     let t0 = std::time::Instant::now();
-    let (mut handle, forwards) = connect_and_auth(
+    let (handle, forwards) = connect_and_auth(
         config,
         password,
         Some(MfaUi { app, session_id, run_id }),
